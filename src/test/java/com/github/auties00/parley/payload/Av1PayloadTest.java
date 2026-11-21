@@ -144,7 +144,7 @@ class Av1PayloadTest {
             var metadata = obu(5, 0, 0, false, new byte[]{1, 2, 3});
             var unit = concat(obu(2, 0, 0, false, new byte[0]), sequence, metadata, frame,
                     obu(15, 0, 0, false, new byte[]{9}));
-            var payloads = FORMAT.packetizer(new PacketizerConfig(maxPayload)).packetize(
+            var payloads = FORMAT.packetizer(PacketizerConfig.defaults().withMaxPayloadSize(maxPayload)).packetize(
                     new EncodedFrame(MediaKind.VIDEO, ByteBuffer.wrap(unit), 0, true, Optional.empty(),
                             Av1FrameMetadata.none()));
             for (var payload : payloads) {
@@ -160,7 +160,8 @@ class Av1PayloadTest {
             assertTrue(depacketizer.inspect(rtp.getFirst()).frameStart());
             assertTrue(FORMAT.isKeyframe(rtp.getFirst().payload()));
             var assembled = depacketizer.assemble(rtp);
-            assertArrayEquals(concat(sequence, metadata, frame), assembled.toByteArray());
+            assertArrayEquals(concat(obu(2, 0, 0, false, new byte[0]), sequence, metadata, frame),
+                    assembled.toByteArray(), "the temporal delimiter the packetizer dropped is restored");
             assertTrue(assembled.keyframe());
             var read = (Av1FrameMetadata) assembled.metadata();
             assertTrue(read.sequenceHeader());
@@ -184,7 +185,7 @@ class Av1PayloadTest {
             var four = FORMAT.packetizer().packetize(EncodedFrame.of(MediaKind.VIDEO,
                     ByteBuffer.wrap(concat(many.toArray(byte[][]::new))), 0, false));
             assertEquals(0, four.getFirst().payload().get(0) & 0x30);
-            var large = FORMAT.packetizer(new PacketizerConfig(64)).packetize(EncodedFrame.of(MediaKind.VIDEO,
+            var large = FORMAT.packetizer(PacketizerConfig.defaults().withMaxPayloadSize(64)).packetize(EncodedFrame.of(MediaKind.VIDEO,
                     ByteBuffer.wrap(obu(6, 0, 0, false, new byte[200])), 0, false));
             assertEquals(4, large.size());
             assertEquals(0x40, large.getFirst().payload().get(0) & 0xC0);
@@ -197,7 +198,7 @@ class Av1PayloadTest {
         @DisplayName("keeps OBU extension layers and reads them back")
         void layers() throws PayloadFormatException {
             var unit = obu(6, 2, 1, true, framePayload(500, false, 3));
-            var rtp = packets(FORMAT.packetizer(new PacketizerConfig(128)).packetize(EncodedFrame.of(MediaKind.VIDEO,
+            var rtp = packets(FORMAT.packetizer(PacketizerConfig.defaults().withMaxPayloadSize(128)).packetize(EncodedFrame.of(MediaKind.VIDEO,
                     ByteBuffer.wrap(unit), 0, false)), 45, 1, 0);
             var depacketizer = FORMAT.depacketizer();
             assertEquals(2, depacketizer.inspect(rtp.getFirst()).temporalId());

@@ -12,7 +12,8 @@ import java.util.OptionalInt;
 ///
 /// A frame is one access unit in Annex B byte-stream format, in and out. The packetizer sends single NAL unit
 /// packets, aggregation packets (AP) for small NAL units and fragmentation units (FU) for large ones, never decoding
-/// order numbers; PACI packets are neither sent nor accepted.
+/// order numbers or PACI packets. The depacketizer accepts all four packet types, and decoding order numbers when
+/// `sprop-max-don-diff` is above zero, reordering the NAL units of each access unit by them.
 ///
 /// The parameter sets of `sprop-vps`, `sprop-sps` and `sprop-pps` seed both directions, as `sprop-parameter-sets`
 /// does for [H264Format].
@@ -57,7 +58,8 @@ public record H265Format(Codec codec) implements PayloadFormat {
 
     /// {@inheritDoc}
     ///
-    /// @throws IllegalArgumentException if `sprop-max-don-diff` is above zero: decoding order numbers are not supported
+    /// @throws IllegalArgumentException if `sprop-max-don-diff` is above zero: the packetizer does not write decoding
+    ///                                  order numbers
     @Override
     public Packetizer packetizer(PacketizerConfig config) {
         Objects.requireNonNull(config, "config cannot be null");
@@ -67,44 +69,40 @@ public record H265Format(Codec codec) implements PayloadFormat {
 
     /// {@inheritDoc}
     ///
-    /// @throws IllegalArgumentException if `sprop-max-don-diff` is above zero: decoding order numbers are not supported
+    /// The depacketizer reads decoding order numbers when `sprop-max-don-diff` is above zero.
     @Override
     public Depacketizer depacketizer(DepacketizerConfig config) {
         Objects.requireNonNull(config, "config cannot be null");
-        checkNoDecodingOrderNumbers();
-        return VideoDepacketizer.withDescriptor(new H265Depacketizer(spropParameterSets()), config);
+        // TODO: de-interleave NAL units of different access units (sprop-depack-buf-nalus above zero); decoding order
+        //  numbers are honoured within an access unit only, which is all a non-interleaved sender produces.
+        return VideoDepacketizer.withDescriptor(new H265Depacketizer(spropParameterSets(),
+                number("sprop-max-don-diff", 0) > 0), config);
     }
 
     /// {@return whether the payload carries an IRAP slice or a sequence parameter set (NAL unit types `16..23` and
-    /// `33`), the units a keyframe starts with: as a single NAL unit, any unit of an aggregation packet, or any
-    /// fragment of a fragmentation unit}
+    /// `33`), the units a keyframe starts with: as a single NAL unit, any unit of an aggregation packet, any fragment
+    /// of a fragmentation unit, or the packet a PACI packet wraps; a malformed payload is not a keyframe}
     ///
     /// @param payload the payload
     @Override
     public boolean isKeyframe(ByteBuffer payload) {
-        if (payload.remaining() < 2) {
+        List<NalDepacketizer.Unit> units;
+        try {
+            units = new H265Depacketizer(List.of(), number("sprop-max-don-diff", 0) > 0).units(payload);
+        } catch (PayloadFormatException exception) {
             return false;
         }
-        var start = payload.position();
-        var type = (payload.get(start) >>> 1) & 0x3F;
-        if (type == H265Packetizer.FU) {
-            return payload.remaining() >= 3 && isIrap(payload.get(start + 2) & 0x3F);
-        }
-        if (type == H265Packetizer.AP) {
-            var offset = start + 2;
-            while (offset + 2 < payload.limit()) {
-                var size = payload.getShort(offset) & 0xFFFF;
-                if (size < 2 || offset + 2 + size > payload.limit()) {
-                    return false;
-                }
-                if (isIrap((payload.get(offset + 2) >>> 1) & 0x3F)) {
-                    return true;
-                }
-                offset += 2 + size;
+        for (var unit : units) {
+            var header = switch (unit) {
+                case NalDepacketizer.Unit.Whole whole -> whole.nal().getShort(whole.nal().position()) & 0xFFFF;
+                case NalDepacketizer.Unit.Fragment fragment ->
+                        (fragment.header()[0] & 0xFF) << 8 | fragment.header()[1] & 0xFF;
+            };
+            if (isIrap((header >>> 9) & 0x3F)) {
+                return true;
             }
-            return false;
         }
-        return isIrap(type);
+        return false;
     }
 
     /// {@return an empty optional: video payloads span no timestamp range}

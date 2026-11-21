@@ -97,7 +97,7 @@ class Vp8PayloadTest {
             var data = keyframe(1280, 720, 4000);
             var frame = new EncodedFrame(MediaKind.VIDEO, ByteBuffer.wrap(data), 3000, true, Optional.empty(),
                     Vp8FrameMetadata.none().withPictureId(0x7FFE, OptionalInt.empty()));
-            var payloads = FORMAT.packetizer(new PacketizerConfig(maxPayload)).packetize(frame);
+            var payloads = FORMAT.packetizer(PacketizerConfig.defaults().withMaxPayloadSize(maxPayload)).packetize(frame);
             for (var payload : payloads) {
                 assertTrue(payload.payload().remaining() <= maxPayload);
             }
@@ -160,7 +160,7 @@ class Vp8PayloadTest {
         @Test
         @DisplayName("keeps a non-reference flag and key index")
         void flags() throws PayloadFormatException {
-            var metadata = new Vp8FrameMetadata(OptionalInt.of(5), OptionalInt.of(9), OptionalInt.of(1), false,
+            var metadata = new Vp8FrameMetadata(OptionalInt.of(5), 15, OptionalInt.of(9), OptionalInt.of(1), false,
                     OptionalInt.of(17), true, Optional.empty(), OptionalLong.empty(), List.of());
             var frame = new EncodedFrame(MediaKind.VIDEO, bytes(1, 2, 3), 0, false, Optional.empty(), metadata);
             var assembled = FORMAT.depacketizer().assemble(packets(FORMAT.packetizer().packetize(frame), 96, 1, 0));
@@ -233,7 +233,7 @@ class Vp8PayloadTest {
         private static int[] rewrite(Vp8PayloadRewriter rewriter, int pictureId, int tl0)
                 throws PayloadFormatException {
             var payload = ByteBuffer.allocate(6);
-            Vp8Descriptor.write(payload, false, true, OptionalInt.of(pictureId), OptionalInt.of(tl0),
+            Vp8Descriptor.write(payload, false, true, OptionalInt.of(pictureId), false, OptionalInt.of(tl0),
                     OptionalInt.empty(), false, OptionalInt.empty());
             payload.put((byte) 0).flip();
             rewriter.rewrite(payload);

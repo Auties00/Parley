@@ -14,13 +14,15 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.OptionalInt;
 
 /// The depacketizer of the NAL-unit formats, H.264 and H.265: it rebuilds an Annex B access unit from single NAL
 /// unit, aggregation and fragmentation packets.
 ///
 /// It remembers the last parameter set of each type, seeded from the format parameters, and inserts the missing ones
 /// before a random access picture, so the frame it reports as a keyframe decodes on its own. A random access picture
-/// whose parameter sets were never seen is not reported as a keyframe.
+/// whose parameter sets were never seen is not reported as a keyframe. When the units carry decoding order numbers
+/// (H.265 with `sprop-max-don-diff` above zero), the NAL units of an access unit are put back in decoding order.
 abstract sealed class NalDepacketizer implements Depacketizer permits H264Depacketizer, H265Depacketizer {
     /// The last parameter set of each type, by type, in the order they precede a random access picture.
     private final Map<Integer, ByteBuffer> parameterSets = new LinkedHashMap<>();
@@ -45,7 +47,12 @@ abstract sealed class NalDepacketizer implements Depacketizer permits H264Depack
         /// A whole NAL unit.
         ///
         /// @param nal the NAL unit, header included
-        record Whole(ByteBuffer nal) implements Unit {
+        /// @param don its decoding order number, when the stream carries them
+        record Whole(ByteBuffer nal, OptionalInt don) implements Unit {
+            /// Creates a unit without a decoding order number.
+            Whole(ByteBuffer nal) {
+                this(nal, OptionalInt.empty());
+            }
         }
 
         /// A fragment of a NAL unit.
@@ -54,7 +61,13 @@ abstract sealed class NalDepacketizer implements Depacketizer permits H264Depack
         /// @param start  whether the fragment starts the NAL unit
         /// @param end    whether the fragment ends it
         /// @param data   the fragment's bytes after the header
-        record Fragment(byte[] header, boolean start, boolean end, ByteBuffer data) implements Unit {
+        /// @param don    the decoding order number of the NAL unit, which its first fragment carries when the stream
+        ///               has them
+        record Fragment(byte[] header, boolean start, boolean end, ByteBuffer data, OptionalInt don) implements Unit {
+            /// Creates a fragment without a decoding order number.
+            Fragment(byte[] header, boolean start, boolean end, ByteBuffer data) {
+                this(header, start, end, data, OptionalInt.empty());
+            }
         }
     }
 
@@ -104,7 +117,7 @@ abstract sealed class NalDepacketizer implements Depacketizer permits H264Depack
         var temporal = 0;
         for (var i = 0; i < units.size(); i++) {
             var head = switch (units.get(i)) {
-                case Unit.Whole(var nal) -> nal;
+                case Unit.Whole whole -> whole.nal();
                 case Unit.Fragment fragment -> fragmentStart(fragment);
             };
             var type = type(head);
@@ -112,7 +125,7 @@ abstract sealed class NalDepacketizer implements Depacketizer permits H264Depack
             temporal = temporalId(head);
             if (i == 0) {
                 start = switch (units.get(i)) {
-                    case Unit.Whole(var nal) -> startsAccessUnit(nal);
+                    case Unit.Whole whole -> startsAccessUnit(whole.nal());
                     case Unit.Fragment fragment -> fragment.start() && startsAccessUnit(head);
                 };
             }
@@ -132,15 +145,18 @@ abstract sealed class NalDepacketizer implements Depacketizer permits H264Depack
     public final EncodedFrame assemble(List<RtpPacket> packetsOfOneFrame) throws PayloadFormatException {
         Payloads.checkRun(packetsOfOneFrame);
         var nals = new ArrayList<ByteBuffer>();
+        var dons = new ArrayList<Integer>();
         ByteArrayOutputStream pending = null;
+        var pendingDon = -1;
         for (var packet : packetsOfOneFrame) {
             for (var unit : units(packet.payload())) {
                 switch (unit) {
-                    case Unit.Whole(var nal) -> {
+                    case Unit.Whole whole -> {
                         if (pending != null) {
                             throw new PayloadFormatException("NAL unit inside an unfinished fragmented NAL unit");
                         }
-                        nals.add(NalUnits.copy(nal));
+                        nals.add(NalUnits.copy(whole.nal()));
+                        dons.add(whole.don().orElse(-1));
                     }
                     case Unit.Fragment fragment -> {
                         if (fragment.start()) {
@@ -149,6 +165,7 @@ abstract sealed class NalDepacketizer implements Depacketizer permits H264Depack
                             }
                             pending = new ByteArrayOutputStream();
                             pending.writeBytes(fragment.header());
+                            pendingDon = fragment.don().orElse(-1);
                         } else if (pending == null) {
                             throw new PayloadFormatException("fragmentation unit without its start");
                         }
@@ -157,6 +174,7 @@ abstract sealed class NalDepacketizer implements Depacketizer permits H264Depack
                         pending.writeBytes(bytes);
                         if (fragment.end()) {
                             nals.add(ByteBuffer.wrap(pending.toByteArray()).asReadOnlyBuffer());
+                            dons.add(pendingDon);
                             pending = null;
                         }
                     }
@@ -166,6 +184,7 @@ abstract sealed class NalDepacketizer implements Depacketizer permits H264Depack
         if (pending != null) {
             throw new PayloadFormatException("fragmentation unit without its end");
         }
+        decodingOrder(nals, dons);
         if (nals.isEmpty()) {
             throw new PayloadFormatException("access unit without NAL units");
         }
@@ -217,6 +236,28 @@ abstract sealed class NalDepacketizer implements Depacketizer permits H264Depack
         return new EncodedFrame(MediaKind.VIDEO, ByteBuffer.wrap(out.toByteArray()), first.timestamp(), keyframe,
                 Optional.empty(), metadata(firstRandomAccess >= 0, temporal, types,
                 resolution.isPresent() ? resolution : lastResolution));
+    }
+
+    /// Puts NAL units that carry decoding order numbers back in decoding order: by their 16-bit numbers relative to
+    /// the first one, keeping the transmission order of equal numbers; units without numbers keep their order.
+    ///
+    /// @spec https://www.rfc-editor.org/rfc/rfc7798.html#section-6 RFC 7798 section 6: Packetization Rules
+    private static void decodingOrder(List<ByteBuffer> nals, List<Integer> dons) {
+        if (dons.isEmpty() || dons.contains(-1)) {
+            return;
+        }
+        var base = dons.getFirst();
+        var order = new ArrayList<Integer>(nals.size());
+        for (var index = 0; index < nals.size(); index++) {
+            order.add(index);
+        }
+        order.sort(java.util.Comparator.comparingInt(index -> (short) (dons.get(index) - base)));
+        var sorted = new ArrayList<ByteBuffer>(nals.size());
+        for (var index : order) {
+            sorted.add(nals.get(index));
+        }
+        nals.clear();
+        nals.addAll(sorted);
     }
 
     /// Stores a copy of a parameter set as the last one of its type.

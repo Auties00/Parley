@@ -1,21 +1,34 @@
 package com.github.auties00.parley.jitter;
 
+import com.github.auties00.parley.media.Av1FrameMetadata;
+import com.github.auties00.parley.media.AudioFrameMetadata;
 import com.github.auties00.parley.media.EncodedFrame;
+import com.github.auties00.parley.media.FrameMetadata;
+import com.github.auties00.parley.media.GenericFrameMetadata;
+import com.github.auties00.parley.media.H264FrameMetadata;
+import com.github.auties00.parley.media.H265FrameMetadata;
 import com.github.auties00.parley.media.MediaKind;
+import com.github.auties00.parley.media.Resolution;
+import com.github.auties00.parley.media.Vp8FrameMetadata;
+import com.github.auties00.parley.media.Vp9FrameMetadata;
 import com.github.auties00.parley.net.MonotonicClock;
 import com.github.auties00.parley.payload.Depacketizer;
 import com.github.auties00.parley.payload.PacketBoundaries;
 import com.github.auties00.parley.payload.PayloadFormat;
 import com.github.auties00.parley.payload.PayloadFormatException;
 import com.github.auties00.parley.rtp.RtpPacket;
+import com.github.auties00.parley.rtp.session.NtpRtpMapping;
 
 import java.time.Duration;
+import java.time.Instant;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.OptionalDouble;
+import java.util.OptionalInt;
 import java.util.Set;
 import java.util.TreeMap;
 import java.util.TreeSet;
@@ -58,6 +71,15 @@ import java.util.concurrent.locks.ReentrantLock;
 /// a frame that still cannot be decoded after it is dropped. A dropped frame, a malformed one, or too many buffered
 /// packets trigger a keyframe request, at most one per configured interval.
 ///
+/// # Timing
+///
+/// Each released frame carries its capture time on the sender's clock ([EncodedFrame#captureTime()]): from the
+/// `abs-capture-time` header extension when the stream carries it, else from the RTP to NTP mapping of the latest
+/// sender report ([#setSenderClock(NtpRtpMapping)]). When the stream carries the `playout-delay` header extension, a
+/// frame is handed out no earlier than its minimum after its first packet arrived, and missing packets are awaited no
+/// longer than its maximum. A [SyncGroup] the assembler belongs to holds each frame back by its share of lip-sync
+/// delay.
+///
 /// # Threading
 ///
 /// All methods are safe to call from any thread; [#next()] is meant for one consumer thread. Feedback is sent
@@ -66,6 +88,7 @@ import java.util.concurrent.locks.ReentrantLock;
 /// @spec https://www.rfc-editor.org/rfc/rfc4585.html RFC 4585: Extended RTP Profile for Real-time Transport Control Protocol (RTCP)-Based Feedback (RTP/AVPF)
 /// @spec https://www.rfc-editor.org/rfc/rfc5104.html RFC 5104: Codec Control Messages in the RTP Audio-Visual Profile with Feedback (AVPF)
 /// @spec https://www.w3.org/TR/webrtc-stats/ Identifiers for WebRTC's Statistics API
+/// @spec https://webrtc.googlesource.com/src/+/refs/heads/main/docs/native-code/rtp-hdrext/playout-delay/README.md WebRTC: Playout Delay
 public final class VideoFrameAssembler implements AutoCloseable {
     /// The longest a blocked [#next()] waits before checking timers again, in nanoseconds.
     private static final long MAX_WAIT_NANOS = TimeUnit.MILLISECONDS.toNanos(10);
@@ -78,6 +101,12 @@ public final class VideoFrameAssembler implements AutoCloseable {
 
     /// The released frame ids remembered for reference checks.
     private static final int REMEMBERED_RELEASES = 1024;
+
+    /// The window the frame rate is measured over, in nanoseconds.
+    private static final long FRAME_RATE_WINDOW_NANOS = TimeUnit.SECONDS.toNanos(1);
+
+    /// The RTP clock rate of every video format.
+    private static final int VIDEO_CLOCK_RATE = 90000;
 
     /// The settings.
     private final VideoAssemblerConfig config;
@@ -118,8 +147,26 @@ public final class VideoFrameAssembler implements AutoCloseable {
     /// The ids of released frames.
     private final TreeSet<Long> released = new TreeSet<>();
 
-    /// The frames ready for [#next()].
-    private final ArrayDeque<EncodedFrame> ready = new ArrayDeque<>();
+    /// The frames ready for [#next()], each with the clock time it may be handed out at.
+    private final ArrayDeque<Ready> ready = new ArrayDeque<>();
+
+    /// The capture clock and playout delay bounds of the stream.
+    private final CaptureClock captureClock;
+
+    /// The lip-sync state.
+    private final SyncState sync = new SyncState();
+
+    /// When the frames of the last second were handed out, oldest first, in clock nanoseconds.
+    private final ArrayDeque<Long> handedOut = new ArrayDeque<>();
+
+    /// The capture time of the last frame handed out with one, or `null`.
+    private Instant lastCaptureTime;
+
+    /// When that frame was handed out, in clock nanoseconds.
+    private long lastCapturePlayoutNanos;
+
+    /// The size of the last frame released whose metadata carries one, or `null`.
+    private Resolution lastResolution;
 
     /// The unwrapper of sequence numbers.
     private final Unwrapper sequences = new Unwrapper(16);
@@ -218,6 +265,13 @@ public final class VideoFrameAssembler implements AutoCloseable {
         }
     }
 
+    /// A released frame and when it may be handed out.
+    ///
+    /// @param frame   the frame
+    /// @param readyAt the clock time it may be handed out at
+    private record Ready(EncodedFrame frame, long readyAt) {
+    }
+
     /// One complete frame waiting for release.
     ///
     /// @param frame         the frame
@@ -237,6 +291,8 @@ public final class VideoFrameAssembler implements AutoCloseable {
         this.feedback = feedback;
         this.references = new ReferenceFinder(format);
         this.rttNanos = config.initialRtt().toNanos();
+        this.captureClock = new CaptureClock(VIDEO_CLOCK_RATE, config.depacketizer().absCaptureTimeExtensionId(),
+                config.depacketizer().playoutDelayExtensionId());
     }
 
     /// Creates an assembler for one incoming video stream.
@@ -273,6 +329,7 @@ public final class VideoFrameAssembler implements AutoCloseable {
                 return;
             }
             packetsReceived++;
+            captureClock.observe(packet);
             var boundaries = depacketizer.inspect(packet);
             if (!boundaries.valid()) {
                 packetsDiscarded++;
@@ -376,6 +433,26 @@ public final class VideoFrameAssembler implements AutoCloseable {
         }
     }
 
+    /// Sets the RTP to NTP mapping of the stream's latest RTCP sender report, which dates the frames that carry no
+    /// `abs-capture-time`; call it on every sender report.
+    ///
+    /// @param mapping the mapping
+    /// @spec https://www.rfc-editor.org/rfc/rfc3550.html#section-6.4.1 RFC 3550 section 6.4.1: SR: Sender Report RTCP Packet
+    public void setSenderClock(NtpRtpMapping mapping) {
+        Objects.requireNonNull(mapping, "mapping cannot be null");
+        lock.lock();
+        try {
+            captureClock.setSenderClock(mapping);
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    /// {@return the synchronization state, for [SyncGroup]}
+    SyncState syncMember() {
+        return sync;
+    }
+
     /// Asks the sender for a keyframe now, unless one was asked for within the configured interval: for an
     /// application whose decoder failed on a released frame.
     public void requestKeyframe() {
@@ -394,9 +471,17 @@ public final class VideoFrameAssembler implements AutoCloseable {
     public VideoAssemblerStatistics statistics() {
         lock.lock();
         try {
+            var now = clock.nanos();
+            trimWindow(now);
+            var estimated = lastCaptureTime == null ? Optional.<Instant>empty()
+                    : Optional.of(lastCaptureTime.plusNanos(Math.max(0, now - lastCapturePlayoutNanos)));
             return new VideoAssemblerStatistics(packetsReceived, packetsDiscarded, packetsRecovered, packetsLost,
                     nackCount, keyframeRequests, framesReceived, framesDropped, keyframesReleased,
-                    Duration.ofNanos(jitterBufferDelayNanos), emittedCount, freezeCount, Duration.ofNanos(freezeNanos));
+                    Duration.ofNanos(jitterBufferDelayNanos), emittedCount, freezeCount, Duration.ofNanos(freezeNanos),
+                    lastResolution == null ? OptionalInt.empty() : OptionalInt.of(lastResolution.width()),
+                    lastResolution == null ? OptionalInt.empty() : OptionalInt.of(lastResolution.height()),
+                    emittedCount == 0 ? OptionalDouble.empty() : OptionalDouble.of(handedOut.size()), estimated,
+                    Duration.ofNanos(sync.syncDelayNanos()));
         } finally {
             lock.unlock();
         }
@@ -416,6 +501,7 @@ public final class VideoFrameAssembler implements AutoCloseable {
         } finally {
             lock.unlock();
         }
+        sync.leave();
     }
 
     /// Runs the timers, takes a ready frame, and waits up to `waitNanos` for one when none is ready.
@@ -426,18 +512,48 @@ public final class VideoFrameAssembler implements AutoCloseable {
         try {
             checkOpen();
             actions = evaluate(clock.nanos());
-            frame = ready.poll();
+            frame = takeReady(clock.nanos());
             if (frame == null && actions.isEmpty() && waitNanos > 0) {
-                changed.awaitNanos(waitNanos);
+                var head = ready.peekFirst();
+                var wait = head == null ? waitNanos : Math.max(1, Math.min(waitNanos, head.readyAt() - clock.nanos()));
+                changed.awaitNanos(wait);
                 checkOpen();
                 actions = evaluate(clock.nanos());
-                frame = ready.poll();
+                frame = takeReady(clock.nanos());
             }
         } finally {
             lock.unlock();
         }
         run(actions);
+        if (frame != null) {
+            sync.notifyPlayout();
+        }
         return Optional.ofNullable(frame);
+    }
+
+    /// {@return the first ready frame whose hand-out time has come, or `null`, recording its timing}
+    private EncodedFrame takeReady(long now) {
+        var head = ready.peekFirst();
+        if (head == null || head.readyAt() > now) {
+            return null;
+        }
+        ready.pollFirst();
+        var frame = head.frame();
+        handedOut.addLast(now);
+        trimWindow(now);
+        if (frame.captureTime().isPresent()) {
+            lastCaptureTime = frame.captureTime().get();
+            lastCapturePlayoutNanos = now;
+            sync.record(now, lastCaptureTime);
+        }
+        return frame;
+    }
+
+    /// Drops the hand-out times older than the frame rate window.
+    private void trimWindow(long now) {
+        while (!handedOut.isEmpty() && now - handedOut.peekFirst() > FRAME_RATE_WINDOW_NANOS) {
+            handedOut.pollFirst();
+        }
     }
 
     /// Throws if the assembler is closed.
@@ -652,7 +768,18 @@ public final class VideoFrameAssembler implements AutoCloseable {
         var dependencies = references.references(identity).orElse(List.of());
         var frame = candidate.frame();
         frame = frame.withMetadata(frame.metadata().withDependencies(identity.id(), dependencies));
-        ready.add(frame);
+        if (frame.captureTime().isEmpty()) {
+            var capture = captureClock.captureTimeOf(frame.rtpTimestamp());
+            if (capture.isPresent()) {
+                frame = frame.withCaptureTime(capture.get());
+            }
+        }
+        resolution(frame.metadata()).ifPresent(size -> lastResolution = size);
+        var readyAt = now + sync.syncDelayNanos();
+        if (captureClock.minimumDelayNanos() > 0) {
+            readyAt = Math.max(readyAt, candidate.firstArrival() + captureClock.minimumDelayNanos());
+        }
+        ready.add(new Ready(frame, Math.max(readyAt, ready.isEmpty() ? readyAt : ready.peekLast().readyAt())));
         released.add(identity.id());
         while (released.size() > REMEMBERED_RELEASES) {
             released.pollFirst();
@@ -695,9 +822,27 @@ public final class VideoFrameAssembler implements AutoCloseable {
         return released.containsAll(needed);
     }
 
-    /// {@return how long a frame or packet may wait: three round trips within the configured bounds}
+    /// {@return how long a frame or packet may wait: three round trips within the configured bounds, and no longer
+    /// than the maximum playout delay the stream carries}
     private long waitBudgetNanos() {
         var budget = 3 * rttNanos;
-        return Math.min(Math.max(budget, config.minimumWait().toNanos()), config.maximumWait().toNanos());
+        var result = Math.min(Math.max(budget, config.minimumWait().toNanos()), config.maximumWait().toNanos());
+        if (captureClock.maximumDelayNanos() >= 0) {
+            result = Math.min(result, captureClock.maximumDelayNanos());
+        }
+        return result;
+    }
+
+    /// {@return the picture size a video frame's metadata carries, if any}
+    private static Optional<Resolution> resolution(FrameMetadata metadata) {
+        return switch (metadata) {
+            case Vp8FrameMetadata vp8 -> vp8.resolution();
+            case Vp9FrameMetadata vp9 -> vp9.resolution();
+            case H264FrameMetadata h264 -> h264.resolution();
+            case H265FrameMetadata h265 -> h265.resolution();
+            case Av1FrameMetadata av1 -> av1.resolution();
+            case GenericFrameMetadata generic -> generic.resolution();
+            case AudioFrameMetadata ignored -> Optional.empty();
+        };
     }
 }

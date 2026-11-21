@@ -27,6 +27,7 @@ import static com.github.auties00.parley.payload.TestPackets.bytes;
 import static com.github.auties00.parley.payload.TestPackets.packet;
 import static com.github.auties00.parley.payload.TestPackets.packets;
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
+import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
@@ -182,7 +183,7 @@ class NalPayloadTest {
         @DisplayName("round-trips an IDR access unit across payload sizes with STAP-A and FU-A")
         void roundTrip(int maxPayload) throws PayloadFormatException {
             var idr = nal(5000, 0x65, 0x88);
-            var payloads = format.packetizer(new PacketizerConfig(maxPayload)).packetize(frame(annexB(SPS_640, PPS, idr)));
+            var payloads = format.packetizer(PacketizerConfig.defaults().withMaxPayloadSize(maxPayload)).packetize(frame(annexB(SPS_640, PPS, idr)));
             for (var payload : payloads) {
                 assertTrue(payload.payload().remaining() <= maxPayload);
             }
@@ -213,9 +214,9 @@ class NalPayloadTest {
         @DisplayName("aggregates the max-size STAP-A exactly and sends single NAL units as slices")
         void aggregation() {
             var small = nal(100, 0x41, 0x80);
-            var payloads = format.packetizer(new PacketizerConfig(1 + 2 * (2 + 100))).packetize(frame(annexB(small, small)));
+            var payloads = format.packetizer(PacketizerConfig.defaults().withMaxPayloadSize(1 + 2 * (2 + 100))).packetize(frame(annexB(small, small)));
             assertEquals(1, payloads.size());
-            var single = format.packetizer(new PacketizerConfig(100)).packetize(frame(annexB(small)));
+            var single = format.packetizer(PacketizerConfig.defaults().withMaxPayloadSize(100)).packetize(frame(annexB(small)));
             assertEquals(1, single.size());
             assertArrayEquals(small, array(single.getFirst().payload()));
             assertTrue(single.getFirst().payload().isReadOnly());
@@ -229,7 +230,7 @@ class NalPayloadTest {
             var payloads = mode0.packetizer().packetize(frame(annexB(SPS_640, PPS, nal(200, 0x65, 0x88))));
             assertEquals(3, payloads.size());
             assertThrows(IllegalArgumentException.class,
-                    () -> mode0.packetizer(new PacketizerConfig(100)).packetize(frame(annexB(nal(200, 0x65)))));
+                    () -> mode0.packetizer(PacketizerConfig.defaults().withMaxPayloadSize(100)).packetize(frame(annexB(nal(200, 0x65)))));
             var mode2 = new H264Format(Codec.h264().withFormatParameters(Map.of("packetization-mode", "2")));
             assertThrows(IllegalArgumentException.class, mode2::packetizer);
         }
@@ -325,7 +326,7 @@ class NalPayloadTest {
         void roundTrip(int maxPayload) throws PayloadFormatException {
             var sps = h265Sps(1280, 720, 0, 1);
             var idr = nal(4000, 19 << 1, 0x01, 0x80);
-            var payloads = format.packetizer(new PacketizerConfig(maxPayload)).packetize(
+            var payloads = format.packetizer(PacketizerConfig.defaults().withMaxPayloadSize(maxPayload)).packetize(
                     new EncodedFrame(MediaKind.VIDEO, annexB(VPS, sps, H265_PPS, idr), 0, true, Optional.empty(),
                             H265FrameMetadata.none()));
             for (var payload : payloads) {
@@ -361,7 +362,7 @@ class NalPayloadTest {
             assertFalse(depacketizer.inspect(packet(103, true, 1, 0, bytes(0x82, 1, 0, 0))).valid());
             assertFalse(depacketizer.inspect(packet(103, true, 1, 0, bytes(49 << 1, 1, 0xD3))).valid());
             var don = new H265Format(Codec.h265().withFormatParameters(Map.of("sprop-max-don-diff", "2")));
-            assertThrows(IllegalArgumentException.class, don::depacketizer);
+            assertDoesNotThrow(() -> don.depacketizer());
             assertThrows(IllegalArgumentException.class, don::packetizer);
             assertEquals(1, format.profileId());
             assertEquals(0, format.tierFlag());

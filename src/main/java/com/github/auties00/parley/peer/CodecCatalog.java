@@ -137,6 +137,24 @@ final class CodecCatalog {
         return VIDEO_EXTENSIONS.contains(uri) || !AUDIO_EXTENSIONS.contains(uri);
     }
 
+    /// {@return the header extensions of `capabilities` a transceiver of `kind` negotiates, in order: those that apply
+    /// to the kind, without the RTP stream id extensions for audio, which has no simulcast}
+    static List<RtpHeaderExtensionCapability> extensionsFor(List<RtpHeaderExtensionCapability> capabilities,
+                                                            MediaKind kind) {
+        var result = new ArrayList<RtpHeaderExtensionCapability>();
+        for (var capability : capabilities) {
+            var uri = capability.uri();
+            if (!extensionApplies(uri, kind)) {
+                continue;
+            }
+            if (kind == MediaKind.AUDIO && (uri.equals(RTP_STREAM_ID) || uri.equals(REPAIRED_RTP_STREAM_ID))) {
+                continue;
+            }
+            result.add(capability);
+        }
+        return List.copyOf(result);
+    }
+
     /// {@return a codec with `channels` only when it is positive}
     static Codec codec(String mimeType, int clockRate, int channels, Map<String, String> parameters) {
         return new Codec(mimeType, clockRate, channels > 0 ? OptionalInt.of(channels) : OptionalInt.empty(),
@@ -276,6 +294,12 @@ final class CodecCatalog {
         return List.of(fb("goog-remb", null), fb("transport-cc", null), fb("ccm", "fir"), fb("nack", null),
                 fb("nack", "pli"));
     }
+
+    /// The section-wide feedback mechanism that asks for RFC 8888 congestion control feedback,
+    /// `a=rtcp-fb:* ack ccfb`.
+    ///
+    /// @spec https://www.rfc-editor.org/rfc/rfc8888.html RFC 8888: RTP Control Protocol (RTCP) Feedback for Congestion Control
+    static final RtcpFeedback CCFB = new RtcpFeedback("ack", Optional.of("ccfb"));
 
     /// {@return a feedback mechanism, `parameter` absent when `null`}
     static RtcpFeedback fb(String type, String parameter) {

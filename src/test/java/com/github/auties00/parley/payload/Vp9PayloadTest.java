@@ -115,7 +115,7 @@ class Vp9PayloadTest {
                     OptionalInt.of(0), false, false, false, false, true, List.of(), Optional.of(STRUCTURE), false,
                     Optional.empty(), OptionalLong.empty(), List.of());
             var frame = new EncodedFrame(MediaKind.VIDEO, ByteBuffer.wrap(data), 9000, true, Optional.empty(), metadata);
-            var payloads = FORMAT.packetizer(new PacketizerConfig(maxPayload)).packetize(frame);
+            var payloads = FORMAT.packetizer(PacketizerConfig.defaults().withMaxPayloadSize(maxPayload)).packetize(frame);
             for (var payload : payloads) {
                 assertTrue(payload.payload().remaining() <= maxPayload);
                 assertFalse(payload.marker());

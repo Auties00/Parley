@@ -1,5 +1,7 @@
 package com.github.auties00.parley.stats;
 
+import com.github.auties00.parley.media.MediaKind;
+
 import java.time.Instant;
 import java.util.Objects;
 import java.util.OptionalDouble;
@@ -10,14 +12,14 @@ import java.util.OptionalInt;
 /// @param id              the identifier of this object
 /// @param timestamp       when the object was measured
 /// @param trackIdentifier the id of the local track
-/// @param kind            the media kind, `audio` or `video`
+/// @param kind            the media kind
 /// @param audioLevel      the audio level of the last frame, `0` to `1`, when the application stated it
 /// @param width           the width of the last video frame in pixels, when the application stated it
 /// @param height          the height of the last video frame in pixels, when the application stated it
 /// @param frames          the frames the application wrote to the track
 /// @param framesPerSecond the frames written in the last second, or an empty optional for audio
 /// @spec https://www.w3.org/TR/webrtc-stats/ Identifiers for WebRTC's Statistics API
-public record MediaSourceStats(String id, Instant timestamp, String trackIdentifier, String kind,
+public record MediaSourceStats(String id, Instant timestamp, String trackIdentifier, MediaKind kind,
                                OptionalDouble audioLevel, OptionalInt width, OptionalInt height, long frames,
                                OptionalDouble framesPerSecond) implements RtcStats {
     /// Creates the statistics object.

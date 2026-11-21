@@ -1,5 +1,7 @@
 package com.github.auties00.parley.stats;
 
+import com.github.auties00.parley.media.MediaKind;
+
 import java.time.Instant;
 import java.util.Objects;
 import java.util.Optional;
@@ -10,7 +12,7 @@ import java.util.OptionalDouble;
 /// @param id                        the identifier of this object
 /// @param timestamp                 when the object was measured
 /// @param ssrc                      the synchronization source of the stream, an unsigned 32-bit number
-/// @param kind                      the media kind, `audio` or `video`
+/// @param kind                      the media kind
 /// @param transportId               the id of the [TransportStats] the stream flows over
 /// @param codecId                   the id of the [CodecStats] of the codec in use, or an empty optional before the first packet
 /// @param localId                   the id of the matching [InboundRtpStreamStats]
@@ -22,7 +24,7 @@ import java.util.OptionalDouble;
 /// @param totalRoundTripTime        the sum of the round-trip times measured, in seconds
 /// @param roundTripTimeMeasurements the round-trip times measured
 /// @spec https://www.w3.org/TR/webrtc-stats/ Identifiers for WebRTC's Statistics API
-public record RemoteOutboundRtpStreamStats(String id, Instant timestamp, long ssrc, String kind, String transportId,
+public record RemoteOutboundRtpStreamStats(String id, Instant timestamp, long ssrc, MediaKind kind, String transportId,
                                            Optional<String> codecId, String localId, long packetsSent, long bytesSent,
                                            Instant remoteTimestamp, long reportsSent, OptionalDouble roundTripTime,
                                            double totalRoundTripTime,

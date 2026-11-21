@@ -171,12 +171,12 @@ class AudioPlayoutBufferTest {
         var jittered = buffer.targetDelay();
         assertTrue(jittered.toMillis() >= 40, "target " + jittered);
         assertTrue(buffer.statistics().jitter().toMillis() > 5);
-        buffer.setJitterBufferTarget(Optional.of(Duration.ofMillis(500)));
+        buffer.setJitterBufferTarget(Duration.ofMillis(500));
         assertEquals(Duration.ofMillis(500), buffer.targetDelay());
-        buffer.setJitterBufferTarget(Optional.empty());
+        buffer.clearJitterBufferTarget();
         assertEquals(jittered, buffer.targetDelay());
         assertThrows(IllegalArgumentException.class,
-                () -> buffer.setJitterBufferTarget(Optional.of(Duration.ofMillis(4001))));
+                () -> buffer.setJitterBufferTarget(Duration.ofMillis(4001)));
     }
 
     @Test

@@ -27,6 +27,7 @@ import com.github.auties00.parley.stats.IceCandidateStats;
 import com.github.auties00.parley.stats.InboundRtpStreamStats;
 import com.github.auties00.parley.stats.MediaSourceStats;
 import com.github.auties00.parley.stats.OutboundRtpStreamStats;
+import com.github.auties00.parley.stats.QualityLimitationReason;
 import com.github.auties00.parley.stats.RemoteInboundRtpStreamStats;
 import com.github.auties00.parley.stats.RemoteOutboundRtpStreamStats;
 import com.github.auties00.parley.stats.RtcStats;
@@ -40,24 +41,57 @@ import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Base64;
+import java.util.EnumMap;
 import java.util.HashSet;
 import java.util.HexFormat;
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
 import java.util.Optional;
 import java.util.OptionalDouble;
 import java.util.OptionalInt;
 import java.util.OptionalLong;
+import java.util.WeakHashMap;
 
 /// Maps the statistics records of the lower layers to the W3C statistics objects.
 ///
 /// Ids are stable across reports: `T<transport>` for a transport, `CP<transport>-<local>-<remote>` for a pair,
-/// `I<foundation><address><port>` for a candidate, `CO<transport>_<pt>` for a codec, `OT<ssrc>`, `IT<mid>_<rid>`,
+/// `IL<transport>_<foundation><address>_<port>` for a local candidate and `IR...` for a remote one,
+/// `CO<transport>_<pt>` for a codec, `OT<ssrc>`, `IT<mid>_<rid>`,
 /// `RI<ssrc>`, `RO<mid>_<rid>` for the RTP streams, `MS<track>` for a media source, `AP<mid>` for an audio playout,
 /// `D<label>` for a data channel and `CF<fingerprint>` for a certificate.
 ///
 /// @spec https://www.w3.org/TR/webrtc-stats/ Identifiers for WebRTC's Statistics API
 final class StatsMapper {
+    /// The quality limitation history of each send stream, kept between reports; the streams are weak keys, so a
+    /// removed stream's history goes with it.
+    private static final Map<RtpSendStream, QualityLimitation> LIMITATIONS =
+            java.util.Collections.synchronizedMap(new WeakHashMap<>());
+
+    /// The quality limitation history of one send stream.
+    private static final class QualityLimitation {
+        /// The seconds spent under each reason.
+        private final EnumMap<QualityLimitationReason, Double> durations = new EnumMap<>(QualityLimitationReason.class);
+        /// The reason at the previous report.
+        private QualityLimitationReason reason = QualityLimitationReason.NONE;
+        /// When the previous report was made, in `System.nanoTime()` nanoseconds, or `Long.MIN_VALUE`.
+        private long since = Long.MIN_VALUE;
+
+        /// Attributes the time since the previous report to the previous reason and switches to `current`.
+        synchronized Map<QualityLimitationReason, Double> advance(QualityLimitationReason current, long nowNanos) {
+            if (since != Long.MIN_VALUE) {
+                durations.merge(reason, (nowNanos - since) / 1e9, Double::sum);
+            } else {
+                for (var value : QualityLimitationReason.values()) {
+                    durations.put(value, 0.0);
+                }
+            }
+            reason = current;
+            since = nowNanos;
+            return Map.copyOf(durations);
+        }
+    }
+
     /// What the mapper reads from one transport.
     ///
     /// @param id         the transport id
@@ -78,8 +112,9 @@ final class StatsMapper {
     /// @param stream        the stream
     /// @param track         the track feeding it
     /// @param encodingIndex the index of its encoding
+    /// @param encoding      the current parameters of its encoding
     record SendView(String mid, String transportId, MediaKind kind, int payloadType, RtpSendStream stream,
-                    Optional<LocalTrack> track, int encodingIndex) {
+                    Optional<LocalTrack> track, int encodingIndex, Encoding encoding) {
     }
 
     /// What the mapper reads from one receive stream.
@@ -124,7 +159,7 @@ final class StatsMapper {
         negotiated.ifPresent(outcome -> result.addAll(codecs(now, outcome)));
         var sources = new HashSet<String>();
         for (var view : sends) {
-            result.addAll(outbound(now, view, sources));
+            result.addAll(outbound(now, nowNanos, view, sources));
         }
         for (var view : receives) {
             result.addAll(inbound(now, nowNanos, view));
@@ -147,23 +182,24 @@ final class StatsMapper {
         var ice = view.ice().statistics();
         var candidates = new HashSet<String>();
         for (var candidate : ice.localCandidates()) {
-            if (candidates.add(candidateId(candidate))) {
-                result.add(candidate(now, transportId, candidate, false));
+            if (candidates.add(candidateId(view.id(), candidate, false))) {
+                result.add(candidate(now, view.id(), transportId, candidate, false));
             }
         }
         for (var candidate : ice.remoteCandidates()) {
-            if (candidates.add(candidateId(candidate))) {
-                result.add(candidate(now, transportId, candidate, true));
+            if (candidates.add(candidateId(view.id(), candidate, true))) {
+                result.add(candidate(now, view.id(), transportId, candidate, true));
             }
         }
         String selectedPair = null;
         for (var pair : ice.pairs()) {
-            var localId = candidateId(pair.pair().local());
-            var remoteId = candidateId(pair.pair().remote());
-            for (var candidate : List.of(pair.pair().local(), pair.pair().remote())) {
-                if (candidates.add(candidateId(candidate))) {
-                    result.add(candidate(now, transportId, candidate, candidate == pair.pair().remote()));
-                }
+            var localId = candidateId(view.id(), pair.pair().local(), false);
+            var remoteId = candidateId(view.id(), pair.pair().remote(), true);
+            if (candidates.add(localId)) {
+                result.add(candidate(now, view.id(), transportId, pair.pair().local(), false));
+            }
+            if (candidates.add(remoteId)) {
+                result.add(candidate(now, view.id(), transportId, pair.pair().remote(), true));
             }
             var pairId = "CP" + view.id() + "-" + localId + "-" + remoteId;
             if (pair.selected()) {
@@ -223,33 +259,53 @@ final class StatsMapper {
     }
 
     /// {@return the outbound, remote inbound and media source statistics of one send stream}
-    private static List<RtcStats> outbound(Instant now, SendView view, java.util.Set<String> sources) {
+    private static List<RtcStats> outbound(Instant now, long nowNanos, SendView view, java.util.Set<String> sources) {
         var result = new ArrayList<RtcStats>();
         var statistics = view.stream().statistics();
         var ssrc = statistics.ssrc();
         var outboundId = "OT" + ssrc;
         var transportId = "T" + view.transportId();
-        var kind = view.kind() == MediaKind.AUDIO ? "audio" : "video";
+        var kind = view.kind();
+        var video = kind == MediaKind.VIDEO;
         var codecId = Optional.of(codecId(view.transportId(), view.payloadType()));
         var remote = statistics.remote();
         var remoteId = remote.map(ignored -> "RI" + ssrc);
         var sourceId = view.track().map(track -> "MS" + track.id());
+        // TODO: map the per-SSRC frame counters, frame size, frame rate and pacer delay of the send stream statistics
+        //  once the rtp.session package provides them; the track totals stand in until then, which every layer of a
+        //  simulcast sender reports alike.
         var frames = view.track().map(LocalTrack::framesWritten).orElse(0L);
         var keyFrames = view.track().map(LocalTrack::keyFramesWritten).orElse(0L);
         var target = view.track().flatMap(track -> statistics.rid().isPresent()
                 ? boxed(track.targetBitrate(statistics.rid().get())) : boxed(track.targetBitrate()));
+        var encoding = view.encoding();
+        var limitation = Optional.<QualityLimitationReason>empty();
+        Map<QualityLimitationReason, Double> durations = Map.of();
+        if (video) {
+            var reason = target.isPresent() && encoding.maxBitrate().isPresent()
+                    && target.get() < encoding.maxBitrate().getAsLong() ? QualityLimitationReason.BANDWIDTH
+                    : QualityLimitationReason.NONE;
+            limitation = Optional.of(reason);
+            durations = LIMITATIONS.computeIfAbsent(view.stream(), ignored -> new QualityLimitation())
+                    .advance(reason, nowNanos);
+        }
         result.add(new OutboundRtpStreamStats(outboundId, now, ssrc, kind, transportId, codecId,
                 Optional.of(view.mid()), sourceId, remoteId, statistics.rid(), view.encodingIndex(),
                 statistics.packetsSent(), statistics.bytesSent(), statistics.headerBytesSent(),
                 statistics.retransmittedPacketsSent(), statistics.retransmittedBytesSent(), statistics.rtxSsrc(),
-                target.map(OptionalLong::of).orElse(OptionalLong.empty()), 0, frames, keyFrames, frames,
+                target.map(OptionalLong::of).orElse(OptionalLong.empty()), 0,
+                video ? OptionalLong.of(frames) : OptionalLong.empty(),
+                video ? OptionalLong.of(keyFrames) : OptionalLong.empty(),
+                video ? OptionalLong.of(frames) : OptionalLong.empty(),
                 OptionalInt.empty(), OptionalInt.empty(), OptionalDouble.empty(), statistics.nackCount(),
-                statistics.firCount(), statistics.pliCount(), true, Optional.empty()));
+                statistics.firCount(), statistics.pliCount(), encoding.active(), encoding.scalabilityMode(),
+                limitation, durations));
         remote.ifPresent(reception -> result.add(new RemoteInboundRtpStreamStats("RI" + ssrc, now, ssrc, kind,
                 transportId, codecId, outboundId, reception.packetsLost(), seconds(reception.jitter()),
                 reception.fractionLost() / 256.0,
                 reception.roundTripTime().map(rtt -> OptionalDouble.of(seconds(rtt))).orElse(OptionalDouble.empty()),
                 seconds(reception.totalRoundTripTime()), reception.roundTripTimeMeasurements())));
+        // TODO: report the media source's audio level, frame size and frame rate once the local track measures them.
         view.track().ifPresent(track -> {
             if (sources.add(track.id())) {
                 result.add(new MediaSourceStats("MS" + track.id(), now, track.id(), kind, OptionalDouble.empty(),
@@ -266,7 +322,8 @@ final class StatsMapper {
         var key = view.mid() + "_" + statistics.rid().orElse("");
         var inboundId = "IT" + key;
         var transportId = "T" + view.transportId();
-        var kind = view.kind() == MediaKind.AUDIO ? "audio" : "video";
+        var kind = view.kind();
+        var audio = kind == MediaKind.AUDIO;
         var codecId = Optional.of(codecId(view.transportId(), view.payloadType()));
         var remoteId = statistics.remoteSender().map(ignored -> "RO" + key);
         var playout = view.playout().map(AudioPlayoutBuffer::statistics);
@@ -275,6 +332,11 @@ final class StatsMapper {
                 .or(() -> assembler.map(value -> seconds(value.jitterBufferDelay()))).orElse(0.0);
         var emitted = playout.map(value -> value.jitterBufferEmittedCount())
                 .or(() -> assembler.map(value -> value.jitterBufferEmittedCount())).orElse(0L);
+        var estimatedPlayout = playout.flatMap(value -> value.estimatedPlayoutTimestamp())
+                .or(() -> assembler.flatMap(value -> value.estimatedPlayoutTimestamp()));
+        var playoutId = playout.map(ignored -> "AP" + view.mid());
+        // TODO: map fecSsrc and fecBytesReceived from the receive stream statistics once the rtp.session package
+        //  provides them.
         result.add(new InboundRtpStreamStats(inboundId, now, statistics.ssrc().orElse(0), kind, transportId, codecId,
                 Optional.of(view.track().id()), Optional.of(view.mid()), remoteId, statistics.packetsReceived(),
                 statistics.packetsLost(), seconds(statistics.jitter()), statistics.bytesReceived(),
@@ -284,23 +346,44 @@ final class StatsMapper {
                 - statistics.packetsRecovered()), 0, statistics.retransmittedPacketsReceived(),
                 statistics.retransmittedBytesReceived(), statistics.rtxSsrc(), OptionalLong.empty(),
                 statistics.nackCount(), statistics.firCount(), statistics.pliCount(),
-                assembler.map(value -> value.framesReceived()).orElse(0L),
-                assembler.map(value -> value.keyframesReleased()).orElse(0L),
-                assembler.map(value -> value.framesDropped()).orElse(0L), OptionalInt.empty(), OptionalInt.empty(),
-                OptionalDouble.empty(), instant(now, nowNanos, statistics.lastPacketReceivedNanos()), Optional.empty(),
+                audio ? OptionalLong.empty() : OptionalLong.of(assembler.map(value -> value.framesReceived()).orElse(0L)),
+                audio ? OptionalLong.empty()
+                        : OptionalLong.of(assembler.map(value -> value.keyframesReleased()).orElse(0L)),
+                audio ? OptionalLong.empty() : OptionalLong.of(assembler.map(value -> value.framesDropped()).orElse(0L)),
+                assembler.map(value -> value.frameWidth()).orElse(OptionalInt.empty()),
+                assembler.map(value -> value.frameHeight()).orElse(OptionalInt.empty()),
+                assembler.map(value -> value.framesPerSecond()).orElse(OptionalDouble.empty()),
+                instant(now, nowNanos, statistics.lastPacketReceivedNanos()), estimatedPlayout,
                 jitterBufferDelay, playout.map(value -> seconds(value.jitterBufferTargetDelay())).orElse(0.0),
-                playout.map(value -> seconds(value.jitterBufferMinimumDelay())).orElse(0.0), emitted));
+                playout.map(value -> seconds(value.jitterBufferMinimumDelay())).orElse(0.0), emitted,
+                optionalLong(playout.map(value -> value.totalSamplesReceived())),
+                optionalLong(playout.map(value -> value.concealedSamples())),
+                optionalLong(playout.map(value -> value.silentConcealedSamples())),
+                optionalLong(playout.map(value -> value.concealmentEvents())),
+                optionalLong(playout.map(value -> value.insertedSamplesForDeceleration())),
+                optionalLong(playout.map(value -> value.removedSamplesForAcceleration())),
+                playout.map(value -> value.audioLevel()).orElse(OptionalDouble.empty()),
+                playout.filter(value -> value.audioLevel().isPresent())
+                        .map(value -> OptionalDouble.of(value.totalAudioEnergy())).orElse(OptionalDouble.empty()),
+                playout.map(value -> OptionalDouble.of(seconds(value.totalSamplesDuration())))
+                        .orElse(OptionalDouble.empty()),
+                playoutId));
         statistics.remoteSender().ifPresent(sender -> result.add(new RemoteOutboundRtpStreamStats("RO" + key, now,
                 statistics.ssrc().orElse(0), kind, transportId, codecId, inboundId, sender.packetsSent(),
                 sender.bytesSent(), sender.remoteTimestamp(), sender.reportsReceived(),
                 statistics.roundTripTime().map(rtt -> OptionalDouble.of(seconds(rtt))).orElse(OptionalDouble.empty()),
                 statistics.roundTripTime().map(StatsMapper::seconds).orElse(0.0),
                 statistics.roundTripTime().isPresent() ? 1 : 0)));
-        playout.ifPresent(value -> result.add(new AudioPlayoutStats("AP" + view.mid(), now, "audio",
-                value.concealedSamples() / 48_000.0, value.concealmentEvents(),
-                value.totalSamplesReceived() / 48_000.0, seconds(value.jitterBufferDelay()),
+        playout.ifPresent(value -> result.add(new AudioPlayoutStats("AP" + view.mid(), now, MediaKind.AUDIO,
+                (double) value.concealedSamples() / value.clockRate(), value.concealmentEvents(),
+                seconds(value.totalSamplesDuration()), seconds(value.jitterBufferDelay()),
                 value.jitterBufferEmittedCount())));
         return result;
+    }
+
+    /// {@return a boxed optional long as an `OptionalLong`}
+    private static OptionalLong optionalLong(Optional<Long> value) {
+        return value.map(OptionalLong::of).orElse(OptionalLong.empty());
     }
 
     /// {@return an optional long boxed into an optional, for chaining}
@@ -319,9 +402,9 @@ final class StatsMapper {
     }
 
     /// {@return the statistics of a candidate}
-    private static IceCandidateStats candidate(Instant now, String transportId, IceCandidate candidate,
-                                               boolean remote) {
-        return new IceCandidateStats(candidateId(candidate), now, remote, transportId,
+    private static IceCandidateStats candidate(Instant now, String transport, String transportId,
+                                               IceCandidate candidate, boolean remote) {
+        return new IceCandidateStats(candidateId(transport, candidate, remote), now, remote, transportId,
                 Optional.of(candidate.address()), candidate.port(),
                 candidate.protocol().name().toLowerCase(Locale.ROOT), candidateType(candidate),
                 candidate.priority(), Optional.empty(), Optional.empty(), candidate.foundation(),
@@ -332,9 +415,11 @@ final class StatsMapper {
                 candidate.tcpType().map(type -> type.name().toLowerCase(Locale.ROOT)));
     }
 
-    /// {@return the stable id of a candidate}
-    private static String candidateId(IceCandidate candidate) {
-        return "I" + candidate.foundation() + candidate.address().replace(':', '.') + "_" + candidate.port();
+    /// {@return the stable id of a candidate: local and remote candidates and candidates of different transports
+    /// never share one, even with the same foundation, address and port}
+    static String candidateId(String transport, IceCandidate candidate, boolean remote) {
+        return "I" + (remote ? "R" : "L") + transport + "_" + candidate.foundation()
+                + candidate.address().replace(':', '.') + "_" + candidate.port();
     }
 
     /// {@return the statistics of a DER-encoded certificate}

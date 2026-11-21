@@ -84,7 +84,7 @@ class SdpModelTest {
     class Accessors {
         @Test
         @DisplayName("read the BUNDLE group, mids, directions and fingerprints of a Chrome offer")
-        void chrome() {
+        void chrome() throws SdpFormatException {
             var offer = SessionDescription.parse(BrowserFixtures.CHROME_OFFER);
             assertEquals(List.of("0", "1", "2"), offer.bundleGroups().getFirst().mids());
             assertEquals("4611731400430051336", offer.origin().orElseThrow().sessionId());
@@ -99,7 +99,7 @@ class SdpModelTest {
 
         @Test
         @DisplayName("fall back to the session-level fingerprint of a Firefox offer")
-        void firefox() {
+        void firefox() throws SdpFormatException {
             var offer = SessionDescription.parse(BrowserFixtures.FIREFOX_OFFER);
             var audio = offer.media().getFirst();
             assertTrue(audio.attribute(SdpAttribute.Fingerprint.class).isEmpty());
@@ -123,7 +123,7 @@ class SdpModelTest {
     class Withers {
         @Test
         @DisplayName("change one part of a section and keep the rest")
-        void section() {
+        void section() throws SdpFormatException {
             var section = SessionDescription.parse(BrowserFixtures.LITE_SFU_OFFER).media().getFirst();
             var edited = section.withPort(9).withFormats(List.of("111")).withoutAttributes("candidate")
                     .withAttribute(new SdpAttribute.Ptime(20));

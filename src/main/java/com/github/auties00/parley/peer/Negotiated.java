@@ -54,11 +54,19 @@ record Negotiated(boolean offerer, List<Transport> transports, List<Media> media
     /// @param remoteFingerprints the fingerprints the peer's DTLS certificate must match
     /// @param dtlsRole           the local DTLS role
     /// @param iceRole            the local ICE role
-    /// @param iceRestart         whether this exchange restarted ICE on an existing transport
+    /// @param localTlsId         the `a=tls-id` this side wrote for the transport, kept until its DTLS association
+    ///                           restarts
+    /// @param remoteTlsId        the `a=tls-id` the peer wrote for the transport, or an empty optional when it wrote
+    ///                           none
+    /// @param dtlsRestart        whether this exchange asks for a new DTLS association on a transport the previous
+    ///                           exchange already ran: the peer changed its `a=tls-id`, its fingerprints or its
+    ///                           `a=setup` role (RFC 8842 section 5); the SRTP keys and the SCTP association of the
+    ///                           transport restart with it
+    /// @spec https://www.rfc-editor.org/rfc/rfc8842.html RFC 8842: Session Description Protocol (SDP) Offer/Answer Considerations for Datagram Transport Layer Security (DTLS) and Transport Layer Security (TLS)
     record Transport(String id, List<String> mids, IceCredentials local, IceCredentials remote, boolean remoteLite,
                      List<String> remoteCandidates, boolean remoteComplete,
                      List<SdpAttribute.Fingerprint> remoteFingerprints, DtlsRole dtlsRole, IceRole iceRole,
-                     boolean iceRestart) {
+                     String localTlsId, Optional<String> remoteTlsId, boolean dtlsRestart) {
         Transport {
             mids = List.copyOf(mids);
             remoteCandidates = List.copyOf(remoteCandidates);
@@ -114,15 +122,30 @@ record Negotiated(boolean offerer, List<Transport> transports, List<Media> media
     /// @param sendLayers      the local encodings, empty when the section does not send
     /// @param receiveLayers   the remote streams, empty when the section does not receive
     /// @param remoteStreams   the stream ids the remote track belongs to
-    /// @param remoteBitrate   the bandwidth cap the peer set with `b=AS` or `b=TIAS`, in bits per second
+    /// @param maxBitrate      the payload bitrate in bits per second the peer asks this side to stay under when
+    ///                        sending on the section: its `b=TIAS`, else its `b=AS` less an estimate of the IP, UDP,
+    ///                        RTP and SRTP overhead (RFC 3890 section 6.2), from the section or else the session
+    ///                        level; an empty optional when the peer set no cap
+    /// @param cryptex         whether both sides wrote `a=cryptex`, so the RTP header extensions and CSRCs of the
+    ///                        section are encrypted (RFC 9335)
+    /// @param congestionControlFeedback whether both sides wrote `a=rtcp-fb:* ack ccfb`, so the receiver sends
+    ///                        RFC 8888 congestion control feedback
+    /// @param extensionDirections the negotiated header extensions by URI, each with its direction from this side's
+    ///                        point of view
+    /// @spec https://www.rfc-editor.org/rfc/rfc3890.html RFC 3890: A Transport Independent Bandwidth Modifier for the Session Description Protocol (SDP)
+    /// @spec https://www.rfc-editor.org/rfc/rfc9335.html RFC 9335: Completely Encrypting RTP Header Extensions and Contributing Sources
+    /// @spec https://www.rfc-editor.org/rfc/rfc8888.html RFC 8888: RTP Control Protocol (RTCP) Feedback for Congestion Control
     record Media(RtpTransceiver transceiver, String mid, String transportId, MediaKind kind,
                  TransceiverDirection direction, List<CodecEntry> codecs, OptionalInt redPayloadType,
                  OptionalInt ulpfecPayloadType, OptionalInt flexfecPayloadType, Optional<CodecEntry> telephoneEvent,
                  Map<Integer, URI> extensions, boolean reducedSizeRtcp, String cname, List<SendLayer> sendLayers,
-                 List<ReceiveLayer> receiveLayers, List<String> remoteStreams, OptionalLong remoteBitrate) {
+                 List<ReceiveLayer> receiveLayers, List<String> remoteStreams, OptionalLong maxBitrate,
+                 boolean cryptex, boolean congestionControlFeedback,
+                 Map<URI, TransceiverDirection> extensionDirections) {
         Media {
             codecs = List.copyOf(codecs);
             extensions = Map.copyOf(extensions);
+            extensionDirections = Map.copyOf(extensionDirections);
             sendLayers = List.copyOf(sendLayers);
             receiveLayers = List.copyOf(receiveLayers);
             remoteStreams = List.copyOf(remoteStreams);

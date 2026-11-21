@@ -11,6 +11,7 @@ import com.github.auties00.parley.sdp.MediaDirection;
 import com.github.auties00.parley.sdp.Origin;
 import com.github.auties00.parley.sdp.RtpCodec;
 import com.github.auties00.parley.sdp.SdpAttribute;
+import com.github.auties00.parley.sdp.SdpFormatException;
 import com.github.auties00.parley.sdp.SdpLine;
 import com.github.auties00.parley.sdp.SessionDescription;
 import com.github.auties00.parley.sdp.SetupRole;
@@ -41,12 +42,19 @@ import java.util.Set;
 /// @implNote This implementation follows RFC 9429 with the choices browsers make where the RFC leaves room: one
 /// `a=group:BUNDLE` with every section, the ICE and DTLS attributes repeated in every section, `a=setup:actpass` in
 /// every offer, `a=setup:active` in a first answer, a session-wide payload type and header extension id space, and
-/// `a=ssrc` lines for a sender without simulcast.
+/// `a=ssrc` lines for a sender without simulcast. Every transport section carries an `a=tls-id`, one value for all
+/// the sections of the offered BUNDLE group, kept until the peer restarts the DTLS association. Every RTP section of
+/// an offer carries `a=cryptex` and `a=rtcp-fb:* ack ccfb`, which an answer echoes when offered: RFC 9335 and RFC 8888
+/// make each inert unless both sides write it, so neither needs a configuration toggle.
 /// @spec https://www.rfc-editor.org/rfc/rfc9429.html RFC 9429: JavaScript Session Establishment Protocol (JSEP)
 /// @spec https://www.rfc-editor.org/rfc/rfc8843.html RFC 8843: Negotiating Media Multiplexing Using the Session Description Protocol (SDP)
 /// @spec https://www.rfc-editor.org/rfc/rfc8839.html RFC 8839: Session Description Protocol (SDP) Offer/Answer Procedures for Interactive Connectivity Establishment (ICE)
 /// @spec https://www.rfc-editor.org/rfc/rfc8842.html RFC 8842: Session Description Protocol (SDP) Offer/Answer Considerations for Datagram Transport Layer Security (DTLS) and Transport Layer Security (TLS)
 /// @spec https://www.rfc-editor.org/rfc/rfc8853.html RFC 8853: Using Simulcast in Session Description Protocol (SDP) and RTP Sessions
+/// @spec https://www.rfc-editor.org/rfc/rfc9335.html RFC 9335: Completely Encrypting RTP Header Extensions and Contributing Sources
+/// @spec https://www.rfc-editor.org/rfc/rfc8888.html RFC 8888: RTP Control Protocol (RTCP) Feedback for Congestion Control
+/// @spec https://www.rfc-editor.org/rfc/rfc3890.html RFC 3890: A Transport Independent Bandwidth Modifier for the Session Description Protocol (SDP)
+/// @spec https://www.w3.org/TR/webrtc-extensions/ WebRTC Extensions
 /// @spec https://www.w3.org/TR/webrtc/ WebRTC: Real-Time Communication in Browsers
 final class JsepEngine {
     /// The RTP profile of every media section Parley writes.
@@ -61,6 +69,18 @@ final class JsepEngine {
     static final long DEFAULT_REMOTE_MAX_MESSAGE_SIZE = 65536;
     /// The characters of an ICE username fragment or password.
     private static final String ICE_CHARS = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    /// The length of a generated `a=tls-id`, within the 20 to 255 characters RFC 8842 allows.
+    private static final int TLS_ID_LENGTH = 32;
+    /// The bytes an RTP packet carries beyond its payload: IPv4 (20), UDP (8), the fixed RTP header (12) and the
+    /// SRTP authentication tag (10), the overhead an `AS` bandwidth includes and a `TIAS` one does not.
+    static final int PACKET_OVERHEAD_BYTES = 50;
+    /// The packet rate assumed for an audio section when converting `AS` to a payload rate: one packet per 20 ms.
+    static final int AUDIO_PACKETS_PER_SECOND = 50;
+    /// The packet size assumed for a video section when converting `AS` to a payload rate.
+    static final int VIDEO_PACKET_BYTES = 1200;
+    /// The RTP profiles of DTLS-SRTP, the only ones a peer connection negotiates (RFC 9429 section 5.1.2).
+    private static final Set<String> DTLS_SRTP_PROTOCOLS = Set.of("UDP/TLS/RTP/SAVPF", "UDP/TLS/RTP/SAVP",
+            "TCP/DTLS/RTP/SAVPF", "TCP/DTLS/RTP/SAVP");
 
     /// A description with its type, parsed.
     record Description(JsepType type, SessionDescription sdp) {
@@ -146,6 +166,9 @@ final class JsepEngine {
     private final Set<String> remoteComplete = new HashSet<>();
     /// The last negotiation applied, or `null`.
     private Negotiated negotiated;
+    /// The `a=tls-id` of each local transport written by a created description that no applied local description
+    /// carries yet; cleared when a local description is applied, whose own values then hold.
+    private final Map<String, String> freshTlsIds = new HashMap<>();
     /// What a rollback restores, captured when the state leaves `STABLE`.
     private Snapshot stable;
 
@@ -291,10 +314,12 @@ final class JsepEngine {
             }
             firstOfKind.add(slot.kind());
             var port = bundleOnly ? 0 : 9;
+            var tlsId = localTlsId(negotiatedBundle.contains(slot.mid()) ? negotiatedBundle.getFirst() : firstMid,
+                    false);
             if (slot.data()) {
-                sections.add(dataSection(slot.mid(), port, bundleOnly, ice, SetupRole.ACTPASS));
+                sections.add(dataSection(slot.mid(), port, bundleOnly, ice, SetupRole.ACTPASS, tlsId));
             } else {
-                sections.add(offerMediaSection(slot.transceiver(), slot.mid(), port, bundleOnly, ice));
+                sections.add(offerMediaSection(slot.transceiver(), slot.mid(), port, bundleOnly, ice, tlsId));
             }
         }
         var description = new SessionDescription(sessionLines(offeredMids, true), sections);
@@ -390,19 +415,23 @@ final class JsepEngine {
 
     /// Writes the media section of a transceiver in an offer.
     private MediaDescription offerMediaSection(RtpTransceiver transceiver, String mid, int port, boolean bundleOnly,
-                                               Negotiated.IceCredentials ice) {
+                                               Negotiated.IceCredentials ice, String tlsId) {
         var codecs = offerCodecs(transceiver);
         var builder = new SectionBuilder(kindName(transceiver.kind()), port, RTP_PROTOCOL);
         formats(builder, codecs);
         builder.line(new SdpLine('c', "IN IP4 0.0.0.0"));
+        receiveBitrateLine(builder, transceiver);
         builder.attribute(new SdpAttribute.Rtcp(9, Optional.of("IN IP4 0.0.0.0")));
-        transportAttributes(builder, ice, SetupRole.ACTPASS);
+        transportAttributes(builder, ice, SetupRole.ACTPASS, tlsId);
         builder.attribute(new SdpAttribute.Mid(mid));
         if (bundleOnly) {
             builder.attribute(new SdpAttribute.BundleOnly());
         }
-        for (var uri : offerExtensions(transceiver.kind())) {
-            builder.attribute(new SdpAttribute.Extmap(extensionId(uri), Optional.empty(), uri, Optional.empty()));
+        for (var extension : offerExtensions(transceiver)) {
+            var direction = extension.direction() == TransceiverDirection.SENDRECV ? Optional.<MediaDirection>empty()
+                    : Optional.of(toSdp(extension.direction()));
+            builder.attribute(new SdpAttribute.Extmap(extensionId(extension.uri()), direction, extension.uri(),
+                    Optional.empty()));
         }
         var direction = transceiver.direction;
         builder.attribute(new SdpAttribute.Direction(toSdp(direction)));
@@ -412,6 +441,9 @@ final class JsepEngine {
         }
         builder.attribute(new SdpAttribute.RtcpMux());
         builder.attribute(new SdpAttribute.RtcpRsize());
+        builder.attribute(new SdpAttribute.Cryptex());
+        builder.attribute(new SdpAttribute.RtcpFb(OptionalInt.empty(), CodecCatalog.CCFB.type(),
+                CodecCatalog.CCFB.parameter()));
         codecLines(builder, codecs);
         if (direction.sends()) {
             var layers = sender.layers();
@@ -475,21 +507,16 @@ final class JsepEngine {
         return result;
     }
 
-    /// {@return the header extensions offered for `kind`}
-    private List<URI> offerExtensions(MediaKind kind) {
-        var result = new ArrayList<URI>();
-        for (var capability : connection.configuration().headerExtensions()) {
-            var uri = capability.uri();
-            if (!CodecCatalog.extensionApplies(uri, kind)) {
-                continue;
-            }
-            if (kind == MediaKind.AUDIO && (uri.equals(CodecCatalog.RTP_STREAM_ID)
-                    || uri.equals(CodecCatalog.REPAIRED_RTP_STREAM_ID))) {
-                continue;
-            }
-            result.add(uri);
-        }
-        return result;
+    /// {@return the header extensions a transceiver offers, with their directions: those of
+    /// [RtpTransceiver#headerExtensionsToNegotiate()] that are not `STOPPED`}
+    private static List<RtpHeaderExtensionCapability> offerExtensions(RtpTransceiver transceiver) {
+        return transceiver.headerExtensions.stream()
+                .filter(extension -> extension.direction() != TransceiverDirection.STOPPED).toList();
+    }
+
+    /// Appends the `b=TIAS` line of a transceiver's receive bitrate cap, when it has one.
+    private static void receiveBitrateLine(SectionBuilder builder, RtpTransceiver transceiver) {
+        transceiver.receiveBitrateCap.ifPresent(cap -> builder.line(new Bandwidth(Bandwidth.TIAS, cap).toLine()));
     }
 
 
@@ -509,17 +536,18 @@ final class JsepEngine {
         var accepted = new ArrayList<String>();
         for (var remote : offer.media()) {
             var mid = remote.mid().orElse(null);
-            if (remote.isRejected() || mid == null) {
+            if (remote.isRejected() || mid == null || !isSupported(remote)) {
                 sections.add(rejectAnswer(remote));
                 continue;
             }
+            var tlsId = localTlsId(mid, remoteRestartsDtls(offer, remote));
             MediaDescription answer;
             if (remote.media().equals("application")) {
-                answer = isSctp(remote.protocol()) ? dataSection(mid, 9, false, ice, setup) : null;
+                answer = dataSection(mid, 9, false, ice, setup, tlsId);
             } else {
                 var transceiver = transceiverByMid(mid);
-                answer = transceiver == null || transceiver.stopping || transceiver.stopped || !isRtp(remote.protocol())
-                        ? null : answerMediaSection(transceiver, offer, remote, ice, setup);
+                answer = transceiver == null || transceiver.stopping || transceiver.stopped
+                        ? null : answerMediaSection(transceiver, offer, remote, ice, setup, tlsId);
             }
             if (answer == null) {
                 sections.add(rejectAnswer(remote));
@@ -531,6 +559,11 @@ final class JsepEngine {
             }
         }
         var ordered = offeredGroup.stream().filter(accepted::contains).toList();
+        if (!ordered.isEmpty()) {
+            var tagTlsId = localTlsId(ordered.getFirst(), false);
+            sections.replaceAll(section -> section.mid().filter(ordered::contains).isPresent()
+                    ? withTlsId(section, tagTlsId) : section);
+        }
         var lines = sessionLines(ordered, offer.attribute(SdpAttribute.ExtmapAllowMixed.class).isPresent());
         var text = finish(new SessionDescription(lines, sections));
         lastCreatedAnswer = text;
@@ -554,10 +587,17 @@ final class JsepEngine {
         return SetupRole.ACTIVE;
     }
 
+    /// {@return a section whose `a=tls-id` line carries `tlsId`, in place}
+    private static MediaDescription withTlsId(MediaDescription section, String tlsId) {
+        var line = new SdpAttribute.TlsId(tlsId).toLine();
+        return section.withLines(section.lines().stream()
+                .map(candidate -> candidate.isAttribute("tls-id") ? line : candidate).toList());
+    }
+
     /// Writes the answer section of a transceiver, or returns `null` to reject the offered section.
     private MediaDescription answerMediaSection(RtpTransceiver transceiver, SessionDescription offer,
                                                 MediaDescription remote, Negotiated.IceCredentials ice,
-                                                SetupRole setup) {
+                                                SetupRole setup, String tlsId) {
         var codecs = answerCodecs(transceiver, remote);
         if (codecs.stream().noneMatch(entry -> !CodecCatalog.isAuxiliary(entry.codec())
                 && !CodecCatalog.subtype(entry.codec()).equals(CodecCatalog.TELEPHONE_EVENT))) {
@@ -570,14 +610,16 @@ final class JsepEngine {
         var builder = new SectionBuilder(remote.media(), 9, remote.protocol());
         formats(builder, codecs);
         builder.line(new SdpLine('c', "IN IP4 0.0.0.0"));
+        receiveBitrateLine(builder, transceiver);
         builder.attribute(new SdpAttribute.Rtcp(9, Optional.of("IN IP4 0.0.0.0")));
-        transportAttributes(builder, ice, setup);
+        transportAttributes(builder, ice, setup, tlsId);
         builder.attribute(new SdpAttribute.Mid(mid));
         for (var extmap : remote.attributes(SdpAttribute.Extmap.class)) {
-            if (supportsExtension(extmap.uri(), transceiver.kind())) {
+            var local = answerExtensionDirection(transceiver, extmap);
+            if (local.isPresent()) {
                 extensionIds.putIfAbsent(extmap.uri(), extmap.id());
-                builder.attribute(new SdpAttribute.Extmap(extmap.id(), Optional.empty(), extmap.uri(),
-                        Optional.empty()));
+                var written = local.get() == MediaDirection.SENDRECV ? Optional.<MediaDirection>empty() : local;
+                builder.attribute(new SdpAttribute.Extmap(extmap.id(), written, extmap.uri(), Optional.empty()));
             }
         }
         builder.attribute(new SdpAttribute.Direction(toSdp(direction)));
@@ -588,6 +630,13 @@ final class JsepEngine {
         builder.attribute(new SdpAttribute.RtcpMux());
         if (remote.hasAttribute("rtcp-rsize")) {
             builder.attribute(new SdpAttribute.RtcpRsize());
+        }
+        if (hasCryptex(offer, remote)) {
+            builder.attribute(new SdpAttribute.Cryptex());
+        }
+        if (hasCongestionControlFeedback(remote)) {
+            builder.attribute(new SdpAttribute.RtcpFb(OptionalInt.empty(), CodecCatalog.CCFB.type(),
+                    CodecCatalog.CCFB.parameter()));
         }
         codecLines(builder, codecs);
         var remoteSimulcast = remote.attribute(SdpAttribute.Simulcast.class);
@@ -716,12 +765,41 @@ final class JsepEngine {
         return OptionalInt.empty();
     }
 
-    /// {@return whether this side negotiates the header extension `uri` for `kind`}
-    private boolean supportsExtension(URI uri, MediaKind kind) {
-        return CodecCatalog.extensionApplies(uri, kind) && connection.configuration().headerExtensions().stream()
-                .anyMatch(capability -> capability.uri().equals(uri))
-                && !(kind == MediaKind.AUDIO && (uri.equals(CodecCatalog.RTP_STREAM_ID)
-                || uri.equals(CodecCatalog.REPAIRED_RTP_STREAM_ID)));
+    /// {@return the direction, from this side's point of view, an answer accepts an offered header extension in: the
+    /// transceiver's direction for it intersected with the reverse of the offered one, or an empty optional when the
+    /// transceiver does not negotiate it}
+    private static Optional<MediaDirection> answerExtensionDirection(RtpTransceiver transceiver,
+                                                                     SdpAttribute.Extmap extmap) {
+        for (var extension : transceiver.headerExtensions) {
+            if (extension.uri().equals(extmap.uri())) {
+                if (extension.direction() == TransceiverDirection.STOPPED) {
+                    return Optional.empty();
+                }
+                var offered = extmap.direction().orElse(MediaDirection.SENDRECV).reverse();
+                return Optional.of(toSdp(extension.direction()).intersect(offered));
+            }
+        }
+        return Optional.empty();
+    }
+
+    /// {@return whether a section, or the session level of its description, carries `a=cryptex`}
+    ///
+    /// @spec https://www.rfc-editor.org/rfc/rfc9335.html RFC 9335: Completely Encrypting RTP Header Extensions and Contributing Sources
+    static boolean hasCryptex(SessionDescription description, MediaDescription section) {
+        return description.attribute(section, SdpAttribute.Cryptex.class).isPresent();
+    }
+
+    /// {@return whether a section carries `a=rtcp-fb:* ack ccfb`}
+    ///
+    /// @spec https://www.rfc-editor.org/rfc/rfc8888.html RFC 8888: RTP Control Protocol (RTCP) Feedback for Congestion Control
+    static boolean hasCongestionControlFeedback(MediaDescription section) {
+        return section.attributes(SdpAttribute.RtcpFb.class).stream()
+                .anyMatch(feedback -> feedback.payloadType().isEmpty() && isCongestionControlFeedback(feedback));
+    }
+
+    /// {@return whether a feedback attribute is the `ack ccfb` mechanism, whatever its payload type}
+    private static boolean isCongestionControlFeedback(SdpAttribute.RtcpFb feedback) {
+        return feedback.type().equals(CodecCatalog.CCFB.type()) && feedback.parameter().equals(CodecCatalog.CCFB.parameter());
     }
 
     /// {@return a rejected answer section: port `0`, the offered media type, protocol and formats}
@@ -754,10 +832,10 @@ final class JsepEngine {
 
     /// Writes the data section.
     private MediaDescription dataSection(String mid, int port, boolean bundleOnly, Negotiated.IceCredentials ice,
-                                         SetupRole setup) {
+                                         SetupRole setup, String tlsId) {
         var builder = new SectionBuilder("application", port, SCTP_PROTOCOL).format("webrtc-datachannel");
         builder.line(new SdpLine('c', "IN IP4 0.0.0.0"));
-        transportAttributes(builder, ice, setup);
+        transportAttributes(builder, ice, setup, tlsId);
         builder.attribute(new SdpAttribute.Mid(mid));
         if (bundleOnly) {
             builder.attribute(new SdpAttribute.BundleOnly());
@@ -806,7 +884,8 @@ final class JsepEngine {
     }
 
     /// Appends the ICE and DTLS attributes of a section.
-    private void transportAttributes(SectionBuilder builder, Negotiated.IceCredentials ice, SetupRole setup) {
+    private void transportAttributes(SectionBuilder builder, Negotiated.IceCredentials ice, SetupRole setup,
+                                     String tlsId) {
         builder.attribute(new SdpAttribute.IceUfrag(ice.usernameFragment()));
         builder.attribute(new SdpAttribute.IcePwd(ice.password()));
         builder.attribute(new SdpAttribute.IceOptions(List.of("trickle")));
@@ -814,6 +893,63 @@ final class JsepEngine {
             builder.attribute(fingerprint);
         }
         builder.attribute(new SdpAttribute.Setup(setup));
+        builder.attribute(new SdpAttribute.TlsId(tlsId));
+    }
+
+    /// {@return the `a=tls-id` of a local transport: the one the latest applied local description wrote for it,
+    /// unless `restart` asks for a new one or there is none; repeated calls return the same new value until a local
+    /// description applies it}
+    ///
+    /// @param transportId the identification tag of the section that carries the transport
+    /// @param restart     whether the transport's DTLS association restarts, which needs a new value (RFC 8842
+    ///                    section 5)
+    private String localTlsId(String transportId, boolean restart) {
+        var fresh = freshTlsIds.get(transportId);
+        if (fresh != null) {
+            return fresh;
+        }
+        if (!restart) {
+            var base = pendingLocal != null ? pendingLocal : currentLocal;
+            if (base != null) {
+                var applied = base.sdp().mediaByMid(transportId)
+                        .flatMap(section -> base.sdp().attribute(section, SdpAttribute.TlsId.class));
+                if (applied.isPresent()) {
+                    return applied.get().id();
+                }
+            }
+        }
+        var created = randomToken(TLS_ID_LENGTH);
+        freshTlsIds.put(transportId, created);
+        return created;
+    }
+
+    /// {@return whether a remote offer asks for a new DTLS association on the transport a section ran in the
+    /// current remote description: its `a=tls-id` or its set of fingerprints changed}
+    ///
+    /// @spec https://www.rfc-editor.org/rfc/rfc8842.html RFC 8842: Session Description Protocol (SDP) Offer/Answer Considerations for Datagram Transport Layer Security (DTLS) and Transport Layer Security (TLS)
+    private boolean remoteRestartsDtls(SessionDescription offer, MediaDescription section) {
+        if (currentRemote == null) {
+            return false;
+        }
+        var mid = section.mid().orElse(null);
+        var previous = mid == null ? Optional.<MediaDescription>empty() : currentRemote.sdp().mediaByMid(mid);
+        if (previous.isEmpty() || previous.get().isRejected()) {
+            return false;
+        }
+        var oldTlsId = currentRemote.sdp().attribute(previous.get(), SdpAttribute.TlsId.class);
+        var newTlsId = offer.attribute(section, SdpAttribute.TlsId.class);
+        if (oldTlsId.isPresent() && newTlsId.isPresent() && !oldTlsId.equals(newTlsId)) {
+            return true;
+        }
+        return !fingerprintSet(currentRemote.sdp(), previous.get()).equals(fingerprintSet(offer, section));
+    }
+
+    /// {@return the fingerprints of a section, else of its session level, as a set}
+    private static Set<SdpAttribute.Fingerprint> fingerprintSet(SessionDescription description,
+                                                                MediaDescription section) {
+        var fingerprints = section.attributes(SdpAttribute.Fingerprint.class);
+        return new HashSet<>(fingerprints.isEmpty() ? description.attributes(SdpAttribute.Fingerprint.class)
+                : fingerprints);
     }
 
     /// Appends the `a=msid` lines of a sender: one per stream, or one with stream id `-` without streams.
@@ -960,6 +1096,7 @@ final class JsepEngine {
             var restart = localIce != null && !localIce.equals(credentials);
             localIce = credentials;
             iceRestartRequested = false;
+            freshTlsIds.clear();
             pendingLocal = new Description(JsepType.OFFER, parsed);
             localTransportOf = proposeLocalTransports(parsed);
             setState(SignalingState.HAVE_LOCAL_OFFER);
@@ -968,6 +1105,7 @@ final class JsepEngine {
         }
         var restart = localIce != null && !localIce.equals(credentials);
         localIce = credentials;
+        freshTlsIds.clear();
         var offer = pendingRemote.sdp();
         if (type == JsepType.PRANSWER) {
             pendingLocal = new Description(JsepType.PRANSWER, parsed);
@@ -1060,7 +1198,7 @@ final class JsepEngine {
                 continue;
             }
             var kind = kindOf(section.media());
-            if (kind.isEmpty() || !isRtp(section.protocol())) {
+            if (kind.isEmpty() || !isDtlsSrtp(section.protocol())) {
                 continue;
             }
             var transceiver = transceiverByMid(mid);
@@ -1266,7 +1404,9 @@ final class JsepEngine {
     private Negotiated negotiate(SessionDescription offer, SessionDescription answer, boolean localIsOfferer) {
         var local = localIsOfferer ? offer : answer;
         var remote = localIsOfferer ? answer : offer;
-        var group = answer.bundleGroups().stream().findFirst().map(SdpAttribute.Group::mids).orElse(List.of());
+        var bundle = answer.bundleGroups().stream().findFirst();
+        var tag = bundle.flatMap(value -> bundleTag(answer, value));
+        var group = tag.isEmpty() ? List.<String>of() : bundle.get().mids();
         var remoteLite = remote.attribute(SdpAttribute.IceLite.class).isPresent();
         if (iceRole == null || remoteRestartsIce(remote)) {
             iceRole = connection.configuration().iceLite() ? IceRole.CONTROLLED
@@ -1287,7 +1427,7 @@ final class JsepEngine {
                 closed.add(mid);
                 continue;
             }
-            var transportId = group.contains(mid) ? group.getFirst() : mid;
+            var transportId = group.contains(mid) ? tag.get() : mid;
             transportOf.put(mid, transportId);
             var localSection = local.media().get(index);
             var remoteSection = remote.media().get(index);
@@ -1309,20 +1449,25 @@ final class JsepEngine {
         }
         var transports = new ArrayList<Negotiated.Transport>();
         for (var transportId : new LinkedHashSet<>(transportOf.values())) {
-            var tagged = remote.mediaByMid(transportId).orElseThrow();
-            var localTagged = local.mediaByMid(transportId).orElseThrow();
+            var tagged = remote.mediaByMid(transportId).orElseThrow(
+                    () -> new OperationErrorException("the remote description lacks a=mid:" + transportId));
+            var localTagged = local.mediaByMid(transportId).orElseThrow(
+                    () -> new OperationErrorException("the local description lacks a=mid:" + transportId));
             var remoteIce = new Negotiated.IceCredentials(
                     remote.attribute(tagged, SdpAttribute.IceUfrag.class).map(SdpAttribute.IceUfrag::ufrag)
-                            .orElseThrow(),
+                            .orElseThrow(() -> new OperationErrorException(
+                                    "the remote transport a=mid:" + transportId + " lacks a=ice-ufrag")),
                     remote.attribute(tagged, SdpAttribute.IcePwd.class).map(SdpAttribute.IcePwd::password)
-                            .orElseThrow());
+                            .orElseThrow(() -> new OperationErrorException(
+                                    "the remote transport a=mid:" + transportId + " lacks a=ice-pwd")));
             var candidates = new ArrayList<String>();
             var complete = false;
             for (var entry : transportOf.entrySet()) {
                 if (!entry.getValue().equals(transportId)) {
                     continue;
                 }
-                var section = remote.mediaByMid(entry.getKey()).orElseThrow();
+                var section = remote.mediaByMid(entry.getKey()).orElseThrow(
+                        () -> new OperationErrorException("the remote description lacks a=mid:" + entry.getKey()));
                 for (var candidate : section.attributes("candidate")) {
                     if (!candidates.contains(candidate)) {
                         candidates.add(candidate);
@@ -1346,16 +1491,23 @@ final class JsepEngine {
             var role = localIsOfferer
                     ? remoteSetup == SetupRole.PASSIVE ? DtlsRole.CLIENT : DtlsRole.SERVER
                     : localSetup == SetupRole.PASSIVE ? DtlsRole.SERVER : DtlsRole.CLIENT;
-            if (dtlsRole == null) {
+            var remoteTlsId = remote.attribute(tagged, SdpAttribute.TlsId.class).map(SdpAttribute.TlsId::id);
+            var previous = negotiated == null ? Optional.<Negotiated.Transport>empty() : negotiated.transports()
+                    .stream().filter(candidate -> candidate.id().equals(transportId)).findFirst();
+            var dtlsRestart = previous.isPresent() && (previous.get().dtlsRole() != role
+                    || !new HashSet<>(previous.get().remoteFingerprints()).equals(new HashSet<>(fingerprints))
+                    || (previous.get().remoteTlsId().isPresent() && remoteTlsId.isPresent()
+                    && !previous.get().remoteTlsId().equals(remoteTlsId)));
+            if (dtlsRole == null || dtlsRestart) {
                 dtlsRole = role;
             }
-            var restart = negotiated != null && negotiated.transports().stream()
-                    .anyMatch(previous -> previous.id().equals(transportId)
-                            && (!previous.remote().equals(remoteIce) || !previous.local().equals(localIce)));
+            var localTlsId = local.attribute(localTagged, SdpAttribute.TlsId.class).map(SdpAttribute.TlsId::id)
+                    .orElseGet(() -> previous.map(Negotiated.Transport::localTlsId)
+                            .orElseGet(() -> randomToken(TLS_ID_LENGTH)));
             var mids = transportOf.entrySet().stream().filter(entry -> entry.getValue().equals(transportId))
                     .map(Map.Entry::getKey).toList();
             transports.add(new Negotiated.Transport(transportId, mids, localIce, remoteIce, remoteLite, candidates,
-                    complete, fingerprints, role, iceRole, restart));
+                    complete, fingerprints, role, iceRole, localTlsId, remoteTlsId, dtlsRestart));
             localTransportOf.keySet().removeIf(mid -> !transportOf.containsKey(mid));
             for (var mid : mids) {
                 localTransportOf.put(mid, transportId);
@@ -1400,8 +1552,12 @@ final class JsepEngine {
             }
         }
         var extensions = new LinkedHashMap<Integer, URI>();
+        var extensionDirections = new LinkedHashMap<URI, TransceiverDirection>();
         for (var extmap : answerSection.attributes(SdpAttribute.Extmap.class)) {
             extensions.put(extmap.id(), extmap.uri());
+            var answered = extmap.direction().orElse(MediaDirection.SENDRECV);
+            var mine = localIsOfferer ? answered.reverse() : answered;
+            extensionDirections.putIfAbsent(extmap.uri(), TransceiverDirection.of(mine.sends(), mine.receives()));
         }
         var sendLayers = new ArrayList<Negotiated.SendLayer>();
         if (direction.sends()) {
@@ -1441,15 +1597,39 @@ final class JsepEngine {
         }
         var remoteStreams = remoteSection.attributes(SdpAttribute.Msid.class).stream()
                 .map(SdpAttribute.Msid::streamId).filter(stream -> !stream.equals("-")).distinct().toList();
-        var remoteBitrate = remoteSection.bandwidths().stream()
-                .filter(bandwidth -> bandwidth.type().equals(Bandwidth.TIAS) || bandwidth.type().equals(Bandwidth.AS))
-                .sorted((a, b) -> a.type().equals(Bandwidth.TIAS) ? -1 : b.type().equals(Bandwidth.TIAS) ? 1 : 0)
-                .map(Bandwidth::bitsPerSecond).filter(OptionalLong::isPresent).map(OptionalLong::getAsLong)
-                .findFirst().map(OptionalLong::of).orElse(OptionalLong.empty());
+        var maxBitrate = payloadBitrate(remoteSection.bandwidths(), transceiver.kind())
+                .or(() -> payloadBitrate(remote.bandwidths(), transceiver.kind()))
+                .map(OptionalLong::of).orElse(OptionalLong.empty());
         var reducedSize = answerSection.hasAttribute("rtcp-rsize");
+        var cryptex = hasCryptex(local, localSection) && hasCryptex(remote, remoteSection);
+        var ccfb = hasCongestionControlFeedback(localSection) && hasCongestionControlFeedback(remoteSection);
         return new Negotiated.Media(transceiver, mid, transportId, transceiver.kind(), direction, codecs, red, ulpfec,
                 flexfec, Optional.ofNullable(telephoneEvent), extensions, reducedSize, cname, sendLayers,
-                receiveLayers, remoteStreams, remoteBitrate);
+                receiveLayers, remoteStreams, maxBitrate, cryptex, ccfb, extensionDirections);
+    }
+
+    /// {@return the payload bitrate cap that `b=` lines set, in bits per second: `TIAS` as is, else `AS` less the
+    /// packet overhead of [#PACKET_OVERHEAD_BYTES] at the packet rate of the kind (50 per second for audio, one per
+    /// [#VIDEO_PACKET_BYTES] of video), never below half the `AS` value; an empty optional when neither is set}
+    ///
+    /// @spec https://www.rfc-editor.org/rfc/rfc3890.html RFC 3890: A Transport Independent Bandwidth Modifier for the Session Description Protocol (SDP)
+    /// @spec https://www.rfc-editor.org/rfc/rfc3556.html RFC 3556: Session Description Protocol (SDP) Bandwidth Modifiers for RTP Control Protocol (RTCP) Bandwidth
+    static Optional<Long> payloadBitrate(List<Bandwidth> bandwidths, MediaKind kind) {
+        for (var bandwidth : bandwidths) {
+            if (bandwidth.type().equals(Bandwidth.TIAS) && bandwidth.bitsPerSecond().isPresent()) {
+                return Optional.of(bandwidth.bitsPerSecond().getAsLong());
+            }
+        }
+        for (var bandwidth : bandwidths) {
+            if (bandwidth.type().equals(Bandwidth.AS) && bandwidth.bitsPerSecond().isPresent()) {
+                var total = bandwidth.bitsPerSecond().getAsLong();
+                var packetsPerSecond = kind == MediaKind.AUDIO ? AUDIO_PACKETS_PER_SECOND
+                        : Math.ceilDiv(total, VIDEO_PACKET_BYTES * 8L);
+                var overhead = packetsPerSecond * PACKET_OVERHEAD_BYTES * 8L;
+                return Optional.of(Math.max(total - overhead, total / 2));
+            }
+        }
+        return Optional.empty();
     }
 
     /// {@return the remote stream a section without simulcast announces through `a=ssrc` and `a=ssrc-group:FID`}
@@ -1475,19 +1655,22 @@ final class JsepEngine {
         var result = new ArrayList<Negotiated.CodecEntry>();
         var kind = kindOf(section.media()).orElse(MediaKind.AUDIO);
         for (var rtp : RtpCodec.of(section)) {
-            var parameters = rtp.fmtp().map(text -> new SdpAttribute.Fmtp(rtp.payloadType(), text).parameterMap())
+            var parameters = rtp.fmtpValue().map(text -> new SdpAttribute.Fmtp(rtp.payloadType(), text).parameterMap())
                     .orElse(Map.of());
             var mime = (kind == MediaKind.AUDIO ? "audio/" : "video/") + rtp.name();
             Codec codec;
             try {
                 codec = new Codec(mime, rtp.clockRate(),
-                        kind == MediaKind.AUDIO ? OptionalInt.of(rtp.channels()) : OptionalInt.empty(),
+                        kind == MediaKind.AUDIO ? OptionalInt.of(rtp.channelCount()) : OptionalInt.empty(),
                         lowerCaseKeys(parameters));
             } catch (IllegalArgumentException exception) {
                 continue;
             }
             var fbs = new ArrayList<RtcpFeedback>();
             for (var fb : feedback) {
+                if (isCongestionControlFeedback(fb)) {
+                    continue;
+                }
                 if (fb.payloadType().isEmpty() || fb.payloadType().getAsInt() == rtp.payloadType()) {
                     var mechanism = new RtcpFeedback(fb.type(), fb.parameter());
                     if (!fbs.contains(mechanism)) {
@@ -1820,14 +2003,44 @@ final class JsepEngine {
     private static SessionDescription parse(String text) {
         try {
             return SessionDescription.parse(Objects.requireNonNull(text, "sdp cannot be null"));
-        } catch (IllegalArgumentException exception) {
+        } catch (SdpFormatException exception) {
             throw new OperationErrorException("malformed session description: " + exception.getMessage(), exception);
         }
     }
 
-    /// {@return whether a protocol is an RTP profile Parley negotiates through JSEP}
-    static boolean isRtp(String protocol) {
-        return protocol.endsWith("RTP/SAVPF") || protocol.endsWith("RTP/SAVP");
+    /// {@return whether a protocol is one of the DTLS-SRTP profiles, the only RTP profiles a peer connection
+    /// negotiates}
+    ///
+    /// @spec https://www.rfc-editor.org/rfc/rfc5764.html RFC 5764: Datagram Transport Layer Security (DTLS) Extension to Establish Keys for the Secure Real-time Transport Protocol (SRTP)
+    /// @spec https://www.rfc-editor.org/rfc/rfc7850.html RFC 7850: Registering Values of the SDP 'proto' Field for Transporting RTP Media over TCP under Various RTP Profiles
+    static boolean isDtlsSrtp(String protocol) {
+        return DTLS_SRTP_PROTOCOLS.contains(protocol);
+    }
+
+    /// {@return whether this side can accept a media section: audio or video over a DTLS-SRTP profile, or the data
+    /// section over SCTP; every other section is answered with port `0`}
+    static boolean isSupported(MediaDescription section) {
+        return section.media().equals("application") ? isSctp(section.protocol())
+                : kindOf(section.media()).isPresent() && isDtlsSrtp(section.protocol());
+    }
+
+    /// {@return the identification tag of the section that carries the transport of a BUNDLE group: the first
+    /// section the group names that is present, not rejected, has a non-zero port and that this side can accept, or
+    /// an empty optional when there is none}
+    ///
+    /// The validator of remote descriptions and the negotiation both read the tag from here, so a description the
+    /// validator accepted always has the transport attributes the negotiation reads.
+    ///
+    /// @spec https://www.rfc-editor.org/rfc/rfc8843.html RFC 8843: Negotiating Media Multiplexing Using the Session Description Protocol (SDP)
+    static Optional<String> bundleTag(SessionDescription description, SdpAttribute.Group group) {
+        for (var mid : group.mids()) {
+            var section = description.mediaByMid(mid);
+            if (section.isPresent() && !section.get().isRejected() && section.get().port() != 0
+                    && isSupported(section.get())) {
+                return Optional.of(mid);
+            }
+        }
+        return Optional.empty();
     }
 
     /// {@return whether a protocol carries SCTP over DTLS}

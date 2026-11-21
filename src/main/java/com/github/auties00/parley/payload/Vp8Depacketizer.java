@@ -56,8 +56,9 @@ final class Vp8Depacketizer implements Depacketizer {
         var data = out.toByteArray();
         var keyframe = (data[0] & 0x01) == 0;
         var resolution = keyframe ? keyframeResolution(data) : Optional.<Resolution>empty();
-        var metadata = new Vp8FrameMetadata(first.pictureId(), first.tl0PicIndex(), first.temporalId(),
-                first.layerSync(), first.keyIndex(), first.nonReference(), resolution, OptionalLong.empty(), List.of());
+        var metadata = new Vp8FrameMetadata(first.pictureId(), first.longPictureId() ? 15 : 7, first.tl0PicIndex(),
+                first.temporalId(), first.layerSync(), first.keyIndex(), first.nonReference(), resolution,
+                OptionalLong.empty(), List.of());
         return new EncodedFrame(MediaKind.VIDEO, ByteBuffer.wrap(data), packetsOfOneFrame.getFirst().timestamp(),
                 keyframe, Optional.empty(), metadata);
     }
