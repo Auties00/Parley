@@ -93,6 +93,7 @@ public sealed interface SdpAttribute {
     /// {@return the typed attribute of the text after `a=`, as [#parse(SdpLine)] maps it}
     ///
     /// @param text the attribute text, such as `mid:0` or `rtcp-mux`
+    /// @throws IllegalArgumentException if `text` holds a line break
     static SdpAttribute parse(String text) {
         return parse(new SdpLine('a', Objects.requireNonNull(text, "text cannot be null")));
     }

@@ -116,6 +116,8 @@ final class JsepEngine {
 
     /// The local ICE credentials of the last applied local description, or `null`.
     private Negotiated.IceCredentials localIce;
+    /// The credentials the next local description uses when it does not keep [#localIce], or `null`.
+    private Negotiated.IceCredentials nextIce;
     /// Whether the application asked for an ICE restart.
     private boolean iceRestartRequested;
     /// The local DTLS role once a first answer decided it, or `null`.
@@ -265,8 +267,7 @@ final class JsepEngine {
         if (state != SignalingState.STABLE && state != SignalingState.HAVE_LOCAL_OFFER) {
             throw new InvalidStateException("cannot create an offer in state " + state);
         }
-        var restart = options.iceRestart() || iceRestartRequested;
-        var ice = restart || localIce == null ? newCredentials() : localIce;
+        var ice = iceForNext(options.iceRestart() || iceRestartRequested);
         var slots = planOffer();
         var assignments = new HashMap<String, RtpTransceiver>();
         for (var slot : slots) {
@@ -392,7 +393,7 @@ final class JsepEngine {
                                                Negotiated.IceCredentials ice) {
         var codecs = offerCodecs(transceiver);
         var builder = new SectionBuilder(kindName(transceiver.kind()), port, RTP_PROTOCOL);
-        codecs.forEach(entry -> builder.format(Integer.toString(entry.payloadType())));
+        formats(builder, codecs);
         builder.line(new SdpLine('c', "IN IP4 0.0.0.0"));
         builder.attribute(new SdpAttribute.Rtcp(9, Optional.of("IN IP4 0.0.0.0")));
         transportAttributes(builder, ice, SetupRole.ACTPASS);
@@ -501,8 +502,7 @@ final class JsepEngine {
             throw new InvalidStateException("cannot create an answer in state " + state);
         }
         var offer = pendingRemote.sdp();
-        var restart = remoteRestartsIce(offer) || localIce == null;
-        var ice = restart ? newCredentials() : localIce;
+        var ice = iceForNext(remoteRestartsIce(offer));
         var setup = answerSetup(offer);
         var offeredGroup = offer.bundleGroups().stream().findFirst().map(SdpAttribute.Group::mids).orElse(List.of());
         var sections = new ArrayList<MediaDescription>();
@@ -568,7 +568,7 @@ final class JsepEngine {
         var direction = TransceiverDirection.of(transceiver.direction.sends() && remoteDirection.receives(),
                 transceiver.direction.receives() && remoteDirection.sends());
         var builder = new SectionBuilder(remote.media(), 9, remote.protocol());
-        codecs.forEach(entry -> builder.format(Integer.toString(entry.payloadType())));
+        formats(builder, codecs);
         builder.line(new SdpLine('c', "IN IP4 0.0.0.0"));
         builder.attribute(new SdpAttribute.Rtcp(9, Optional.of("IN IP4 0.0.0.0")));
         transportAttributes(builder, ice, setup);
@@ -843,6 +843,14 @@ final class JsepEngine {
         }
     }
 
+    /// Appends the payload types of the codecs to the `m=` line, each followed by that of its RTX format.
+    private static void formats(SectionBuilder builder, List<Negotiated.CodecEntry> codecs) {
+        for (var entry : codecs) {
+            builder.format(Integer.toString(entry.payloadType()));
+            entry.rtxPayloadType().ifPresent(rtx -> builder.format(Integer.toString(rtx)));
+        }
+    }
+
     /// {@return whether any codec has an RTX format}
     private static boolean hasRtx(List<Negotiated.CodecEntry> codecs) {
         return codecs.stream().anyMatch(entry -> entry.rtxPayloadType().isPresent());
@@ -924,7 +932,10 @@ final class JsepEngine {
         if (!text.equals(created)) {
             SdpMungingRules.check(parse(created), parsed);
         }
-        var credentials = iceCredentials(parsed).orElseThrow(
+        var allRejected = parsed.media().stream().allMatch(MediaDescription::isRejected);
+        var fallback = localIce != null ? localIce : nextIce;
+        var credentials = iceCredentials(parsed).or(() -> allRejected ? Optional.ofNullable(fallback)
+                : Optional.empty()).orElseThrow(
                 () -> new InvalidModificationException("the description carries no ICE credentials"));
         if (type == JsepType.OFFER) {
             if (state == SignalingState.STABLE) {
@@ -1772,6 +1783,18 @@ final class JsepEngine {
         var previous = iceCredentials(currentRemote.sdp());
         var next = iceCredentials(remote);
         return previous.isPresent() && next.isPresent() && !previous.equals(next);
+    }
+
+    /// {@return the credentials of the next local description: the current ones, unless `restart` asks for new ones
+    /// or there are none yet; repeated calls return the same new credentials until a description applies them}
+    private Negotiated.IceCredentials iceForNext(boolean restart) {
+        if (!restart && localIce != null) {
+            return localIce;
+        }
+        if (nextIce == null || nextIce.equals(localIce)) {
+            nextIce = newCredentials();
+        }
+        return nextIce;
     }
 
     /// {@return fresh ICE credentials: a 4-character username fragment and a 24-character password}
