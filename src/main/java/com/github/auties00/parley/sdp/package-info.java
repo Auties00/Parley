@@ -3,7 +3,9 @@
 /// ([RtpCodec], RFC 8866 sections 6.6 and 6.15) and the SDES keys ([SdesCrypto], RFC 4568).
 ///
 /// The model is a lossless view of the text: a parsed description keeps every line, in order and verbatim, so the
-/// attributes this package does not interpret survive a parse and encode round trip. Every type is immutable.
+/// attributes this package does not interpret survive a parse and encode round trip. Every type is immutable. Text
+/// that is not a session description fails to parse with the checked [SdpFormatException], since a description is
+/// untrusted wire data.
 ///
 /// Unless otherwise noted, passing `null` to a method or constructor of a type in this package throws
 /// [NullPointerException].

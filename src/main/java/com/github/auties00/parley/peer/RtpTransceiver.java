@@ -4,9 +4,11 @@ import com.github.auties00.parley.media.Codec;
 import com.github.auties00.parley.media.MediaKind;
 
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.OptionalLong;
 
 /// A pair of an [RtpSender] and an [RtpReceiver] sharing one media section, the W3C `RTCRtpTransceiver`.
 ///
@@ -50,6 +52,12 @@ public final class RtpTransceiver {
     List<Codec> codecPreferences = List.of();
     /// The last negotiated media section, or `null`.
     Negotiated.Media negotiated;
+    /// The header extensions the next negotiation offers or accepts, with their directions.
+    List<RtpHeaderExtensionCapability> headerExtensions;
+    /// The payload bitrate cap the descriptions ask the peer to respect on this section, written as `b=TIAS`.
+    OptionalLong receiveBitrateCap = OptionalLong.empty();
+    /// How the remote track delivers media, or an empty optional for the connection's default.
+    Optional<RemoteTrackMode> remoteTrackMode = Optional.empty();
 
     /// Creates a transceiver.
     RtpTransceiver(PeerConnection connection, MediaKind kind, TransceiverDirection direction, RtpSender sender,
@@ -59,6 +67,21 @@ public final class RtpTransceiver {
         this.direction = direction;
         this.sender = sender;
         this.receiver = receiver;
+        this.headerExtensions = CodecCatalog.extensionsFor(connection.configuration().headerExtensions(), kind);
+    }
+
+    /// Applies the Parley options of a [TransceiverInit] that the W3C members do not cover: the receive bitrate cap
+    /// and the remote track mode.
+    ///
+    /// @param init the options the transceiver was created with
+    void applyInit(TransceiverInit init) {
+        receiveBitrateCap = init.receiveBitrateCap();
+        remoteTrackMode = init.remoteTrackMode();
+    }
+
+    /// {@return how the remote track delivers media, or an empty optional for the connection's default}
+    Optional<RemoteTrackMode> remoteTrackMode() {
+        return remoteTrackMode;
     }
 
     /// {@return the media kind}
@@ -175,6 +198,68 @@ public final class RtpTransceiver {
                 throw new InvalidModificationException("the preferences hold no media codec");
             }
             codecPreferences = List.copyOf(result);
+        }
+    }
+
+    /// {@return the header extensions the next negotiation offers or accepts for this transceiver, each with the
+    /// direction it is negotiated in; `STOPPED` ones are left out of the descriptions}
+    ///
+    /// The list starts as the connection's header extensions that apply to the transceiver's kind, all `SENDRECV`.
+    public List<RtpHeaderExtensionCapability> headerExtensionsToNegotiate() {
+        synchronized (connection.lock()) {
+            return headerExtensions;
+        }
+    }
+
+    /// Changes the header extensions the next negotiation offers or accepts, the WebRTC Extensions
+    /// `setHeaderExtensionsToNegotiate`; the change can make a negotiation needed only through other changes, as the
+    /// extension set is not part of the negotiation-needed check.
+    ///
+    /// Each extension must be one of [#headerExtensionsToNegotiate()] by URI, at most once; extensions left out keep
+    /// their place and become `STOPPED`. The `sdes:mid` extension, which BUNDLE demultiplexing needs, cannot be
+    /// stopped.
+    ///
+    /// @param extensions the extensions with their new directions
+    /// @throws InvalidModificationException if an extension is unknown or given twice, or `sdes:mid` is stopped
+    /// @throws InvalidStateException        if the connection is closed
+    public void setHeaderExtensionsToNegotiate(List<RtpHeaderExtensionCapability> extensions) {
+        var copy = List.copyOf(extensions);
+        synchronized (connection.lock()) {
+            connection.checkOpen();
+            var updated = new LinkedHashMap<java.net.URI, RtpHeaderExtensionCapability>();
+            for (var current : headerExtensions) {
+                updated.put(current.uri(), current.withDirection(TransceiverDirection.STOPPED));
+            }
+            var seen = new java.util.HashSet<java.net.URI>();
+            for (var extension : copy) {
+                if (!updated.containsKey(extension.uri())) {
+                    throw new InvalidModificationException("unknown header extension: " + extension.uri());
+                }
+                if (!seen.add(extension.uri())) {
+                    throw new InvalidModificationException("header extension given twice: " + extension.uri());
+                }
+                updated.put(extension.uri(), extension);
+            }
+            var mid = updated.get(CodecCatalog.MID);
+            if (mid != null && mid.direction() == TransceiverDirection.STOPPED) {
+                throw new InvalidModificationException("the sdes:mid header extension cannot be stopped");
+            }
+            headerExtensions = List.copyOf(updated.values());
+        }
+    }
+
+    /// {@return the header extensions of [#headerExtensionsToNegotiate()] with the direction the last answer
+    /// negotiated: `SENDRECV`, `SENDONLY` or `RECVONLY` from this side's point of view for a negotiated one,
+    /// `STOPPED` for the others and before the first answer}
+    public List<RtpHeaderExtensionCapability> negotiatedHeaderExtensions() {
+        synchronized (connection.lock()) {
+            var result = new ArrayList<RtpHeaderExtensionCapability>();
+            for (var extension : headerExtensions) {
+                var direction = negotiated == null ? Optional.<TransceiverDirection>empty()
+                        : Optional.ofNullable(negotiated.extensionDirections().get(extension.uri()));
+                result.add(extension.withDirection(direction.orElse(TransceiverDirection.STOPPED)));
+            }
+            return List.copyOf(result);
         }
     }
 

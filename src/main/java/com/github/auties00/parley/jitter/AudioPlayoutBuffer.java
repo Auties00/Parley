@@ -1,5 +1,6 @@
 package com.github.auties00.parley.jitter;
 
+import com.github.auties00.parley.media.AudioFrameMetadata;
 import com.github.auties00.parley.media.EncodedFrame;
 import com.github.auties00.parley.media.MediaKind;
 import com.github.auties00.parley.net.MonotonicClock;
@@ -9,13 +10,16 @@ import com.github.auties00.parley.payload.OpusFormat;
 import com.github.auties00.parley.payload.PayloadFormat;
 import com.github.auties00.parley.payload.PayloadFormatException;
 import com.github.auties00.parley.rtp.RtpPacket;
+import com.github.auties00.parley.rtp.session.NtpRtpMapping;
 
 import java.time.Duration;
+import java.time.Instant;
 import java.util.ArrayDeque;
 import java.util.Arrays;
 import java.util.List;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.OptionalDouble;
 import java.util.TreeMap;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.locks.Condition;
@@ -44,11 +48,19 @@ import java.util.concurrent.locks.ReentrantLock;
 ///
 /// The buffer delays each frame by a target delay: the 95th percentile of the recent packet delays (each packet's
 /// transit time above the fastest recent one) or twice the RFC 3550 interarrival jitter, whichever is larger, kept
-/// between the configured minimum and maximum and never below the `jitterBufferTarget`. At the start of each
+/// between the configured minimum and maximum, never below the `jitterBufferTarget`, and within the bounds of the
+/// `playout-delay` header extension when the stream carries it. At the start of each
 /// talkspurt (a packet with the marker bit after silence or loss) the schedule restarts at the current target. While
 /// audio plays and the actual delay drifts more than a frame away from the target, the buffer conceals one extra
 /// frame to grow the delay ([AudioPlayoutStatistics#insertedSamplesForDeceleration()]) or skips one frame to shrink
-/// it ([AudioPlayoutStatistics#removedSamplesForAcceleration()]), at most once per ten frames.
+/// it ([AudioPlayoutStatistics#removedSamplesForAcceleration()]), at most once per ten frames. A [SyncGroup] the
+/// buffer belongs to adds its share of lip-sync delay to the target.
+///
+/// # Capture time
+///
+/// Each frame handed out carries its capture time on the sender's clock ([EncodedFrame#captureTime()]): from the
+/// `abs-capture-time` header extension when the stream carries it, else from the RTP to NTP mapping of the latest
+/// sender report, which the receiving side passes in with [#setSenderClock(NtpRtpMapping)].
 ///
 /// # Threading
 ///
@@ -57,6 +69,7 @@ import java.util.concurrent.locks.ReentrantLock;
 /// @spec https://www.rfc-editor.org/rfc/rfc3550.html#appendix-A.8 RFC 3550 appendix A.8: Estimating the Interarrival Jitter
 /// @spec https://www.w3.org/TR/webrtc-extensions/#dom-rtcrtpreceiver-jitterbuffertarget W3C WebRTC Extensions: jitterBufferTarget
 /// @spec https://www.w3.org/TR/webrtc-stats/ Identifiers for WebRTC's Statistics API
+/// @spec https://webrtc.googlesource.com/src/+/refs/heads/main/docs/native-code/rtp-hdrext/playout-delay/README.md Playout Delay
 public final class AudioPlayoutBuffer implements AutoCloseable {
     /// The number of recent packet delays the percentile is taken over: about two seconds of 20 ms frames.
     private static final int HISTORY = 100;
@@ -105,6 +118,24 @@ public final class AudioPlayoutBuffer implements AutoCloseable {
 
     /// The unwrapper of sequence numbers.
     private final Unwrapper sequences = new Unwrapper(16);
+
+    /// The capture clock and playout delay bounds of the stream.
+    private final CaptureClock captureClock;
+
+    /// The lip-sync state.
+    private final SyncState sync = new SyncState();
+
+    /// The capture time of the last frame played, or `null`.
+    private Instant lastCaptureTime;
+
+    /// When the last frame with a capture time played, in clock nanoseconds.
+    private long lastCapturePlayoutNanos;
+
+    /// The audio level of the last frame played, `0` to `1`, or `NaN` when unknown.
+    private double audioLevel = Double.NaN;
+
+    /// The sum over frames of the squared audio level times their duration in seconds.
+    private double totalAudioEnergy;
 
     /// The application's preferred delay.
     private Optional<Duration> jitterBufferTarget;
@@ -199,6 +230,8 @@ public final class AudioPlayoutBuffer implements AutoCloseable {
         this.comfortNoiseFormat = format instanceof ComfortNoiseFormat;
         this.jitterBufferTarget = config.jitterBufferTarget();
         this.frameUnits = Math.max(1, toUnits(config.defaultFrameDuration().toNanos()));
+        this.captureClock = new CaptureClock(clockRate, config.depacketizer().absCaptureTimeExtensionId(),
+                config.depacketizer().playoutDelayExtensionId());
     }
 
     /// Creates a playout buffer for one incoming audio stream.
@@ -246,6 +279,7 @@ public final class AudioPlayoutBuffer implements AutoCloseable {
                 return;
             }
             packetsReceived++;
+            captureClock.observe(copy);
             var timestamp = timestamps.unwrap(copy.timestamp());
             var sequence = sequences.unwrap(copy.sequence());
             updateJitter(timestamp, arrivalNanos);
@@ -288,18 +322,21 @@ public final class AudioPlayoutBuffer implements AutoCloseable {
     /// @throws InterruptedException  if the thread is interrupted while waiting
     /// @throws IllegalStateException if the buffer is closed
     public AudioPlayout next() throws InterruptedException {
+        AudioPlayout result;
         lock.lockInterruptibly();
         try {
             while (true) {
                 var outcome = due();
                 if (outcome.isPresent()) {
-                    return outcome.get();
+                    result = outcome.get();
+                    break;
                 }
                 changed.awaitNanos(waitNanos(MAX_WAIT_NANOS));
             }
         } finally {
             lock.unlock();
         }
+        return played(result);
     }
 
     /// Waits up to a timeout for the next playout instant and returns its outcome.
@@ -310,12 +347,14 @@ public final class AudioPlayoutBuffer implements AutoCloseable {
     /// @throws IllegalStateException if the buffer is closed
     public Optional<AudioPlayout> next(Duration timeout) throws InterruptedException {
         var deadline = System.nanoTime() + timeout.toNanos();
+        Optional<AudioPlayout> result;
         lock.lockInterruptibly();
         try {
             while (true) {
                 var outcome = due();
                 if (outcome.isPresent()) {
-                    return outcome;
+                    result = outcome;
+                    break;
                 }
                 var remaining = deadline - System.nanoTime();
                 if (remaining <= 0) {
@@ -326,6 +365,7 @@ public final class AudioPlayoutBuffer implements AutoCloseable {
         } finally {
             lock.unlock();
         }
+        return result.map(this::played);
     }
 
     /// {@return the outcome whose playout instant has come by the buffer's clock, without waiting, or an empty
@@ -333,26 +373,67 @@ public final class AudioPlayoutBuffer implements AutoCloseable {
     ///
     /// @throws IllegalStateException if the buffer is closed
     public Optional<AudioPlayout> poll() {
+        Optional<AudioPlayout> result;
         lock.lock();
         try {
-            return due();
+            result = due();
+        } finally {
+            lock.unlock();
+        }
+        return result.map(this::played);
+    }
+
+    /// {@return an outcome, after telling the synchronization group a frame played}
+    private AudioPlayout played(AudioPlayout outcome) {
+        if (outcome instanceof AudioPlayout.Frame) {
+            sync.notifyPlayout();
+        }
+        return outcome;
+    }
+
+    /// Sets the application's preferred delay, the W3C `jitterBufferTarget`; it applies from the next adaptation.
+    ///
+    /// @param target the preferred delay, `0..4000` ms
+    /// @throws IllegalArgumentException if `target` is out of range
+    public void setJitterBufferTarget(Duration target) {
+        var wrapped = Optional.of(target);
+        AudioPlayoutConfig.checkTarget(wrapped);
+        lock.lock();
+        try {
+            jitterBufferTarget = wrapped;
         } finally {
             lock.unlock();
         }
     }
 
-    /// Sets the application's preferred delay, the W3C `jitterBufferTarget`; it applies from the next adaptation.
-    ///
-    /// @param target the preferred delay, `0..4000` ms, or an empty optional to let the buffer decide
-    /// @throws IllegalArgumentException if `target` is out of range
-    public void setJitterBufferTarget(Optional<Duration> target) {
-        AudioPlayoutConfig.checkTarget(target);
+    /// Removes the application's preferred delay, letting the buffer decide; it applies from the next adaptation.
+    public void clearJitterBufferTarget() {
         lock.lock();
         try {
-            jitterBufferTarget = target;
+            jitterBufferTarget = Optional.empty();
         } finally {
             lock.unlock();
         }
+    }
+
+    /// Sets the RTP to NTP mapping of the stream's latest RTCP sender report, which dates the frames that carry no
+    /// `abs-capture-time`; call it on every sender report.
+    ///
+    /// @param mapping the mapping
+    /// @spec https://www.rfc-editor.org/rfc/rfc3550.html#section-6.4.1 RFC 3550 section 6.4.1: SR: Sender Report RTCP Packet
+    public void setSenderClock(NtpRtpMapping mapping) {
+        Objects.requireNonNull(mapping, "mapping cannot be null");
+        lock.lock();
+        try {
+            captureClock.setSenderClock(mapping);
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    /// {@return the synchronization state, for [SyncGroup]}
+    SyncState syncMember() {
+        return sync;
     }
 
     /// {@return the current target delay}
@@ -369,11 +450,15 @@ public final class AudioPlayoutBuffer implements AutoCloseable {
     public AudioPlayoutStatistics statistics() {
         lock.lock();
         try {
+            var estimated = lastCaptureTime == null ? Optional.<Instant>empty()
+                    : Optional.of(lastCaptureTime.plusNanos(Math.max(0, clock.nanos() - lastCapturePlayoutNanos)));
             return new AudioPlayoutStatistics(packetsReceived, packetsLate, packetsDiscarded,
                     Duration.ofNanos(toNanos((long) jitter)), Duration.ofNanos(jitterBufferDelayNanos),
                     Duration.ofNanos(jitterBufferTargetDelayNanos), Duration.ofNanos(jitterBufferMinimumDelayNanos),
                     emittedCount, totalSamples, concealedSamples, silentConcealedSamples, concealmentEvents,
-                    insertedSamples, removedSamples, Duration.ofNanos(targetNanos()));
+                    insertedSamples, removedSamples, Duration.ofNanos(targetNanos()), clockRate, estimated,
+                    Double.isNaN(audioLevel) ? OptionalDouble.empty() : OptionalDouble.of(audioLevel),
+                    totalAudioEnergy, Duration.ofNanos(sync.syncDelayNanos()));
         } finally {
             lock.unlock();
         }
@@ -391,6 +476,7 @@ public final class AudioPlayoutBuffer implements AutoCloseable {
         } finally {
             lock.unlock();
         }
+        sync.leave();
     }
 
     /// Starts the schedule at a packet arriving now.
@@ -488,7 +574,23 @@ public final class AudioPlayoutBuffer implements AutoCloseable {
             concealedSamples += units;
             return new AudioPlayout.Missing(slot.packet().timestamp(), Duration.ofNanos(toNanos(units)));
         }
-        return new AudioPlayout.Frame(frame.get(), Duration.ofNanos(toNanos(units)));
+        var played = frame.get();
+        if (played.captureTime().isEmpty()) {
+            var capture = captureClock.captureTimeOf(slot.packet().timestamp());
+            if (capture.isPresent()) {
+                played = played.withCaptureTime(capture.get());
+            }
+        }
+        if (played.captureTime().isPresent()) {
+            lastCaptureTime = played.captureTime().get();
+            lastCapturePlayoutNanos = now;
+            sync.record(now, lastCaptureTime);
+        }
+        if (played.metadata() instanceof AudioFrameMetadata audio && audio.audioLevelDbov().isPresent()) {
+            audioLevel = Math.pow(10, -audio.audioLevelDbov().getAsInt() / 20.0);
+            totalAudioEnergy += audioLevel * audioLevel * units / clockRate;
+        }
+        return new AudioPlayout.Frame(played, Duration.ofNanos(toNanos(units)));
     }
 
     /// {@return a missing outcome; `advance` false keeps the timestamp to grow the delay}
@@ -550,14 +652,20 @@ public final class AudioPlayoutBuffer implements AutoCloseable {
         return scheduled - last.getValue().arrival();
     }
 
-    /// {@return the target delay in nanoseconds}
+    /// {@return the target delay in nanoseconds: the estimate within the configured bounds, the playout delay bounds
+    /// the stream carries and the `jitterBufferTarget`, plus the lip-sync delay, never above the maximum}
     private long targetNanos() {
         var estimate = Math.max(percentileNanos(), toNanos((long) (2 * jitter)));
-        var minimum = config.minimumDelay().toNanos();
+        var maximum = config.maximumDelay().toNanos();
+        if (captureClock.maximumDelayNanos() >= 0) {
+            maximum = Math.min(maximum, captureClock.maximumDelayNanos());
+        }
+        var minimum = Math.max(config.minimumDelay().toNanos(), captureClock.minimumDelayNanos());
         if (jitterBufferTarget.isPresent()) {
             minimum = Math.max(minimum, jitterBufferTarget.get().toNanos());
         }
-        return Math.min(Math.max(estimate, minimum), config.maximumDelay().toNanos());
+        minimum = Math.min(minimum, maximum);
+        return Math.min(Math.max(estimate, minimum) + sync.syncDelayNanos(), maximum);
     }
 
     /// {@return the delay the network required for the recent packets: their transit range}

@@ -35,7 +35,7 @@ class SdpPropertyTest {
     @ParameterizedTest
     @MethodSource("fixtures")
     @DisplayName("parses a browser description and encodes it back byte for byte")
-    void browserRoundTrip(String sdp) {
+    void browserRoundTrip(String sdp) throws SdpFormatException {
         var parsed = SessionDescription.parse(sdp);
         assertEquals(sdp, parsed.encode());
         for (var section : parsed.media()) {
@@ -78,15 +78,15 @@ class SdpPropertyTest {
 
     @ParameterizedTest
     @MethodSource("fixtures")
-    @DisplayName("parses mangled browser descriptions into a fixed point or rejects them with IllegalArgumentException")
-    void descriptionFuzz(String sdp) {
+    @DisplayName("parses mangled browser descriptions into a fixed point or rejects them with SdpFormatException")
+    void descriptionFuzz(String sdp) throws SdpFormatException {
         var random = new Random(sdp.hashCode());
         for (var iteration = 0; iteration < ITERATIONS / 10; iteration++) {
             var mangled = mangle(random, sdp);
             SessionDescription parsed;
             try {
                 parsed = SessionDescription.parse(mangled);
-            } catch (IllegalArgumentException expected) {
+            } catch (SdpFormatException expected) {
                 continue;
             } catch (RuntimeException unexpected) {
                 throw new AssertionError("unexpected exception for:\n" + mangled, unexpected);
@@ -100,21 +100,30 @@ class SdpPropertyTest {
                 section.typedAttributes();
                 section.mid();
                 section.bandwidths();
-                RtpCodec.of(section);
+                for (var codec : RtpCodec.of(section)) {
+                    codec.fmtpValue();
+                    codec.kind();
+                    try {
+                        RtpCodec.of(codec.toParameters());
+                    } catch (IllegalArgumentException rejected) {
+                        // a format whose parameters differ only in case is not a valid codec
+                    }
+                }
                 parsed.direction(section);
+                parsed.bandwidths();
             }
         }
     }
 
     @Test
-    @DisplayName("rejects random text with IllegalArgumentException only")
+    @DisplayName("rejects random text with SdpFormatException only")
     void randomTextFuzz() {
         var random = new Random(42);
         for (var iteration = 0; iteration < ITERATIONS; iteration++) {
             var text = noise(random, random.nextInt(200));
             try {
                 SessionDescription.parse(text).encode();
-            } catch (IllegalArgumentException expected) {
+            } catch (SdpFormatException expected) {
                 // the documented rejection
             }
         }

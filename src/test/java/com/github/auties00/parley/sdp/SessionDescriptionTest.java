@@ -57,7 +57,7 @@ class SessionDescriptionTest {
     class Parse {
         @Test
         @DisplayName("reads the session and media attributes of an ice-lite WebRTC offer")
-        void webrtcOffer() {
+        void webrtcOffer() throws SdpFormatException {
             var description = SessionDescription.parse(LITE_WEBRTC_OFFER);
             var audio = description.firstMedia("audio").orElseThrow();
             assertEquals(3480, audio.port());
@@ -68,27 +68,29 @@ class SessionDescriptionTest {
             var codecs = RtpCodec.of(audio);
             assertEquals(2, codecs.size());
             assertTrue(codecs.getFirst().is("OPUS"));
-            assertEquals(2, codecs.getFirst().channels());
-            assertEquals("minptime=10;useinbandfec=1", codecs.getFirst().fmtp().orElseThrow());
+            assertEquals(java.util.OptionalInt.of(2), codecs.getFirst().channels());
+            assertEquals("minptime=10;useinbandfec=1", codecs.getFirst().fmtpValue().orElseThrow());
+            assertEquals(java.util.Map.of("minptime", "10", "useinbandfec", "1"),
+                    codecs.getFirst().formatParameters());
             assertEquals(8000, codecs.get(1).clockRate());
         }
 
         @Test
         @DisplayName("round trips to the same text")
-        void roundTrip() {
+        void roundTrip() throws SdpFormatException {
             assertEquals(LITE_WEBRTC_OFFER, SessionDescription.parse(LITE_WEBRTC_OFFER).encode());
         }
 
         @Test
         @DisplayName("accepts bare LF line endings")
-        void bareLineFeeds() {
+        void bareLineFeeds() throws SdpFormatException {
             var description = SessionDescription.parse(SDES_OFFER.replace("\r\n", "\n"));
             assertEquals("RTP/SAVP", description.media().getFirst().protocol());
         }
 
         @Test
         @DisplayName("resolves the static payload types of PCMU and PCMA without an rtpmap")
-        void staticPayloadTypes() {
+        void staticPayloadTypes() throws SdpFormatException {
             var description = SessionDescription.parse("v=0\r\nm=audio 4000 RTP/AVP 0 8\r\n");
             var codecs = RtpCodec.of(description.media().getFirst());
             assertEquals("PCMU", codecs.get(0).name());
@@ -98,7 +100,7 @@ class SessionDescriptionTest {
         @Test
         @DisplayName("rejects a line without a type prefix")
         void malformed() {
-            assertThrows(IllegalArgumentException.class, () -> SessionDescription.parse("v=0\r\nnonsense\r\n"));
+            assertThrows(SdpFormatException.class, () -> SessionDescription.parse("v=0\r\nnonsense\r\n"));
         }
     }
 
@@ -107,7 +109,7 @@ class SessionDescriptionTest {
     class Crypto {
         @Test
         @DisplayName("parses the inline key and ignores the lifetime")
-        void parse() {
+        void parse() throws SdpFormatException {
             var description = SessionDescription.parse(SDES_OFFER);
             var crypto = SdesCrypto.parse(description.media().getFirst().attribute("crypto").orElseThrow());
             assertEquals(1, crypto.tag());

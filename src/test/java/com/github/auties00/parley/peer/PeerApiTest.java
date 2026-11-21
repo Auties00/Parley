@@ -52,13 +52,13 @@ class PeerApiTest {
         void setParameters() {
             var a = peer();
             var sender = a.pc().addTransceiver(MediaKind.VIDEO, TransceiverInit.builder()
-                    .sendEncodings(List.of(Encoding.rid("h"), Encoding.rid("l").scaleDown(4))).build()).sender();
+                    .sendEncodings(List.of(Encoding.rid("h"), Encoding.rid("l").withScaleResolutionDownBy(4))).build()).sender();
             assertThrows(InvalidStateException.class, () -> sender.setParameters(new RtpSendParameters("x",
                     List.of(), List.of(), new RtcpParameters("c", false), List.of())));
             var parameters = sender.getParameters();
             assertEquals(2, parameters.encodings().size());
-            var edited = parameters.withEncodings(List.of(parameters.encodings().get(0).maxBitrate(1_000_000),
-                    parameters.encodings().get(1).active(false)));
+            var edited = parameters.withEncodings(List.of(parameters.encodings().get(0).withMaxBitrate(1_000_000),
+                    parameters.encodings().get(1).withActive(false)));
             sender.setParameters(edited);
             var again = sender.getParameters();
             assertEquals(OptionalLong.of(1_000_000), again.encodings().get(0).maxBitrate());
@@ -76,8 +76,8 @@ class PeerApiTest {
         @DisplayName("reject invalid encodings and simulcast layers without rids")
         void encodings() {
             assertThrows(IllegalArgumentException.class, () -> Encoding.rid("a.b"));
-            assertThrows(IllegalArgumentException.class, () -> Encoding.defaults().scaleDown(0.5));
-            assertThrows(IllegalArgumentException.class, () -> Encoding.defaults().maxBitrate(0));
+            assertThrows(IllegalArgumentException.class, () -> Encoding.defaults().withScaleResolutionDownBy(0.5));
+            assertThrows(IllegalArgumentException.class, () -> Encoding.defaults().withMaxBitrate(0));
             assertThrows(IllegalArgumentException.class, () -> TransceiverInit.builder()
                     .sendEncodings(List.of(Encoding.defaults(), Encoding.rid("x"))).build());
             assertThrows(IllegalArgumentException.class, () -> TransceiverInit.builder()
@@ -396,10 +396,11 @@ class PeerApiTest {
         }
 
         static OutboundRtpStreamStats outbound(String id, long ssrc, String transportId) {
-            return new OutboundRtpStreamStats(id, Instant.EPOCH, ssrc, "audio", transportId, Optional.empty(),
+            return new OutboundRtpStreamStats(id, Instant.EPOCH, ssrc, MediaKind.AUDIO, transportId, Optional.empty(),
                     Optional.empty(), Optional.empty(), Optional.empty(), Optional.empty(), 0, 1, 2, 3, 0, 0,
-                    OptionalLong.empty(), OptionalLong.empty(), 0, 0, 0, 0, OptionalInt.empty(), OptionalInt.empty(),
-                    OptionalDouble.empty(), 0, 0, 0, true, Optional.empty());
+                    OptionalLong.empty(), OptionalLong.empty(), 0, OptionalLong.empty(), OptionalLong.empty(),
+                    OptionalLong.empty(), OptionalInt.empty(), OptionalInt.empty(), OptionalDouble.empty(), 0, 0, 0,
+                    true, Optional.empty(), Optional.empty(), java.util.Map.of());
         }
 
         @Test

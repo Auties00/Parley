@@ -16,12 +16,17 @@ import java.util.OptionalLong;
 /// The AV1 depacketizer of the AV1 RTP payload format.
 ///
 /// It reassembles the OBU elements of the packets, joining fragments across packets, and writes them back in
-/// low-overhead bitstream format, each OBU with `obu_has_size_field` set and its size. A frame is a keyframe when its
+/// low-overhead bitstream format, each OBU with `obu_has_size_field` set and its size, after the temporal delimiter
+/// the packetizer dropped (a frame of a higher spatial layer, which continues the temporal unit of the layer below,
+/// gets none). A frame is a keyframe when its
 /// first packet sets `N`, or when it carries a sequence header and a shown key frame. The resolution is the maximum
 /// frame size of the latest sequence header.
 ///
 /// @spec https://aomediacodec.github.io/av1-rtp-spec/ RTP Payload Format For AV1 (v1.0.0)
 final class Av1Depacketizer implements Depacketizer {
+    /// A temporal delimiter OBU with its size field: type 2, `obu_has_size_field` set, size zero.
+    private static final byte[] TEMPORAL_DELIMITER = {0x12, 0x00};
+
     /// The latest sequence header fields of the stream.
     private Optional<Obus.SequenceInfo> sequence = Optional.empty();
 
@@ -140,6 +145,10 @@ final class Av1Depacketizer implements Depacketizer {
             throw new PayloadFormatException("AV1 frame ends inside a fragmented OBU");
         }
         var out = new ByteArrayOutputStream();
+        var firstLayer = obus.stream().filter(Obus.Obu::extension).findFirst().map(Obus.Obu::spatialId).orElse(0);
+        if (firstLayer == 0 && (obus.isEmpty() || obus.getFirst().type() != Obus.TEMPORAL_DELIMITER)) {
+            out.write(TEMPORAL_DELIMITER, 0, TEMPORAL_DELIMITER.length);
+        }
         var hasSequenceHeader = false;
         var keyFrame = false;
         var temporal = 0;

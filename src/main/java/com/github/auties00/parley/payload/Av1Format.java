@@ -11,8 +11,9 @@ import java.util.OptionalInt;
 /// A frame is a temporal unit in low-overhead bitstream format (every OBU with its size field), in and out; with a
 /// negotiated dependency descriptor (see [DepacketizerConfig]) the depacketizer delivers the frame of each layer
 /// separately, with its frame id and dependencies. The packetizer removes temporal delimiters and OBU sizes as the
-/// specification asks, and the depacketizer restores the sizes; it does not restore temporal delimiters, which
-/// decoders do not need.
+/// specification asks, and writes the dependency descriptor when [PacketizerConfig#dependencyDescriptor()] says the
+/// session negotiated it; the depacketizer restores the sizes and the temporal delimiter at the start of each
+/// temporal unit.
 ///
 /// @param codec the codec, `video/AV1`
 /// @spec https://aomediacodec.github.io/av1-rtp-spec/ RTP Payload Format For AV1 (v1.0.0)

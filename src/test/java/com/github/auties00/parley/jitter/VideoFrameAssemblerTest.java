@@ -109,7 +109,7 @@ class VideoFrameAssemblerTest {
     @DisplayName("releases in-order VP8 frames with picture id references")
     void inOrder() {
         var assembler = assembler(Codec.vp8());
-        var packetizer = PayloadFormat.of(Codec.vp8()).packetizer(new PacketizerConfig(200));
+        var packetizer = PayloadFormat.of(Codec.vp8()).packetizer(PacketizerConfig.defaults().withMaxPayloadSize(200));
         var released = new ArrayList<EncodedFrame>();
         for (var i = 0; i < 10; i++) {
             for (var packet : send(packetizer, vp8(100 + i, i == 0, 700, Vp8FrameMetadata.none()))) {
@@ -141,7 +141,7 @@ class VideoFrameAssemblerTest {
     @DisplayName("reorders packets across frames and drops duplicates")
     void reorders() {
         var assembler = assembler(Codec.vp8());
-        var packetizer = PayloadFormat.of(Codec.vp8()).packetizer(new PacketizerConfig(100));
+        var packetizer = PayloadFormat.of(Codec.vp8()).packetizer(PacketizerConfig.defaults().withMaxPayloadSize(100));
         var packets = new ArrayList<RtpPacket>();
         for (var i = 0; i < 4; i++) {
             packets.addAll(send(packetizer, vp8(i, i == 0, 250, Vp8FrameMetadata.none())));
@@ -164,7 +164,7 @@ class VideoFrameAssemblerTest {
     @DisplayName("asks for a lost packet, retries every round trip, and releases once it arrives")
     void recovers() {
         var assembler = assembler(Codec.vp8());
-        var packetizer = PayloadFormat.of(Codec.vp8()).packetizer(new PacketizerConfig(100));
+        var packetizer = PayloadFormat.of(Codec.vp8()).packetizer(PacketizerConfig.defaults().withMaxPayloadSize(100));
         var key = send(packetizer, vp8(0, true, 250, Vp8FrameMetadata.none()));
         var second = send(packetizer, vp8(1, false, 250, Vp8FrameMetadata.none()));
         var third = send(packetizer, vp8(2, false, 250, Vp8FrameMetadata.none()));
@@ -196,7 +196,7 @@ class VideoFrameAssemblerTest {
     void keyframeRequest() {
         var assembler = assembler(Codec.vp8());
         assembler.updateRtt(Duration.ofMillis(50));
-        var packetizer = PayloadFormat.of(Codec.vp8()).packetizer(new PacketizerConfig(100));
+        var packetizer = PayloadFormat.of(Codec.vp8()).packetizer(PacketizerConfig.defaults().withMaxPayloadSize(100));
         send(packetizer, vp8(0, true, 250, Vp8FrameMetadata.none())).forEach(packet -> assembler.insert(packet, now.get()));
         drain(assembler);
         var lostFrame = send(packetizer, vp8(1, false, 250, Vp8FrameMetadata.none()));
@@ -224,7 +224,7 @@ class VideoFrameAssemblerTest {
     @DisplayName("lets a lost upper temporal layer frame go without blocking the base layer")
     void temporalLayers() {
         var assembler = assembler(Codec.vp8());
-        var packetizer = PayloadFormat.of(Codec.vp8()).packetizer(new PacketizerConfig(100));
+        var packetizer = PayloadFormat.of(Codec.vp8()).packetizer(PacketizerConfig.defaults().withMaxPayloadSize(100));
         var layers = new int[]{0, 2, 1, 2, 0, 2};
         var tl0 = new int[]{5, 5, 5, 5, 6, 6};
         var frames = new ArrayList<List<RtpPacket>>();
@@ -258,7 +258,7 @@ class VideoFrameAssemblerTest {
     @DisplayName("resolves VP9 inter-layer references within a picture")
     void spatialLayers() {
         var assembler = assembler(Codec.vp9());
-        var packetizer = PayloadFormat.of(Codec.vp9()).packetizer(new PacketizerConfig(100));
+        var packetizer = PayloadFormat.of(Codec.vp9()).packetizer(PacketizerConfig.defaults().withMaxPayloadSize(100));
         var released = new ArrayList<EncodedFrame>();
         for (var picture = 0; picture < 3; picture++) {
             for (var spatial = 0; spatial < 2; spatial++) {
@@ -284,7 +284,7 @@ class VideoFrameAssemblerTest {
     @DisplayName("decodes H.264 strictly in sequence and asks for a keyframe after a lost frame")
     void continuity() {
         var assembler = assembler(Codec.h264());
-        var packetizer = PayloadFormat.of(Codec.h264()).packetizer(new PacketizerConfig(100));
+        var packetizer = PayloadFormat.of(Codec.h264()).packetizer(PacketizerConfig.defaults().withMaxPayloadSize(100));
         var sps = new byte[]{0x67, 0x42, (byte) 0xE0, 0x1F, (byte) 0x8C, 0x68, 0x04};
         var pps = new byte[]{0x68, (byte) 0xCE, 0x3C, (byte) 0x80};
         var idr = h264(new byte[][]{sps, pps, nal(0x65, 300)}, 0);
@@ -318,7 +318,7 @@ class VideoFrameAssemblerTest {
     void independent() {
         var codec = Codec.of("video/x-custom", 90000);
         var assembler = assembler(codec);
-        var packetizer = PayloadFormat.of(codec).packetizer(new PacketizerConfig(100));
+        var packetizer = PayloadFormat.of(codec).packetizer(PacketizerConfig.defaults().withMaxPayloadSize(100));
         var first = send(packetizer, EncodedFrame.of(MediaKind.VIDEO, ByteBuffer.wrap(new byte[150]), 0, false));
         var second = send(packetizer, EncodedFrame.of(MediaKind.VIDEO, ByteBuffer.wrap(new byte[150]), 3000, false));
         var third = send(packetizer, EncodedFrame.of(MediaKind.VIDEO, ByteBuffer.wrap(new byte[150]), 6000, false));
@@ -336,7 +336,7 @@ class VideoFrameAssemblerTest {
     @DisplayName("counts a freeze when releases stall")
     void freezes() {
         var assembler = assembler(Codec.vp8());
-        var packetizer = PayloadFormat.of(Codec.vp8()).packetizer(new PacketizerConfig(1100));
+        var packetizer = PayloadFormat.of(Codec.vp8()).packetizer(PacketizerConfig.defaults().withMaxPayloadSize(1100));
         for (var i = 0; i < 12; i++) {
             send(packetizer, vp8(i, i == 0, 100, Vp8FrameMetadata.none())).forEach(packet -> assembler.insert(packet,
                     now.get()));
@@ -355,7 +355,7 @@ class VideoFrameAssemblerTest {
                 Duration.ofMillis(500), Duration.ofMillis(500), 10, 8, com.github.auties00.parley.payload
                 .DepacketizerConfig.none());
         var assembler = VideoFrameAssembler.create(PayloadFormat.of(Codec.vp8()), config, sink);
-        var packetizer = PayloadFormat.of(Codec.vp8()).packetizer(new PacketizerConfig(64));
+        var packetizer = PayloadFormat.of(Codec.vp8()).packetizer(PacketizerConfig.defaults().withMaxPayloadSize(64));
         send(packetizer, vp8(0, false, 1000, Vp8FrameMetadata.none())).forEach(packet -> assembler.insert(packet,
                 now.get()));
         assertEquals(1, sink.keyframes.get());

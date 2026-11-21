@@ -103,15 +103,19 @@ record Vp8Descriptor(boolean nonReference, boolean startOfPartition, int partiti
                 tl0, temporalId, layerSync, keyIndex, offset - start);
     }
 
-    /// {@return the size of a descriptor with these fields}
-    static int sizeOf(boolean pictureId, boolean tl0, boolean temporalOrKey) {
+    /// {@return the size of a descriptor with these fields; a picture id takes one byte when `shortPictureId`, two
+    /// otherwise}
+    static int sizeOf(boolean pictureId, boolean shortPictureId, boolean tl0, boolean temporalOrKey) {
         var extended = pictureId || tl0 || temporalOrKey;
-        return 1 + (extended ? 1 : 0) + (pictureId ? 2 : 0) + (tl0 ? 1 : 0) + (temporalOrKey ? 1 : 0);
+        return 1 + (extended ? 1 : 0) + (pictureId ? shortPictureId ? 1 : 2 : 0) + (tl0 ? 1 : 0)
+                + (temporalOrKey ? 1 : 0);
     }
 
-    /// Writes a descriptor with a 15-bit picture id when present.
-    static void write(ByteBuffer out, boolean nonReference, boolean start, OptionalInt pictureId, OptionalInt tl0,
-                      OptionalInt temporalId, boolean layerSync, OptionalInt keyIndex) {
+    /// Writes a descriptor with a picture id when present: 7 bits (`M` clear) when `shortPictureId`, 15 bits
+    /// otherwise.
+    static void write(ByteBuffer out, boolean nonReference, boolean start, OptionalInt pictureId,
+                      boolean shortPictureId, OptionalInt tl0, OptionalInt temporalId, boolean layerSync,
+                      OptionalInt keyIndex) {
         var extended = pictureId.isPresent() || tl0.isPresent() || temporalId.isPresent() || keyIndex.isPresent();
         out.put((byte) ((extended ? 0x80 : 0) | (nonReference ? 0x20 : 0) | (start ? 0x10 : 0)));
         if (!extended) {
@@ -119,7 +123,9 @@ record Vp8Descriptor(boolean nonReference, boolean startOfPartition, int partiti
         }
         out.put((byte) ((pictureId.isPresent() ? 0x80 : 0) | (tl0.isPresent() ? 0x40 : 0)
                 | (temporalId.isPresent() ? 0x20 : 0) | (keyIndex.isPresent() ? 0x10 : 0)));
-        if (pictureId.isPresent()) {
+        if (pictureId.isPresent() && shortPictureId) {
+            out.put((byte) (pictureId.getAsInt() & 0x7F));
+        } else if (pictureId.isPresent()) {
             out.putShort((short) (0x8000 | pictureId.getAsInt()));
         }
         if (tl0.isPresent()) {

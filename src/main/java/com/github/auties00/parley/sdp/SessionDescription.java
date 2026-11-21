@@ -43,9 +43,18 @@ public record SessionDescription(List<SdpLine> lines, List<MediaDescription> med
     ///
     /// @param text the description, with `CRLF` or `LF` line endings
     /// @return the parsed description
-    /// @throws IllegalArgumentException if a line is not of the form `<type>=<value>` or an `m=` line is malformed
-    public static SessionDescription parse(String text) {
+    /// @throws SdpFormatException if a line is not of the form `<type>=<value>` or an `m=` line is malformed
+    public static SessionDescription parse(String text) throws SdpFormatException {
         Objects.requireNonNull(text, "text cannot be null");
+        try {
+            return parseLines(text);
+        } catch (IllegalArgumentException exception) {
+            throw new SdpFormatException(String.valueOf(exception.getMessage()), exception);
+        }
+    }
+
+    /// Parses the lines of a description, throwing [IllegalArgumentException] for a malformed one.
+    private static SessionDescription parseLines(String text) {
         var sessionLines = new ArrayList<SdpLine>();
         var sections = new ArrayList<MediaDescription>();
         String mediaValue = null;
@@ -125,6 +134,19 @@ public record SessionDescription(List<SdpLine> lines, List<MediaDescription> med
             }
             return Optional.empty();
         });
+    }
+
+    /// {@return the unmodifiable session-level bandwidths of the well-formed `b=` lines, in order}
+    ///
+    /// @see MediaDescription#bandwidths()
+    public List<Bandwidth> bandwidths() {
+        var result = new ArrayList<Bandwidth>();
+        for (var line : lines) {
+            if (line.type() == 'b') {
+                Bandwidth.parse(line.value()).ifPresent(result::add);
+            }
+        }
+        return List.copyOf(result);
     }
 
     /// {@return the unmodifiable typed attributes of the session-level `a=` lines, in order}

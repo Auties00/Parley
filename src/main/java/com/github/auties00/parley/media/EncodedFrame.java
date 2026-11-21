@@ -18,8 +18,10 @@ import java.util.Optional;
 /// @param rtpTimestamp the RTP timestamp of the frame, an unsigned 32-bit value in units of the codec's clock rate
 /// @param keyframe     whether the frame decodes without any earlier frame (an intra frame); always `true` for
 ///                     audio frames from a depacketizer, since every audio frame stands alone
-/// @param captureTime  the wall-clock time the frame was captured, when the sender reports it (the
-///                     `abs-capture-time` header extension) or the application sets it
+/// @param captureTime  the wall-clock time the frame was captured, on the sender's clock: on the send side what the
+///                     application sets; on the receive side what the jitter buffers derive from the
+///                     `abs-capture-time` header extension when the stream carries it, else from the RTP to NTP
+///                     mapping of the sender's latest RTCP sender report; empty when neither is known
 /// @param metadata     the per-format metadata
 public record EncodedFrame(MediaKind kind, ByteBuffer data, long rtpTimestamp, boolean keyframe,
                            Optional<Instant> captureTime, FrameMetadata metadata) {

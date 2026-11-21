@@ -79,11 +79,17 @@ public record AudioPlayoutConfig(MonotonicClock clock, Duration minimumDelay, Du
 
     /// {@return a copy with a preferred delay}
     ///
-    /// @param target the preferred delay, `0..4000` ms, or an empty optional to let the buffer decide
+    /// @param target the preferred delay, `0..4000` ms
     /// @throws IllegalArgumentException if `target` is out of range
-    public AudioPlayoutConfig withJitterBufferTarget(Optional<Duration> target) {
-        return new AudioPlayoutConfig(clock, minimumDelay, maximumDelay, target, defaultFrameDuration, maxPackets,
-                depacketizer);
+    public AudioPlayoutConfig withJitterBufferTarget(Duration target) {
+        return new AudioPlayoutConfig(clock, minimumDelay, maximumDelay, Optional.of(target), defaultFrameDuration,
+                maxPackets, depacketizer);
+    }
+
+    /// {@return a copy without a preferred delay, which lets the buffer decide}
+    public AudioPlayoutConfig withoutJitterBufferTarget() {
+        return new AudioPlayoutConfig(clock, minimumDelay, maximumDelay, Optional.empty(), defaultFrameDuration,
+                maxPackets, depacketizer);
     }
 
     /// {@return a copy with other depacketizer settings}

@@ -58,7 +58,7 @@ class VideoRoundTripTest {
                 var data = test.generator().apply(random);
                 var frame = EncodedFrame.of(MediaKind.VIDEO, ByteBuffer.wrap(data), random.nextLong(1L << 32),
                         random.nextBoolean());
-                var payloads = test.format().packetizer(new PacketizerConfig(maxPayload)).packetize(frame);
+                var payloads = test.format().packetizer(PacketizerConfig.defaults().withMaxPayloadSize(maxPayload)).packetize(frame);
                 for (var i = 0; i < payloads.size(); i++) {
                     assertTrue(payloads.get(i).payload().remaining() <= maxPayload);
                     assertEquals(i == payloads.size() - 1, payloads.get(i).marker());
@@ -119,11 +119,12 @@ class VideoRoundTripTest {
     /// {@return an AV1 temporal unit of random frame OBUs in low-overhead format, without temporal delimiter}
     private static byte[] temporalUnit(Random random) {
         var out = new ByteArrayOutputStream();
+        out.writeBytes(Av1PayloadTest.obu(2, 0, 0, false, new byte[0]));
         var count = 1 + random.nextInt(4);
         for (var i = 0; i < count; i++) {
             var payload = randomBytes(random, 1 + random.nextInt(2500));
             var extension = random.nextBoolean();
-            out.writeBytes(Av1PayloadTest.obu(6, random.nextInt(8), random.nextInt(4), extension, payload));
+            out.writeBytes(Av1PayloadTest.obu(6, random.nextInt(8), 0, extension, payload));
         }
         return out.toByteArray();
     }

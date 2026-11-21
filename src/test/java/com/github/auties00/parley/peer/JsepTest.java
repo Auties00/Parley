@@ -112,8 +112,8 @@ class JsepTest {
             var a = peer();
             a.pc().addTransceiver(LocalTrack.video("cam"), TransceiverInit.builder()
                     .direction(TransceiverDirection.SENDONLY)
-                    .sendEncodings(List.of(Encoding.rid("h"), Encoding.rid("m").scaleDown(2),
-                            Encoding.rid("l").scaleDown(4)))
+                    .sendEncodings(List.of(Encoding.rid("h"), Encoding.rid("m").withScaleResolutionDownBy(2),
+                            Encoding.rid("l").withScaleResolutionDownBy(4)))
                     .build());
             var video = parse(a.pc().createOffer()).media().getFirst();
             assertEquals(List.of("h", "m", "l"), video.attributes(SdpAttribute.Rid.class).stream()
@@ -564,7 +564,8 @@ class JsepTest {
             var after = a.backend().last().transports().getFirst();
             assertNotEquals(before.local(), after.local());
             assertNotEquals(before.remote(), after.remote());
-            assertTrue(after.iceRestart());
+            assertFalse(after.dtlsRestart(), "an ICE restart keeps the DTLS association");
+            assertEquals(before.localTlsId(), after.localTlsId());
             assertEquals(2, a.backend().gathering.size(), "gathering restarts with the new credentials");
         }
 
@@ -660,12 +661,14 @@ class JsepTest {
             b.pc().setLocalDescription(answer);
             a.pc().setRemoteDescription(answer);
             assertFalse(parse(answer).media().getFirst().formats().contains("0"));
-            assertEquals(64_000, b.backend().last().media().getFirst().remoteBitrate().orElseThrow());
+            assertEquals(64_000 - JsepEngine.AUDIO_PACKETS_PER_SECOND * JsepEngine.PACKET_OVERHEAD_BYTES * 8,
+                    b.backend().last().media().getFirst().maxBitrate().orElseThrow(),
+                    "b=AS includes the packet overhead, which the payload cap excludes");
         }
 
         @Test
         @DisplayName("refuses a changed ICE credential, a remapped payload type or an added attribute")
-        void forbidden() {
+        void forbidden() throws Exception {
             var a = peer();
             a.pc().addTrack(LocalTrack.audio("mic"), List.of());
             var offer = a.pc().createOffer().sdp();

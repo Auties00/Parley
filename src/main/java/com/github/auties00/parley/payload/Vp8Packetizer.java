@@ -44,6 +44,7 @@ final class Vp8Packetizer implements Packetizer {
         }
         var metadata = frame.metadata() instanceof Vp8FrameMetadata vp8 ? vp8 : Vp8FrameMetadata.none();
         var pictureId = metadata.pictureId().orElse(nextPictureId);
+        var shortPictureId = metadata.pictureId().isPresent() && metadata.pictureIdBits() == 7;
         nextPictureId = (pictureId + 1) & 0x7FFF;
         var tl0 = metadata.tl0PicIndex();
         if (tl0.isEmpty() && metadata.temporalId().isPresent()) {
@@ -54,14 +55,14 @@ final class Vp8Packetizer implements Packetizer {
         } else if (tl0.isPresent()) {
             tl0PicIndex = tl0.getAsInt();
         }
-        var descriptorSize = Vp8Descriptor.sizeOf(true, tl0.isPresent(),
+        var descriptorSize = Vp8Descriptor.sizeOf(true, shortPictureId, tl0.isPresent(),
                 metadata.temporalId().isPresent() || metadata.keyIndex().isPresent());
         var fragments = Payloads.split(data, maxPayloadSize - descriptorSize);
         var result = new ArrayList<PacketizedPayload>(fragments.size());
         for (var k = 0; k < fragments.size(); k++) {
             var fragment = fragments.get(k);
             var out = ByteBuffer.allocate(descriptorSize + fragment.remaining());
-            Vp8Descriptor.write(out, metadata.nonReference(), k == 0, OptionalInt.of(pictureId), tl0,
+            Vp8Descriptor.write(out, metadata.nonReference(), k == 0, OptionalInt.of(pictureId), shortPictureId, tl0,
                     metadata.temporalId(), metadata.layerSync(), metadata.keyIndex());
             out.put(fragment);
             result.add(PacketizedPayload.of(out.flip(), k == fragments.size() - 1));

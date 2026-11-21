@@ -57,6 +57,10 @@ final class Peers {
 
     /// {@return the parsed SDP of a description}
     static SessionDescription parse(JsepDescription description) {
-        return SessionDescription.parse(description.sdp());
+        try {
+            return SessionDescription.parse(description.sdp());
+        } catch (com.github.auties00.parley.sdp.SdpFormatException exception) {
+            throw new java.io.UncheckedIOException(exception);
+        }
     }
 }

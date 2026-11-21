@@ -68,6 +68,7 @@ final class StatsSelection {
                 result.add(inbound.transportId());
                 inbound.codecId().ifPresent(result::add);
                 inbound.remoteId().ifPresent(result::add);
+                inbound.playoutId().ifPresent(result::add);
             }
             case RemoteInboundRtpStreamStats remote -> {
                 result.add(remote.transportId());
