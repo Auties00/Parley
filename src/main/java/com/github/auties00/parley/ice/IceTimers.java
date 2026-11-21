@@ -17,6 +17,9 @@ import java.time.Duration;
 /// @param consentExpiry     how long without a consent response before consent expires, 30 seconds
 /// @param gatherTimeout     how long one STUN or TURN server may take to provide a candidate
 /// @param resolveTimeout    how long the resolution of a remote `.local` candidate may take
+/// @spec https://www.rfc-editor.org/rfc/rfc8445.html RFC 8445: Interactive Connectivity Establishment (ICE): A Protocol for Network Address Translator (NAT) Traversal
+/// @spec https://www.rfc-editor.org/rfc/rfc7675.html RFC 7675: Session Traversal Utilities for NAT (STUN) Usage for Consent Freshness
+/// @spec https://www.rfc-editor.org/rfc/rfc6544.html RFC 6544: TCP Candidates with Interactive Connectivity Establishment (ICE)
 record IceTimers(Duration pacing, StunRetransmission checkRetransmission, Duration reliableCheckTimeout,
                  Duration nominationDelay, Duration consentInterval, Duration disconnectedAfter,
                  Duration consentExpiry, Duration gatherTimeout, Duration resolveTimeout) {

@@ -9,6 +9,7 @@ import java.util.HexFormat;
 import java.util.List;
 import java.util.Locale;
 import java.util.Objects;
+import java.util.Optional;
 
 /// The fingerprint of a certificate, as an `a=fingerprint` attribute carries it: a hash function name and the digest
 /// of the certificate's DER encoding.
@@ -67,6 +68,23 @@ public record DtlsFingerprint(String algorithm, byte[] value) {
             throw new IllegalArgumentException("malformed fingerprint digest: " + tokens[1], exception);
         }
         return new DtlsFingerprint(tokens[0], digest);
+    }
+
+    /// {@return the fingerprint an `a=fingerprint` value carries, or an empty optional when the value is malformed or
+    /// names a hash function this library does not support}
+    ///
+    /// RFC 8122 lets a description carry several fingerprints; one of an unknown hash function is skipped, not fatal,
+    /// as long as another one remains.
+    ///
+    /// @param sdpValue the attribute value
+    /// @spec https://www.rfc-editor.org/rfc/rfc8122.html RFC 8122: Connection-Oriented Media Transport over the Transport Layer Security (TLS) Protocol in the Session Description Protocol (SDP)
+    public static Optional<DtlsFingerprint> tryParse(String sdpValue) {
+        Objects.requireNonNull(sdpValue, "sdpValue cannot be null");
+        try {
+            return Optional.of(parse(sdpValue));
+        } catch (IllegalArgumentException exception) {
+            return Optional.empty();
+        }
     }
 
     /// {@return the fingerprint of a certificate under a hash function}

@@ -26,6 +26,8 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.OptionalInt;
+import java.util.OptionalLong;
+import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.locks.Condition;
 import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.Supplier;
@@ -34,20 +36,25 @@ import java.util.function.Supplier;
 /// channels it carries, as the W3C `RTCSctpTransport`.
 ///
 /// The transport is created over a DTLS transport with [#over(DtlsTransport, SctpConfig)] and started with
-/// [#start(DtlsRole, int, long, Duration)] once the DTLS handshake is done and the remote description gave the
+/// [#start(DtlsRole, int, OptionalLong, Duration)] once the DTLS handshake is done and the remote description gave the
 /// peer's `a=sctp-port` and `a=max-message-size`. Both endpoints initiate the association at once, as RFC 8841
 /// prescribes; the SCTP handshake resolves the collision. The DTLS role decides which stream ids this side gives
 /// the channels it opens in band: even ids for the DTLS client, odd ones for the server.
 ///
 /// Channels can be created before the transport starts; they open when it connects. Channels the peer opens are
-/// taken with [#acceptDataChannel()].
+/// taken with [#acceptDataChannel()]. Messages that arrive on a stream no channel has yet, as when the peer uses a
+/// negotiated channel before this side created it, are kept (at most [#MAX_UNCLAIMED_MESSAGES] messages and
+/// [#MAX_UNCLAIMED_BYTES] bytes per stream, for at most [#MAX_UNCLAIMED_STREAMS] streams) and handed to the channel
+/// [#createDataChannel(String, DataChannelInit)] creates for that stream; what does not fit is dropped and counted in
+/// [#unclaimedMessagesDropped()].
 ///
 /// # Threading
 ///
-/// Every method is safe to call from any thread. One thread from the configured
-/// [java.util.concurrent.ThreadFactory] reads the association and dispatches messages to their channels; a channel
-/// whose receive bound is reached stops that thread until the application takes messages from it, which stalls
-/// every channel of the transport.
+/// Every method is safe to call from any thread, and none blocks on the association but [#start(DtlsRole, int,
+/// OptionalLong, Duration)], [#acceptDataChannel()] and [#close()] (for at most [#SHUTDOWN_TIMEOUT]). One thread from
+/// the configured [java.util.concurrent.ThreadFactory] reads the association and dispatches messages to their
+/// channels; it never waits for a channel, so a channel the application does not read fails on its own (see
+/// [DataChannel]) and never stalls the others.
 ///
 /// @implNote This implementation runs the association on `com.github.auties00.sctp`, a pure Java port of the
 /// dcSCTP library browsers use, through its blocking socket over a one-datagram-per-call adapter of the DTLS
@@ -80,6 +87,15 @@ public final class SctpTransport implements AutoCloseable {
     /// How often a closing channel samples its buffered amount before resetting its stream.
     private static final long DRAIN_POLL_MILLIS = 5;
 
+    /// The most messages kept for one stream that has no channel yet.
+    public static final int MAX_UNCLAIMED_MESSAGES = 64;
+
+    /// The most bytes kept for one stream that has no channel yet.
+    public static final long MAX_UNCLAIMED_BYTES = 1024 * 1024;
+
+    /// The most streams without a channel whose messages are kept at once.
+    public static final int MAX_UNCLAIMED_STREAMS = 16;
+
     private final Supplier<DatagramTransport> lower;
     private final SctpConfig config;
     private final ReentrantLock lock;
@@ -87,6 +103,8 @@ public final class SctpTransport implements AutoCloseable {
     private final Map<Integer, DataChannel> channels;
     private final List<DataChannel> pending;
     private final ArrayDeque<DataChannel> incoming;
+    private final Map<Integer, Unclaimed> unclaimed;
+    private long unclaimedDropped;
     private SctpTransportState state;
     private boolean starting;
     private DtlsRole role;
@@ -102,12 +120,13 @@ public final class SctpTransport implements AutoCloseable {
         this.channels = new HashMap<>();
         this.pending = new ArrayList<>();
         this.incoming = new ArrayDeque<>();
+        this.unclaimed = new java.util.LinkedHashMap<>();
         this.state = SctpTransportState.CONNECTING;
     }
 
     /// Creates a transport over the application data of `dtls`, which is read when the transport starts.
     ///
-    /// @param dtls   the DTLS transport, whose handshake completes before [#start(DtlsRole, int, long, Duration)]
+    /// @param dtls   the DTLS transport, whose handshake completes before [#start(DtlsRole, int, OptionalLong, Duration)]
     /// @param config the configuration
     /// @return the transport, [SctpTransportState#CONNECTING] and not started
     public static SctpTransport over(DtlsTransport dtls, SctpConfig config) {
@@ -119,7 +138,8 @@ public final class SctpTransport implements AutoCloseable {
     /// Creates a transport directly over a datagram transport that already provides DTLS, such as the application
     /// data of a [DtlsTransport] that is attached later, or (in tests) a plain datagram path.
     ///
-    /// Data channels can be created before [#start(DtlsRole, int, long, Duration)]; they open once it completes.
+    /// Data channels can be created before [#start(DtlsRole, int, OptionalLong, Duration)]; they open once it
+    /// completes.
     ///
     /// @param applicationData the datagram transport
     /// @param config          the configuration
@@ -134,9 +154,9 @@ public final class SctpTransport implements AutoCloseable {
     ///
     /// @param role                 this side's DTLS role, which decides the parity of in-band stream ids
     /// @param remotePort           the peer's `a=sctp-port`, `1` to `65535`
-    /// @param remoteMaxMessageSize the peer's `a=max-message-size`; `0` means the peer accepts any size, and
-    ///                             [#DEFAULT_REMOTE_MAX_MESSAGE_SIZE] is the value to pass when the attribute is
-    ///                             absent
+    /// @param remoteMaxMessageSize the peer's `a=max-message-size`, where `0` means the peer accepts any size; empty
+    ///                             when the description has no such attribute, which RFC 8841 reads as
+    ///                             [#DEFAULT_REMOTE_MAX_MESSAGE_SIZE]
     /// @param timeout              how long to wait for the association, positive
     /// @throws SctpTransportException  if the association is not established in time or is aborted; the transport
     ///                                 is then [SctpTransportState#CLOSED]
@@ -145,10 +165,13 @@ public final class SctpTransport implements AutoCloseable {
     /// @throws IllegalStateException   if the transport was already started or is closed
     /// @throws IllegalArgumentException if `remotePort` is out of range, `remoteMaxMessageSize` is negative or
     ///                                  `timeout` is not positive
-    public void start(DtlsRole role, int remotePort, long remoteMaxMessageSize, Duration timeout)
+    /// @spec https://www.rfc-editor.org/rfc/rfc8841.html RFC 8841: Session Description Protocol (SDP) Offer/Answer Procedures for Stream Control Transmission Protocol (SCTP) over Datagram Transport Layer Security (DTLS) Transport
+    public void start(DtlsRole role, int remotePort, OptionalLong remoteMaxMessageSizeAttribute, Duration timeout)
             throws IOException, InterruptedException {
         Objects.requireNonNull(role, "role");
+        Objects.requireNonNull(remoteMaxMessageSizeAttribute, "remoteMaxMessageSize");
         Objects.requireNonNull(timeout, "timeout");
+        var remoteMaxMessageSize = remoteMaxMessageSizeAttribute.orElse(DEFAULT_REMOTE_MAX_MESSAGE_SIZE);
         if (remotePort < 1 || remotePort > 0xFFFF) {
             throw new IllegalArgumentException("remotePort must be in 1..65535: " + remotePort);
         }
@@ -168,7 +191,9 @@ public final class SctpTransport implements AutoCloseable {
         } finally {
             lock.unlock();
         }
-        var effectiveMax = remoteMaxMessageSize == 0 ? Integer.MAX_VALUE : Math.min(remoteMaxMessageSize, Integer.MAX_VALUE);
+        var effectiveMax = remoteMaxMessageSize == 0 ? Long.MAX_VALUE : remoteMaxMessageSize;
+        var sendBuffer = (int) Math.min(Integer.MAX_VALUE, Math.max(config.maxSendBufferSize(), config.maxBufferedAmount()));
+        var streamQueue = (int) Math.min(Integer.MAX_VALUE, config.maxBufferedAmount());
         var transport = lower.get();
         var channel = new DatagramChannelAdapter(transport);
         var mtu = transport.maxDatagramSize() > 0
@@ -183,9 +208,9 @@ public final class SctpTransport implements AutoCloseable {
                     .name("parley-sctp")
                     .localPort(config.localPort())
                     .remotePort(remotePort)
-                    .maxMessageSize((int) effectiveMax)
-                    .maxSendBufferSize(config.maxSendBufferSize())
-                    .perStreamSendQueueLimit(config.maxSendBufferSize())
+                    .maxMessageSize((int) Math.min(Integer.MAX_VALUE, effectiveMax))
+                    .maxSendBufferSize(sendBuffer)
+                    .perStreamSendQueueLimit(streamQueue)
                     .maxReceiverWindowBufferSize(receiveWindow)
                     .maxTransmissionUnit(mtu)
                     .partialReliability(true)
@@ -261,7 +286,7 @@ public final class SctpTransport implements AutoCloseable {
         if (label.getBytes(StandardCharsets.UTF_8).length > 0xFFFF) {
             throw new IllegalArgumentException("label must be at most 65535 UTF-8 bytes");
         }
-        var channel = new DataChannel(this, label, init, config.maxReceiveBufferedBytes());
+        var channel = newChannel(label, init);
         lock.lock();
         try {
             if (state == SctpTransportState.CLOSED) {
@@ -283,6 +308,10 @@ public final class SctpTransport implements AutoCloseable {
             }
             channel.assignId(id);
             channels.put(id, channel);
+            var early = unclaimed.remove(id);
+            if (early != null) {
+                channel.deliver(early.messages);
+            }
         } finally {
             lock.unlock();
         }
@@ -346,11 +375,23 @@ public final class SctpTransport implements AutoCloseable {
         }
     }
 
-    /// {@return the largest message a channel may send, the peer's limit; `0` until the transport is started}
+    /// {@return the largest message a channel may send: the peer's `a=max-message-size`, `Long.MAX_VALUE` when the
+    /// peer accepts any size, and [#DEFAULT_REMOTE_MAX_MESSAGE_SIZE] before the transport started}
     public long maxMessageSize() {
         lock.lock();
         try {
-            return maxMessageSize;
+            return maxMessageSize == 0 ? DEFAULT_REMOTE_MAX_MESSAGE_SIZE : maxMessageSize;
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    /// {@return the messages dropped because they arrived on a stream without a channel and its queue, or the number
+    /// of such streams, was full}
+    public long unclaimedMessagesDropped() {
+        lock.lock();
+        try {
+            return unclaimedDropped;
         } finally {
             lock.unlock();
         }
@@ -396,7 +437,8 @@ public final class SctpTransport implements AutoCloseable {
         }
     }
 
-    /// {@return the DTLS role the transport was started with, empty before [#start(DtlsRole, int, long, Duration)]}
+    /// {@return the DTLS role the transport was started with, empty before
+    /// [#start(DtlsRole, int, OptionalLong, Duration)]}
     public Optional<DtlsRole> role() {
         lock.lock();
         try {
@@ -407,10 +449,12 @@ public final class SctpTransport implements AutoCloseable {
     }
 
     /// Shuts the association down (gracefully, for at most [#SHUTDOWN_TIMEOUT], then by abort) and closes every
-    /// channel. The DTLS transport stays open. Idempotent.
+    /// channel. The DTLS transport stays open. Idempotent, and never throws: a shutdown that fails, as when the DTLS
+    /// association underneath is already gone, still closes the socket and detaches from the DTLS transport.
     @Override
     public void close() {
         SctpSocket current;
+        DatagramChannelAdapter currentAdapter;
         List<DataChannel> all;
         lock.lock();
         try {
@@ -419,28 +463,36 @@ public final class SctpTransport implements AutoCloseable {
             }
             state = SctpTransportState.CLOSED;
             current = socket;
+            currentAdapter = adapter;
             all = new ArrayList<>(channels.values());
             all.addAll(pending);
             channels.clear();
             pending.clear();
+            unclaimed.clear();
             changed.signalAll();
         } finally {
             lock.unlock();
         }
         all.forEach(DataChannel::terminate);
-        if (current != null) {
-            try {
+        try {
+            if (current != null) {
                 current.shutdown(SHUTDOWN_TIMEOUT);
-            } catch (InterruptedException exception) {
-                Thread.currentThread().interrupt();
-            } catch (IOException | SctpException exception) {
-                LOGGER.log(System.Logger.Level.DEBUG, "SCTP shutdown did not complete", exception);
             }
-            current.close();
-        }
-        var currentAdapter = adapter;
-        if (currentAdapter != null) {
-            currentAdapter.close();
+        } catch (InterruptedException exception) {
+            Thread.currentThread().interrupt();
+        } catch (IOException | SctpException | RuntimeException exception) {
+            LOGGER.log(System.Logger.Level.DEBUG, "SCTP shutdown did not complete: {0}", exception.toString());
+        } finally {
+            if (current != null) {
+                try {
+                    current.close();
+                } catch (RuntimeException exception) {
+                    LOGGER.log(System.Logger.Level.DEBUG, "SCTP socket close failed: {0}", exception.toString());
+                }
+            }
+            if (currentAdapter != null) {
+                currentAdapter.close();
+            }
         }
     }
 
@@ -449,15 +501,16 @@ public final class SctpTransport implements AutoCloseable {
         return "SctpTransport[state=" + state() + ", localPort=" + config.localPort() + "]";
     }
 
-    /// Sends one message on a stream.
+    /// Queues one message on a stream without blocking.
     ///
     /// @param streamId the stream
     /// @param ppid     the payload protocol identifier
-    /// @param payload  the payload, owned by the association from now on
+    /// @param payload  the payload, owned by the association once accepted
     /// @param ordered  whether it is delivered in order
     /// @param init     the channel options, for the partial reliability limits
-    /// @throws IOException if the association refuses the message or fails, or the thread is interrupted
-    void sendMessage(int streamId, long ppid, ByteBuffer payload, boolean ordered, DataChannelInit init)
+    /// @return whether the association accepted the message; `false` when its send buffer is full
+    /// @throws IOException if the association refuses the message or fails
+    boolean trySendMessage(int streamId, long ppid, ByteBuffer payload, boolean ordered, DataChannelInit init)
             throws IOException {
         var current = requireSocket();
         var request = current.selectStream(StreamId.of(streamId))
@@ -470,15 +523,20 @@ public final class SctpTransport implements AutoCloseable {
             request = request.lifetime(init.maxPacketLifeTime().get());
         }
         try {
-            request.send(payload);
-        } catch (InterruptedException exception) {
-            Thread.currentThread().interrupt();
-            var interrupted = new InterruptedIOException("interrupted while the send buffer was full");
-            interrupted.initCause(exception);
-            throw interrupted;
+            return request.trySend(payload);
         } catch (SctpException exception) {
             throw new SctpTransportException("SCTP refused the message on stream " + streamId, exception);
         }
+    }
+
+    /// {@return the factory of the threads the transport and its channels start}
+    ThreadFactory threadFactory() {
+        return config.threadFactory();
+    }
+
+    /// {@return a channel of this transport, with its bounds from the configuration}
+    private DataChannel newChannel(String label, DataChannelInit init) {
+        return new DataChannel(this, label, init, config.maxReceiveBufferedBytes(), config.maxBufferedAmount());
     }
 
     /// {@return the bytes queued for sending on a stream}
@@ -574,6 +632,30 @@ public final class SctpTransport implements AutoCloseable {
         sendControl(current, streamId, open);
     }
 
+    /// Sends a DCEP message from the dispatcher without blocking it: when the send buffer is full, the message is sent
+    /// from a thread of the configured factory, which may wait for room.
+    private void sendControlFromDispatcher(SctpSocket current, int streamId, DcepMessage message) {
+        try {
+            var accepted = current.selectStream(StreamId.of(streamId))
+                    .prepareSend(PayloadProtocolId.of(PayloadProtocol.DCEP))
+                    .ordered(true)
+                    .trySend(message.encode());
+            if (accepted) {
+                return;
+            }
+        } catch (SctpException exception) {
+            LOGGER.log(System.Logger.Level.DEBUG, "Could not send a DCEP message on stream " + streamId, exception);
+            return;
+        }
+        config.threadFactory().newThread(() -> {
+            try {
+                sendControl(current, streamId, message);
+            } catch (IOException exception) {
+                LOGGER.log(System.Logger.Level.DEBUG, "Could not send a DCEP message on stream " + streamId, exception);
+            }
+        }).start();
+    }
+
     private void sendControl(SctpSocket current, int streamId, DcepMessage message) throws IOException {
         try {
             current.selectStream(StreamId.of(streamId))
@@ -612,34 +694,83 @@ public final class SctpTransport implements AutoCloseable {
                     handleControl(current, streamId, payload);
                     continue;
                 }
-                DataChannel channel;
-                lock.lock();
-                try {
-                    channel = channels.get(streamId);
-                } finally {
-                    lock.unlock();
-                }
-                if (channel == null) {
-                    // TODO: buffer messages that arrive on a stream before the application creates the negotiated
-                    //  channel for it, as browsers do, instead of dropping them.
-                    LOGGER.log(System.Logger.Level.DEBUG, "Dropping a message on unknown stream {0}", streamId);
-                    continue;
-                }
                 var decoded = decode(ppid, payload);
                 if (decoded.isEmpty()) {
                     LOGGER.log(System.Logger.Level.DEBUG, "Dropping a message with unknown PPID {0}", ppid);
                     continue;
                 }
-                channel.deliver(decoded.get());
+                DataChannel channel;
+                lock.lock();
+                try {
+                    channel = channels.get(streamId);
+                    if (channel == null) {
+                        keepUnclaimedLocked(streamId, decoded.get());
+                        continue;
+                    }
+                } finally {
+                    lock.unlock();
+                }
+                channel.deliver(List.of(decoded.get()));
             }
         } catch (AssociationAbortedException exception) {
-            LOGGER.log(System.Logger.Level.DEBUG, "SCTP association ended", exception);
+            LOGGER.log(System.Logger.Level.DEBUG, "SCTP association ended: {0}", exception.toString());
+            failChannels(new SctpTransportException("the SCTP association was aborted", exception));
         } catch (InterruptedException exception) {
             Thread.currentThread().interrupt();
         } catch (RuntimeException exception) {
             LOGGER.log(System.Logger.Level.ERROR, "SCTP dispatcher failed", exception);
+            failChannels(new SctpTransportException("the SCTP dispatcher failed", exception));
         }
         close();
+    }
+
+    /// Keeps a message that arrived on a stream without a channel, within the bounds of the class documentation;
+    /// the caller holds [#lock].
+    private void keepUnclaimedLocked(int streamId, DataChannelMessage message) {
+        if (state != SctpTransportState.CONNECTED || streamId > DataChannelInit.MAX_ID) {
+            unclaimedDropped++;
+            return;
+        }
+        var queue = unclaimed.get(streamId);
+        if (queue == null) {
+            if (unclaimed.size() >= MAX_UNCLAIMED_STREAMS) {
+                unclaimedDropped++;
+                return;
+            }
+            queue = new Unclaimed();
+            unclaimed.put(streamId, queue);
+        }
+        if (queue.messages.size() >= MAX_UNCLAIMED_MESSAGES || queue.bytes + message.sizeBytes() > MAX_UNCLAIMED_BYTES) {
+            unclaimedDropped++;
+            return;
+        }
+        queue.messages.add(message);
+        queue.bytes += message.sizeBytes();
+    }
+
+    /// Fails every channel with a cause, as when the association is aborted; [#close()] follows.
+    private void failChannels(IOException cause) {
+        List<DataChannel> all;
+        lock.lock();
+        try {
+            all = new ArrayList<>(channels.values());
+        } finally {
+            lock.unlock();
+        }
+        for (var channel : all) {
+            // TODO: report the SCTP cause code of an ABORT in the error event once the sctp library exposes it on
+            //  AssociationAbortedException.
+            channel.fail(cause);
+        }
+    }
+
+    /// The messages kept for a stream that has no channel yet.
+    private static final class Unclaimed {
+        /// The messages, in arrival order.
+        private final List<DataChannelMessage> messages = new ArrayList<>();
+
+        /// Their total size.
+        private long bytes;
     }
 
     private void handleControl(SctpSocket current, int streamId, ByteBuffer payload) {
@@ -666,25 +797,32 @@ public final class SctpTransport implements AutoCloseable {
                     return;
                 }
                 var init = open.toInit();
-                var channel = new DataChannel(this, open.label(), init, config.maxReceiveBufferedBytes());
+                var channel = newChannel(open.label(), init);
+                List<DataChannelMessage> early;
                 lock.lock();
                 try {
                     if (state != SctpTransportState.CONNECTED || channels.containsKey(streamId)) {
                         LOGGER.log(System.Logger.Level.DEBUG, "Ignoring DATA_CHANNEL_OPEN for stream {0} in use", streamId);
                         return;
                     }
+                    if (hasLocalParity(streamId)) {
+                        LOGGER.log(System.Logger.Level.DEBUG, "Ignoring DATA_CHANNEL_OPEN for stream {0}, whose parity is"
+                                + " this side's", streamId);
+                        return;
+                    }
                     channel.assignId(streamId);
                     channels.put(streamId, channel);
+                    var queued = unclaimed.remove(streamId);
+                    early = queued == null ? List.of() : queued.messages;
                 } finally {
                     lock.unlock();
                 }
                 current.selectStream(StreamId.of(streamId)).setPriority(init.priority().wireValue());
                 channel.markOpen(true);
-                try {
-                    sendControl(current, streamId, new DcepMessage.Ack());
-                } catch (IOException exception) {
-                    LOGGER.log(System.Logger.Level.DEBUG, "Could not acknowledge data channel " + streamId, exception);
+                if (!early.isEmpty()) {
+                    channel.deliver(early);
                 }
+                sendControlFromDispatcher(current, streamId, new DcepMessage.Ack());
                 lock.lock();
                 try {
                     incoming.addLast(channel);
@@ -694,6 +832,17 @@ public final class SctpTransport implements AutoCloseable {
                 }
             }
         }
+    }
+
+    /// {@return whether a stream id has the parity this side gives its in-band channels: even for the DTLS client,
+    /// odd for the server; the caller holds [#lock]}
+    ///
+    /// RFC 8832 section 6 gives each side half of the ids, so an `DATA_CHANNEL_OPEN` from the peer on one of this
+    /// side's ids is a protocol violation, and accepting it would let the peer take ids this side is about to use.
+    ///
+    /// @spec https://www.rfc-editor.org/rfc/rfc8832.html RFC 8832: WebRTC Data Channel Establishment Protocol
+    private boolean hasLocalParity(int streamId) {
+        return role != null && (streamId % 2 == 0) == (role == DtlsRole.CLIENT);
     }
 
     private void onIncomingStreamsReset(List<SctpStream> streams) {

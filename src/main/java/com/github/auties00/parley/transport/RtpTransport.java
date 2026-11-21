@@ -22,8 +22,9 @@ import java.nio.ByteBuffer;
 ///
 /// # Threading
 ///
-/// Receivers are called on the path's reader thread, one packet at a time. Sends may come from any thread, but the
-/// packets of one SSRC must be sent one at a time, since each SSRC is one ordered SRTP stream.
+/// Receivers are called on the path's reader thread. Sends may come from any thread: the transport serializes
+/// protection, so the packets of each SSRC, one ordered SRTP stream, reach the path in the order of their SRTP indexes,
+/// and it serializes the unprotection of each received stream.
 ///
 /// @spec https://www.rfc-editor.org/rfc/rfc3711.html RFC 3711: The Secure Real-time Transport Protocol (SRTP)
 /// @spec https://www.rfc-editor.org/rfc/rfc5761.html RFC 5761: Multiplexing RTP Data and Control Packets on a Single Port
@@ -32,15 +33,15 @@ public sealed interface RtpTransport extends AutoCloseable permits SrtpTransport
     /// Protects and sends one RTP packet.
     ///
     /// @param plainRtp the packet between position and limit
-    /// @throws IOException           if protection or the path fails
-    /// @throws IllegalStateException if the transport is not keyed yet or is closed
+    /// @throws java.nio.channels.ClosedChannelException if the transport is not keyed yet or is closed
+    /// @throws IOException                              if protection or the path fails
     void sendRtp(ByteBuffer plainRtp) throws IOException;
 
     /// Protects and sends one compound RTCP packet.
     ///
     /// @param plainCompoundRtcp the compound packet between position and limit
-    /// @throws IOException           if protection or the path fails
-    /// @throws IllegalStateException if the transport is not keyed yet or is closed
+    /// @throws java.nio.channels.ClosedChannelException if the transport is not keyed yet or is closed
+    /// @throws IOException                              if protection or the path fails
     void sendRtcp(ByteBuffer plainCompoundRtcp) throws IOException;
 
     /// Sets the receiver of unprotected RTP packets, replacing the previous one.

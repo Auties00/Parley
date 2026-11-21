@@ -76,8 +76,9 @@ import java.util.function.Predicate;
 /// var agent = IceAgent.builder()
 ///         .iceServers(List.of(IceServer.of("stun:stun.example.org")))
 ///         .role(IceRole.CONTROLLING)
+///         .receiver((packet, arrival) -> handle(packet))   // set before any datagram can arrive
 ///         .eventListener(event -> {
-///             if (event instanceof IceEvent.CandidateGathered(var candidate)) {
+///             if (event instanceof IceEvent.CandidateGathered(var candidate, var server)) {
 ///                 signaling.send(candidate.toSdp());
 ///             }
 ///         })
@@ -86,13 +87,15 @@ import java.util.function.Predicate;
 /// agent.setRemoteParameters(remoteParameters);      // from the peer's a=ice-ufrag/a=ice-pwd
 /// remoteCandidates.forEach(agent::addRemoteCandidate);
 /// agent.endOfRemoteCandidates();
-/// agent.awaitConnected(Duration.ofSeconds(10));
-/// agent.setReceiver((packet, arrival) -> dtls.receive(packet));
+/// if (!agent.awaitConnected(Duration.ofSeconds(10))) {
+///     throw new IOException("ICE timed out");
+/// }
 /// agent.send(datagram);
 /// }
 ///
 /// [#gather()] starts gathering in the background: host candidates on every usable interface (UDP, and TCP when
-/// enabled), server-reflexive candidates from `stun:` servers and relayed candidates from `turn:` and `turns:`
+/// enabled), server-reflexive candidates from `stun:` servers (and, with TCP candidates, active TCP server-reflexive
+/// ones from `stuns:` servers, whose binding runs over TLS) and relayed candidates from `turn:` and `turns:`
 /// servers, each reported by an [IceEvent.CandidateGathered] as soon as it exists (trickle ICE), then
 /// [IceEvent.GatheringStateChanged] with [IceGatheringState#COMPLETE]. Checks start as soon as the remote parameters
 /// and a remote candidate are known, whether or not gathering finished. [#close()] stops everything, deletes TURN
@@ -116,6 +119,13 @@ import java.util.function.Predicate;
 /// A lite agent ([Builder#lite(boolean)]) gathers host candidates only, sends no checks, is always controlled, and
 /// selects the pair a nominating check arrives on.
 ///
+/// # Untrusted input
+///
+/// Remote candidates come from signaling and peer-reflexive ones from connectivity checks: at most
+/// [#MAX_REMOTE_CANDIDATES] are kept per ICE generation, and the rest are dropped and counted in
+/// [IceTransportStatistics#remoteCandidatesDropped()]. At most [#MAX_PENDING_RESOLUTIONS] `.local` names wait for
+/// multicast DNS at once, each resolved once however many candidates carry it, by one resolver thread.
+///
 /// # Consent and restart
 ///
 /// Once a pair is selected, a full agent sends a consent check every four to six seconds (RFC 7675); after ten
@@ -129,8 +139,8 @@ import java.util.function.Predicate;
 ///
 /// Every thread comes from the [NetworkStack#threadFactory()] of the agent's stack: one reader per socket and TCP
 /// connection, one timer that runs checks and consent, one dispatcher that delivers events serially, and short-lived
-/// threads for gathering, mDNS resolution and ICE-TCP connects. Every public method is safe for concurrent use and
-/// returns without waiting on the network, except [#awaitConnected(Duration)] and [#send(ByteBuffer)].
+/// threads for gathering, the mDNS resolver thread and ICE-TCP connects. Every public method is safe for concurrent
+/// use and returns without waiting on the network, except [#awaitConnected(Duration)] and [#send(ByteBuffer)].
 ///
 /// @spec https://www.rfc-editor.org/rfc/rfc8445.html RFC 8445: Interactive Connectivity Establishment (ICE): A Protocol for Network Address Translator (NAT) Traversal
 /// @spec https://www.rfc-editor.org/rfc/rfc8421.html RFC 8421: Guidelines for Multihomed and IPv4/IPv6 Dual-Stack Interactive Connectivity Establishment (ICE)
@@ -147,6 +157,18 @@ public final class IceAgent implements IceTransport {
 
     /// The most candidate pairs a checklist holds (RFC 8445 section 6.1.2.5).
     private static final int MAX_PAIRS = 100;
+
+    /// The most remote candidates, signalled and peer-reflexive, kept per ICE generation.
+    public static final int MAX_REMOTE_CANDIDATES = 100;
+
+    /// The most `.local` names that wait for multicast DNS resolution at once.
+    public static final int MAX_PENDING_RESOLUTIONS = 32;
+
+    /// The type preference of an active TCP server-reflexive candidate, below UDP server-reflexive ones.
+    private static final int TCP_SRFLX_TYPE_PREFERENCE = 70;
+
+    /// The source of the mDNS candidate error reported when the responder cannot be opened.
+    static final URI MDNS_SERVER = URI.create("mdns:224.0.0.251:5353");
 
     /// The datagram budget before a pair is selected, small enough for any path.
     private static final int DEFAULT_MAX_DATAGRAM = 1200;
@@ -260,6 +282,22 @@ public final class IceAgent implements IceTransport {
     /// The remote candidates with a usable address; guarded by [#lock].
     private final List<RemoteCandidate> remotes = new ArrayList<>();
 
+    /// The remote candidates by address and protocol, the index of [#remotes]; guarded by [#lock].
+    private final Map<RemoteKey, RemoteCandidate> remoteIndex = new HashMap<>();
+
+    /// The remote candidates dropped because the generation already held [#MAX_REMOTE_CANDIDATES], or because the
+    /// resolution queue was full; guarded by [#lock].
+    private long remoteCandidatesDropped;
+
+    /// The `.local` candidates waiting for resolution, by lower-cased name, in arrival order; guarded by [#lock].
+    private final Map<String, List<IceCandidate>> pendingResolutions = new java.util.LinkedHashMap<>();
+
+    /// Whether the resolver thread runs; guarded by [#lock].
+    private boolean resolving;
+
+    /// The DSCP value of the sockets, from [#setTrafficClass(int)]; guarded by [#lock].
+    private int trafficClass;
+
     /// The checklist, highest priority first after [#sortPairs()]; guarded by [#lock].
     private final List<CheckPair> pairs = new ArrayList<>();
 
@@ -300,7 +338,7 @@ public final class IceAgent implements IceTransport {
     /// The pair datagrams are sent on.
     private volatile CheckPair selected;
 
-    /// The receiver of application datagrams.
+    /// The receiver of application datagrams, `null` when none is set.
     private volatile PacketReceiver receiver;
 
     /// The pair each (local candidate, remote address) routes to, for the reading threads.
@@ -341,6 +379,7 @@ public final class IceAgent implements IceTransport {
         this.virtualInterfaces = builder.virtualInterfaces;
         this.addressFilter = builder.addressFilter;
         this.listener = builder.listener;
+        this.receiver = builder.receiver;
         this.timers = builder.timers;
         this.mdnsFactory = builder.mdnsFactory != null ? builder.mdnsFactory : MdnsFactory.multicast(stack);
         this.role = builder.lite ? IceRole.CONTROLLED : builder.role;
@@ -387,8 +426,8 @@ public final class IceAgent implements IceTransport {
                     gatheringState = IceGatheringState.GATHERING;
                 }
                 for (var event : held) {
-                    if (event instanceof IceEvent.CandidateGathered(var candidate)) {
-                        emit(new IceEvent.CandidateGathered(candidate.withUsernameFragment(localParameters.usernameFragment())));
+                    if (event instanceof IceEvent.CandidateGathered(var candidate, var server)) {
+                        emit(new IceEvent.CandidateGathered(candidate.withUsernameFragment(localParameters.usernameFragment()), server));
                     }
                 }
                 if (gatheringState == IceGatheringState.COMPLETE) {
@@ -444,7 +483,9 @@ public final class IceAgent implements IceTransport {
     ///
     /// A candidate whose `ufrag` names another generation than the remote parameters is ignored, as are candidates of
     /// another component, FQDN addresses, simultaneous-open TCP candidates and, under the relay policy, `.local`
-    /// candidates. A `.local` candidate is resolved with multicast DNS in the background and paired once resolved.
+    /// candidates. A `.local` candidate is resolved with multicast DNS in the background and paired once resolved; a
+    /// name already waiting is not queried again, and a candidate beyond [#MAX_PENDING_RESOLUTIONS] waiting names or
+    /// [#MAX_REMOTE_CANDIDATES] candidates of the generation is dropped and counted.
     ///
     /// @param candidate the candidate
     /// @throws IllegalStateException if the agent is closed
@@ -471,8 +512,7 @@ public final class IceAgent implements IceTransport {
             if (!candidate.isMdns() || transportPolicy == IceTransportPolicy.RELAY || !MdnsResolver.isIceName(candidate.address())) {
                 return;
             }
-            var generation = remoteParameters;
-            stack.threadFactory().newThread(() -> resolveRemote(candidate, generation)).start();
+            queueResolution(candidate);
         } finally {
             lock.unlock();
             drainOutgoing();
@@ -522,7 +562,7 @@ public final class IceAgent implements IceTransport {
                 setGatheringState(IceGatheringState.GATHERING);
                 for (var local : locals) {
                     if (local.signaled != null) {
-                        emit(new IceEvent.CandidateGathered(local.signaled.withUsernameFragment(localParameters.usernameFragment())));
+                        emit(new IceEvent.CandidateGathered(local.signaled.withUsernameFragment(localParameters.usernameFragment()), local.server));
                     }
                 }
                 if (pendingGatherTasks == 0) {
@@ -554,9 +594,11 @@ public final class IceAgent implements IceTransport {
     /// Blocks until a pair is selected.
     ///
     /// @param timeout the longest time to wait
-    /// @throws IceException         if the transport fails or closes first, or the timeout elapses
+    /// @return `true` once the state is [IceTransportState#CONNECTED] or [IceTransportState#COMPLETED], `false` when
+    ///         the timeout elapsed first
+    /// @throws IceException         if the transport fails or closes first
     /// @throws InterruptedException if the calling thread is interrupted
-    public void awaitConnected(Duration timeout) throws IceException, InterruptedException {
+    public boolean awaitConnected(Duration timeout) throws IceException, InterruptedException {
         Objects.requireNonNull(timeout, "timeout cannot be null");
         var nanos = timeout.toNanos();
         lock.lock();
@@ -564,7 +606,7 @@ public final class IceAgent implements IceTransport {
             while (true) {
                 switch (state) {
                     case CONNECTED, COMPLETED -> {
-                        return;
+                        return true;
                     }
                     case FAILED -> throw new IceException("ICE failed: no candidate pair works");
                     case CLOSED -> throw new IceException("the ICE agent is closed");
@@ -572,7 +614,7 @@ public final class IceAgent implements IceTransport {
                     }
                 }
                 if (nanos <= 0) {
-                    throw new IceException("no ICE candidate pair succeeded within " + timeout.toMillis() + " ms");
+                    return false;
                 }
                 nanos = stateChanged.awaitNanos(nanos);
             }
@@ -606,9 +648,34 @@ public final class IceAgent implements IceTransport {
         pair.lastPacketSentNanos = clock.nanos();
     }
 
+    /// {@inheritDoc}
+    ///
+    /// Prefer [Builder#receiver(PacketReceiver)], which is in place before the first datagram can arrive; a datagram
+    /// that arrives while no receiver is set is dropped.
     @Override
     public void setReceiver(PacketReceiver receiver) {
         this.receiver = Objects.requireNonNull(receiver, "receiver cannot be null");
+    }
+
+    /// Sets the DSCP value of the packets this agent sends, on every UDP socket it has and will open.
+    ///
+    /// @param dscp the differentiated services code point, `0..63`; RFC 8837 maps each WebRTC priority to one
+    /// @return whether every socket accepted the value; a platform may ignore it
+    /// @throws IllegalArgumentException if `dscp` is outside `0..63`
+    /// @spec https://www.rfc-editor.org/rfc/rfc8837.html RFC 8837: Differentiated Services Code Point (DSCP) Packet Markings for WebRTC QoS
+    public boolean setTrafficClass(int dscp) {
+        if (dscp < 0 || dscp > 63) {
+            throw new IllegalArgumentException("dscp must be in 0..63: " + dscp);
+        }
+        lock.lock();
+        try {
+            trafficClass = dscp;
+            // TODO: apply dscp to every host UDP endpoint (and to those bound later in gatherHosts) through
+            //  DatagramEndpoint.setTrafficClass, which the net package adds; until then nothing is marked.
+            return false;
+        } finally {
+            lock.unlock();
+        }
     }
 
     @Override
@@ -729,7 +796,7 @@ public final class IceAgent implements IceTransport {
                     current == null ? Optional.empty() : Optional.of(current.toPublic()), selectedChanges,
                     packetsSent, packetsReceived, bytesSent, bytesReceived,
                     locals.stream().filter(local -> local.signaled != null).map(local -> local.signaled).toList(),
-                    remotes.stream().map(RemoteCandidate::candidate).toList(), pairStatistics);
+                    remotes.stream().map(RemoteCandidate::candidate).toList(), pairStatistics, remoteCandidatesDropped);
         } finally {
             lock.unlock();
         }
@@ -756,6 +823,7 @@ public final class IceAgent implements IceTransport {
             closingResolver = resolver;
             checks.clear();
             triggered.clear();
+            pendingResolutions.clear();
         } finally {
             lock.unlock();
         }
@@ -835,8 +903,15 @@ public final class IceAgent implements IceTransport {
             if (lite) {
                 return;
             }
+            var relayIndex = 0;
             for (var server : servers) {
                 for (var stunServer : server.stunServers()) {
+                    if (stunServer.secure()) {
+                        if (tcpCandidates && transportPolicy == IceTransportPolicy.ALL) {
+                            launchGatherTask(() -> gatherSecureReflexive(stunServer));
+                        }
+                        continue;
+                    }
                     for (var base : udpBases) {
                         launchGatherTask(() -> gatherServerReflexive(server, stunServer, base));
                     }
@@ -850,8 +925,9 @@ public final class IceAgent implements IceTransport {
                             .map(base -> StunAddressFamily.of(base.base.getAddress()))
                             .distinct()
                             .toList();
+                    var index = relayIndex++;
                     for (var family : families.isEmpty() ? List.of(StunAddressFamily.IPV4) : families) {
-                        launchGatherTask(() -> gatherRelay(server, turnServer, credentials.get(), family));
+                        launchGatherTask(() -> gatherRelay(turnServer, index, credentials.get(), family));
                     }
                 }
             }
@@ -915,7 +991,7 @@ public final class IceAgent implements IceTransport {
                     .or(() -> response.attribute(StunAttribute.MappedAddress.class).map(StunAttribute.MappedAddress::address));
             if (response.messageClass() != StunClass.SUCCESS_RESPONSE || mapped.isEmpty()) {
                 var error = response.errorCode();
-                emitError(stunServer.toUri(), error.map(ErrorCode::code).orElse(IceEvent.CandidateError.UNREACHABLE),
+                emitError(stunServer.toUri(), base.base, error.map(ErrorCode::code).orElse(IceEvent.CandidateError.UNREACHABLE),
                         error.map(ErrorCode::reason).orElse("no mapped address"));
                 return;
             }
@@ -936,25 +1012,28 @@ public final class IceAgent implements IceTransport {
             } finally {
                 lock.unlock();
             }
-            var related = hostPolicy == HostCandidatePolicy.EXPOSE
-                    ? base.base
-                    : new InetSocketAddress(mapped.get().getAddress() instanceof Inet4Address
-                    ? InetAddress.ofLiteral("0.0.0.0") : InetAddress.ofLiteral("::"), ACTIVE_TCP_PORT);
             var signaled = transportPolicy == IceTransportPolicy.ALL
                     ? new IceCandidate(reflexive.foundation, COMPONENT, IceProtocol.UDP, reflexive.priority,
                     IceCandidate.hostString(mapped.get()), mapped.get().getPort(), IceCandidateType.SERVER_REFLEXIVE,
-                    Optional.empty(), Optional.of(related), Optional.empty())
+                    Optional.empty(), Optional.of(relatedAddress(base.base, mapped.get())), Optional.empty())
                     : null;
+            reflexive.server = Optional.of(stunServer.toUri());
             addLocal(reflexive, signaled);
         } catch (IOException exception) {
-            emitError(stunServer.toUri(), IceEvent.CandidateError.UNREACHABLE, String.valueOf(exception.getMessage()));
+            emitError(stunServer.toUri(), base.base, IceEvent.CandidateError.UNREACHABLE, String.valueOf(exception.getMessage()));
         } catch (InterruptedException exception) {
             Thread.currentThread().interrupt();
         }
     }
 
     /// Allocates a relayed address on a TURN server and adds the relayed candidate.
-    private void gatherRelay(IceServer server, TurnServer turnServer, TurnCredentials credentials, StunAddressFamily family) {
+    ///
+    /// @param turnServer the server
+    /// @param index      the position of the server among the TURN URLs of the agent, which keeps the local
+    ///                   preference of every relayed candidate unique
+    /// @param credentials the credentials
+    /// @param family     the address family of the relayed address
+    private void gatherRelay(TurnServer turnServer, int index, TurnCredentials credentials, StunAddressFamily family) {
         TurnClient client = null;
         try {
             client = TurnClient.connect(turnServer, credentials, stack, clock, timers.gatherTimeout());
@@ -965,29 +1044,257 @@ public final class IceAgent implements IceTransport {
             var options = family == StunAddressFamily.IPV6 ? TurnAllocationOptions.IPV6 : TurnAllocationOptions.IPV4;
             var allocation = client.allocate(options, timers.gatherTimeout());
             var relayed = allocation.relayedAddress();
-            var typePreference = switch (turnServer.transport()) {
-                case UDP -> 2;
-                case TCP -> 1;
-                case TLS -> 0;
+            var relayProtocol = switch (turnServer.transport()) {
+                case UDP -> IceProtocol.UDP;
+                case TCP -> IceProtocol.TCP;
+                case TLS -> IceProtocol.TLS;
             };
             var relay = new LocalCandidate(new RelayPath(client, allocation), relayed, IceCandidateType.RELAY,
-                    IceProtocol.UDP, Optional.empty(), IceCandidate.priority(typePreference, 65535, COMPONENT),
+                    IceProtocol.UDP, Optional.empty(), IceCandidate.priority(IceCandidateType.RELAY.typePreference(),
+                    relayLocalPreference(index, family, relayProtocol), COMPONENT),
                     foundation("relay", relayed.getAddress(), turnServer.host() + "/" + turnServer.transport()));
             allocation.setReceiver((peer, data, arrival) -> onPacket(relay, null, data, peer, arrival));
+            var related = allocation.mappedAddress().map(mapped -> relatedAddress(mapped, relayed));
             var signaled = new IceCandidate(relay.foundation, COMPONENT, IceProtocol.UDP, relay.priority,
                     IceCandidate.hostString(relayed), relayed.getPort(), IceCandidateType.RELAY, Optional.empty(),
-                    allocation.mappedAddress(), Optional.empty());
+                    related, Optional.empty(), Optional.of(relayProtocol));
+            relay.server = Optional.of(turnServer.toUri());
             addLocal(relay, signaled);
         } catch (TurnException exception) {
-            emitError(turnServer.toUri(), exception.errorCode().orElse(IceEvent.CandidateError.UNREACHABLE),
+            emitError(turnServer.toUri(), null, exception.errorCode().orElse(IceEvent.CandidateError.UNREACHABLE),
                     String.valueOf(exception.getMessage()));
             closeQuietly(client);
         } catch (IOException exception) {
-            emitError(turnServer.toUri(), IceEvent.CandidateError.UNREACHABLE, String.valueOf(exception.getMessage()));
+            emitError(turnServer.toUri(), null, IceEvent.CandidateError.UNREACHABLE, String.valueOf(exception.getMessage()));
             closeQuietly(client);
         } catch (InterruptedException exception) {
             Thread.currentThread().interrupt();
             closeQuietly(client);
+        }
+    }
+
+    /// {@return the related address a reflexive or relayed candidate is signalled with: its base under
+    /// [HostCandidatePolicy#EXPOSE], otherwise the wildcard address and port `0`, so the candidate does not reveal
+    /// what the host policy hides}
+    ///
+    /// @param base    the base, or the mapped address of a relayed candidate
+    /// @param address the candidate address, whose family the wildcard takes
+    private InetSocketAddress relatedAddress(InetSocketAddress base, InetSocketAddress address) {
+        if (hostPolicy == HostCandidatePolicy.EXPOSE) {
+            return base;
+        }
+        var wildcard = address.getAddress() instanceof Inet4Address
+                ? InetAddress.ofLiteral("0.0.0.0")
+                : InetAddress.ofLiteral("::");
+        return new InetSocketAddress(wildcard, 0);
+    }
+
+    /// {@return the local preference of a relayed candidate, unique for each server, family and transport}
+    ///
+    /// The transport to the server takes the top two bits (UDP above TCP above TLS, as relaying over UDP adds the
+    /// least delay), the family the next one (IPv6 above IPv4, as RFC 8421 prefers), and the position of the server
+    /// the low thirteen bits, the first server highest.
+    ///
+    /// @spec https://www.rfc-editor.org/rfc/rfc8445.html RFC 8445: Interactive Connectivity Establishment (ICE): A Protocol for Network Address Translator (NAT) Traversal
+    static int relayLocalPreference(int serverIndex, StunAddressFamily family, IceProtocol relayProtocol) {
+        var transport = switch (relayProtocol) {
+            case UDP -> 2;
+            case TCP -> 1;
+            case TLS -> 0;
+        };
+        var familyBit = family == StunAddressFamily.IPV6 ? 1 : 0;
+        return transport << 14 | familyBit << 13 | (8191 - Math.min(serverIndex, 8191));
+    }
+
+    /// Learns the public address of the active TCP candidates through a `stuns:` server: a Binding request over TLS
+    /// reveals the address the TCP mapping of the host appears from, signalled as an active TCP server-reflexive
+    /// candidate of the host candidate with the connection's local address.
+    ///
+    /// A TLS mapping gives no UDP candidate; the active TCP candidate it yields lets the peer recognize this side's
+    /// connections instead of learning them as peer-reflexive.
+    ///
+    /// @spec https://www.rfc-editor.org/rfc/rfc8489.html RFC 8489: Session Traversal Utilities for NAT (STUN)
+    /// @spec https://www.rfc-editor.org/rfc/rfc6544.html RFC 6544: TCP Candidates with Interactive Connectivity Establishment (ICE)
+    private void gatherSecureReflexive(StunServer stunServer) {
+        com.github.auties00.parley.net.StreamConnection connection = null;
+        IceScheduler.Cancellable watchdog = null;
+        try {
+            connection = stack.connectTls(InetSocketAddress.createUnresolved(stunServer.host(), stunServer.port()),
+                    stunServer.host(), timers.gatherTimeout());
+            if (!registerResource(connection)) {
+                return;
+            }
+            var closing = connection;
+            watchdog = scheduler.schedule(timers.gatherTimeout().toNanos(), () -> closeQuietly(closing));
+            var request = StunMessage.request(StunMethod.BINDING, List.of());
+            connection.write(request.encode(true));
+            var response = readStunMessage(connection);
+            var mapped = response.attribute(XorMappedAddress.class).map(XorMappedAddress::address)
+                    .or(() -> response.attribute(StunAttribute.MappedAddress.class).map(StunAttribute.MappedAddress::address));
+            if (!response.transactionId().equals(request.transactionId())
+                    || response.messageClass() != StunClass.SUCCESS_RESPONSE || mapped.isEmpty()) {
+                emitError(stunServer.toUri(), connection.localAddress(),
+                        response.errorCode().map(ErrorCode::code).orElse(IceEvent.CandidateError.UNREACHABLE),
+                        response.errorCode().map(ErrorCode::reason).orElse("no mapped address"));
+                return;
+            }
+            var localAddress = connection.localAddress().getAddress();
+            LocalCandidate base = null;
+            lock.lock();
+            try {
+                for (var local : locals) {
+                    if (local.type == IceCandidateType.HOST && local.protocol == IceProtocol.TCP
+                            && local.tcpType.orElse(null) == IceTcpType.ACTIVE && local.base.getAddress().equals(localAddress)) {
+                        base = local;
+                    }
+                }
+            } finally {
+                lock.unlock();
+            }
+            if (base == null) {
+                return;
+            }
+            var address = new InetSocketAddress(mapped.get().getAddress(), ACTIVE_TCP_PORT);
+            var reflexive = new LocalCandidate(base.path, address, IceCandidateType.SERVER_REFLEXIVE, IceProtocol.TCP,
+                    Optional.of(IceTcpType.ACTIVE), IceCandidate.priority(TCP_SRFLX_TYPE_PREFERENCE,
+                    (int) ((base.priority >>> 8) & 0xFFFF), COMPONENT),
+                    foundation("srflx", localAddress, stunServer.host() + "/tls"));
+            reflexive.server = Optional.of(stunServer.toUri());
+            var signaled = new IceCandidate(reflexive.foundation, COMPONENT, IceProtocol.TCP, reflexive.priority,
+                    IceCandidate.hostString(address), ACTIVE_TCP_PORT, IceCandidateType.SERVER_REFLEXIVE,
+                    Optional.of(IceTcpType.ACTIVE), Optional.of(relatedAddress(base.base, address)), Optional.empty());
+            addLocal(reflexive, signaled);
+        } catch (IOException exception) {
+            emitError(stunServer.toUri(), connection == null ? null : connection.localAddress(),
+                    IceEvent.CandidateError.UNREACHABLE, String.valueOf(exception.getMessage()));
+        } finally {
+            if (watchdog != null) {
+                watchdog.cancel();
+            }
+            closeQuietly(connection);
+        }
+    }
+
+    /// {@return the next STUN message on a stream, which carries STUN messages back to back}
+    ///
+    /// @throws IOException if the stream ends or the message is malformed
+    private static StunMessage readStunMessage(com.github.auties00.parley.net.StreamConnection connection) throws IOException {
+        var header = ByteBuffer.allocate(StunMessage.HEADER_LENGTH);
+        readFully(connection, header);
+        var length = header.getShort(2) & 0xFFFF;
+        if (length > MAX_DATAGRAM) {
+            throw new IOException("STUN message of " + length + " bytes");
+        }
+        var message = ByteBuffer.allocate(StunMessage.HEADER_LENGTH + length);
+        message.put(header.flip());
+        readFully(connection, message);
+        try {
+            return StunMessage.decode(message.flip());
+        } catch (StunFormatException exception) {
+            throw new IOException("malformed STUN response", exception);
+        }
+    }
+
+    /// Fills a buffer from a stream.
+    ///
+    /// @throws IOException if the stream ends first
+    private static void readFully(com.github.auties00.parley.net.StreamConnection connection, ByteBuffer buffer) throws IOException {
+        while (buffer.hasRemaining()) {
+            if (connection.read(buffer) < 0) {
+                throw new IOException("the STUN server closed the connection");
+            }
+        }
+    }
+
+    /// Queues a remote `.local` candidate for resolution, starting the resolver thread when it is idle; the caller
+    /// holds [#lock].
+    private void queueResolution(IceCandidate candidate) {
+        var name = candidate.address().toLowerCase(java.util.Locale.ROOT);
+        var waiting = pendingResolutions.get(name);
+        if (waiting == null) {
+            if (pendingResolutions.size() >= MAX_PENDING_RESOLUTIONS) {
+                remoteCandidatesDropped++;
+                return;
+            }
+            waiting = new ArrayList<>(1);
+            pendingResolutions.put(name, waiting);
+        }
+        if (!waiting.contains(candidate)) {
+            waiting.add(candidate);
+        }
+        if (!resolving) {
+            resolving = true;
+            stack.threadFactory().newThread(this::resolveLoop).start();
+        }
+    }
+
+    /// Resolves the queued `.local` names one at a time until the queue is empty, adding each name's candidates with
+    /// the resolved address when their generation is still current.
+    private void resolveLoop() {
+        while (true) {
+            String name;
+            IceParameters generation;
+            MdnsResolver current;
+            lock.lock();
+            try {
+                var next = pendingResolutions.keySet().iterator();
+                if (closed || !next.hasNext()) {
+                    resolving = false;
+                    return;
+                }
+                name = next.next();
+                generation = remoteParameters;
+                if (resolver == null) {
+                    try {
+                        resolver = mdnsFactory.openResolver();
+                    } catch (IOException exception) {
+                        if (LOGGER.isLoggable(Level.DEBUG)) {
+                            LOGGER.log(Level.DEBUG, "cannot open the mDNS resolver", exception);
+                        }
+                        pendingResolutions.clear();
+                        resolving = false;
+                        return;
+                    }
+                }
+                current = resolver;
+            } finally {
+                lock.unlock();
+            }
+            Optional<InetAddress> address;
+            try {
+                address = current.resolve(name, timers.resolveTimeout());
+            } catch (InterruptedException exception) {
+                lock.lock();
+                try {
+                    resolving = false;
+                } finally {
+                    lock.unlock();
+                }
+                Thread.currentThread().interrupt();
+                return;
+            }
+            lock.lock();
+            try {
+                var candidates = pendingResolutions.remove(name);
+                if (candidates != null && address.isPresent() && !closed && remoteParameters == generation) {
+                    for (var candidate : candidates) {
+                        addRemote(candidate, new InetSocketAddress(address.get(), candidate.port()));
+                    }
+                }
+            } finally {
+                lock.unlock();
+                drainOutgoing();
+            }
+        }
+    }
+
+    /// {@return the `.local` names waiting for resolution}
+    int pendingResolutionCount() {
+        lock.lock();
+        try {
+            return pendingResolutions.size();
+        } finally {
+            lock.unlock();
         }
     }
 
@@ -1032,14 +1339,21 @@ public final class IceAgent implements IceTransport {
         }
         var address = IceCandidate.hostString(host.base);
         if (hostPolicy == HostCandidatePolicy.MDNS) {
-            address = mdnsName(host.base.getAddress());
+            var name = mdnsName(host.base.getAddress());
+            if (name.isEmpty()) {
+                emitError(MDNS_SERVER, host.base, IceEvent.CandidateError.UNREACHABLE,
+                        "the mDNS responder could not be opened, so the host candidate is withheld");
+                return null;
+            }
+            address = name.get();
         }
         return new IceCandidate(host.foundation, COMPONENT, host.protocol, host.priority, address, host.base.getPort(),
                 IceCandidateType.HOST, host.tcpType, Optional.empty(), Optional.empty());
     }
 
-    /// {@return the `<uuid>.local` name of a local address, registered with the responder when it can be opened}
-    private String mdnsName(InetAddress address) {
+    /// {@return the `<uuid>.local` name of a local address, registered with the responder, or an empty optional when
+    /// the responder cannot be opened, so that no name nobody answers for is signalled}
+    private Optional<String> mdnsName(InetAddress address) {
         lock.lock();
         try {
             if (responder == null && !responderFailed) {
@@ -1052,10 +1366,7 @@ public final class IceAgent implements IceTransport {
                     }
                 }
             }
-            if (responder != null) {
-                return responder.register(address);
-            }
-            return foundations.computeIfAbsent("mdns|" + address.getHostAddress(), _ -> java.util.UUID.randomUUID() + ".local");
+            return responder == null ? Optional.empty() : Optional.of(responder.register(address));
         } finally {
             lock.unlock();
         }
@@ -1099,7 +1410,7 @@ public final class IceAgent implements IceTransport {
             local.signaled = signaled;
             locals.add(local);
             if (signaled != null) {
-                emit(new IceEvent.CandidateGathered(signaled.withUsernameFragment(localParameters.usernameFragment())));
+                emit(new IceEvent.CandidateGathered(signaled.withUsernameFragment(localParameters.usernameFragment()), local.server));
             }
             if (local.isPairable() && !concluded) {
                 for (var remote : List.copyOf(remotes)) {
@@ -1114,67 +1425,34 @@ public final class IceAgent implements IceTransport {
         }
     }
 
-    /// Resolves a remote `.local` candidate and adds it with its address.
-    private void resolveRemote(IceCandidate candidate, IceParameters generation) {
-        MdnsResolver current;
-        lock.lock();
-        try {
-            if (closed) {
-                return;
-            }
-            if (resolver == null) {
-                try {
-                    resolver = mdnsFactory.openResolver();
-                } catch (IOException exception) {
-                    if (LOGGER.isLoggable(Level.DEBUG)) {
-                        LOGGER.log(Level.DEBUG, "cannot open the mDNS resolver", exception);
-                    }
-                    return;
-                }
-            }
-            current = resolver;
-        } finally {
-            lock.unlock();
-        }
-        try {
-            var address = current.resolve(candidate.address(), timers.resolveTimeout());
-            if (address.isEmpty()) {
-                return;
-            }
-            lock.lock();
-            try {
-                if (closed || remoteParameters != generation) {
-                    return;
-                }
-                addRemote(candidate, new InetSocketAddress(address.get(), candidate.port()));
-            } finally {
-                lock.unlock();
-                drainOutgoing();
-            }
-        } catch (InterruptedException exception) {
-            Thread.currentThread().interrupt();
-        }
-    }
-
     /// Adds a remote candidate with its resolved address and pairs it; the caller holds [#lock].
+    ///
+    /// @return the remote candidate, new or existing, or `null` when the generation is full and the candidate was
+    ///         dropped
     private RemoteCandidate addRemote(IceCandidate candidate, InetSocketAddress address) {
-        for (var existing : remotes) {
-            if (existing.address.equals(address) && existing.candidate.protocol() == candidate.protocol()) {
-                if (existing.candidate.type() == IceCandidateType.PEER_REFLEXIVE && candidate.type() != IceCandidateType.PEER_REFLEXIVE) {
-                    var replaced = new RemoteCandidate(candidate, address);
-                    remotes.set(remotes.indexOf(existing), replaced);
-                    for (var pair : pairs) {
-                        if (pair.remote == existing) {
-                            pair.remote = replaced;
-                        }
+        var key = new RemoteKey(address, candidate.protocol());
+        var existing = remoteIndex.get(key);
+        if (existing != null) {
+            if (existing.candidate.type() == IceCandidateType.PEER_REFLEXIVE && candidate.type() != IceCandidateType.PEER_REFLEXIVE) {
+                var replaced = new RemoteCandidate(candidate, address);
+                remotes.set(remotes.indexOf(existing), replaced);
+                remoteIndex.put(key, replaced);
+                for (var pair : pairs) {
+                    if (pair.remote == existing) {
+                        pair.remote = replaced;
                     }
-                    return replaced;
                 }
-                return existing;
+                return replaced;
             }
+            return existing;
+        }
+        if (remotes.size() >= MAX_REMOTE_CANDIDATES) {
+            remoteCandidatesDropped++;
+            return null;
         }
         var remote = new RemoteCandidate(candidate, address);
         remotes.add(remote);
+        remoteIndex.put(key, remote);
         for (var local : List.copyOf(locals)) {
             if (local.isPairable() && !concluded) {
                 formPair(local, remote);
@@ -1278,6 +1556,8 @@ public final class IceAgent implements IceTransport {
         pairs.clear();
         triggered.clear();
         remotes.clear();
+        remoteIndex.clear();
+        pendingResolutions.clear();
         routes.values().removeIf(pair -> pair != retained);
         nominating = null;
         nominationScheduled = false;
@@ -1698,6 +1978,9 @@ public final class IceAgent implements IceTransport {
                         local.protocol == IceProtocol.TCP ? Optional.of(IceTcpType.ACTIVE) : Optional.empty(),
                         Optional.empty(), remoteParameters == null ? Optional.empty() : Optional.of(remoteParameters.usernameFragment()));
                 remote = addRemote(prflx, source);
+                if (remote == null) {
+                    return;
+                }
             }
             var pair = findPair(local, source);
             if (pair == null && local.path instanceof TcpPassivePath) {
@@ -1879,12 +2162,7 @@ public final class IceAgent implements IceTransport {
 
     /// {@return the remote candidate with an address and protocol, or `null`}; the caller holds [#lock].
     private RemoteCandidate findRemote(InetSocketAddress address, IceProtocol protocol) {
-        for (var remote : remotes) {
-            if (remote.address.equals(address) && remote.candidate.protocol() == protocol) {
-                return remote;
-            }
-        }
-        return null;
+        return remoteIndex.get(new RemoteKey(address, protocol));
     }
 
     /// {@return the pair of a local candidate and a remote address, or `null`}; the caller holds [#lock].
@@ -2172,11 +2450,13 @@ public final class IceAgent implements IceTransport {
     }
 
     /// Reports a server that failed to provide a candidate.
-    private void emitError(URI server, int code, String reason) {
+    ///
+    /// @param localAddress the local address the request was sent from, or `null` when it is not known
+    private void emitError(URI server, InetSocketAddress localAddress, int code, String reason) {
         lock.lock();
         try {
             if (!closed) {
-                emit(new IceEvent.CandidateError(server, code, reason));
+                emit(new IceEvent.CandidateError(server, Optional.ofNullable(localAddress), code, reason));
             }
         } finally {
             lock.unlock();
@@ -2279,6 +2559,10 @@ public final class IceAgent implements IceTransport {
         /// candidate is published.
         private IceCandidate signaled;
 
+        /// The URL of the STUN or TURN server the candidate came from, empty for a host or peer-reflexive one; written
+        /// before the candidate is published.
+        private Optional<URI> server = Optional.empty();
+
         /// Creates a local candidate.
         LocalCandidate(IcePath path, InetSocketAddress base, IceCandidateType type, IceProtocol protocol,
                        Optional<IceTcpType> tcpType, long priority, String foundation) {
@@ -2311,6 +2595,13 @@ public final class IceAgent implements IceTransport {
     /// @param candidate the candidate as signalled (or learned)
     /// @param address   the resolved transport address
     private record RemoteCandidate(IceCandidate candidate, InetSocketAddress address) {
+    }
+
+    /// The key of a remote candidate: its transport address and protocol.
+    ///
+    /// @param address  the transport address
+    /// @param protocol the protocol
+    private record RemoteKey(InetSocketAddress address, IceProtocol protocol) {
     }
 
     /// The key that routes received application data to a pair.
@@ -2566,6 +2857,9 @@ public final class IceAgent implements IceTransport {
         private Consumer<IceEvent> listener = _ -> {
         };
 
+        /// The receiver of application datagrams, or `null` for none.
+        private PacketReceiver receiver;
+
         /// Whether TCP candidates are gathered.
         private boolean tcpCandidates = true;
 
@@ -2687,6 +2981,16 @@ public final class IceAgent implements IceTransport {
         /// @return this builder
         public Builder eventListener(Consumer<IceEvent> listener) {
             this.listener = Objects.requireNonNull(listener, "listener cannot be null");
+            return this;
+        }
+
+        /// Sets the receiver of the application datagrams that arrive on the selected pair, in place before the first
+        /// one can arrive; [IceAgent#setReceiver(PacketReceiver)] replaces it later.
+        ///
+        /// @param receiver the receiver, called on the reading thread of the socket the datagram arrived on
+        /// @return this builder
+        public Builder receiver(PacketReceiver receiver) {
+            this.receiver = Objects.requireNonNull(receiver, "receiver cannot be null");
             return this;
         }
 

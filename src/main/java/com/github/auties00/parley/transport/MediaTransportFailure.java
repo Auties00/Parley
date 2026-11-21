@@ -2,6 +2,8 @@ package com.github.auties00.parley.transport;
 
 import com.github.auties00.parley.dtls.DtlsAlert;
 
+import java.time.Duration;
+import java.util.Objects;
 import java.util.Optional;
 
 /// Why an established [MediaTransport] failed; reported once, in a [MediaTransportEvent.Failed], after the transport
@@ -21,13 +23,25 @@ public sealed interface MediaTransportFailure {
         }
     }
 
-    /// A run of received packets failed SRTP authentication: the keys no longer match the peer's.
+    /// No packet authenticated for the configured media timeout: the peer stopped sending, or its keys no longer match
+    /// this side's. Packets that fail authentication never fail the transport by themselves, since anyone who can
+    /// reach the port can send them; they only show up in `authenticationFailures`.
     ///
-    /// @param consecutive the length of the run, at least the configured limit
-    record SrtpAuthentication(int consecutive) implements MediaTransportFailure {
+    /// @param silence                how long no packet authenticated, at least the configured media timeout
+    /// @param authenticationFailures the packets that failed authentication during that time
+    record MediaTimeout(Duration silence, long authenticationFailures) implements MediaTransportFailure {
+        /// Creates the failure.
+        ///
+        /// @param silence                how long no packet authenticated
+        /// @param authenticationFailures the packets that failed authentication meanwhile
+        public MediaTimeout {
+            Objects.requireNonNull(silence, "silence cannot be null");
+        }
+
         @Override
         public String message() {
-            return consecutive + " consecutive packets failed SRTP authentication";
+            return "no media authenticated for " + silence.toMillis() + " ms (" + authenticationFailures
+                    + " packets failed SRTP authentication meanwhile)";
         }
     }
 

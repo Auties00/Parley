@@ -1,5 +1,7 @@
 package com.github.auties00.parley.dtls;
 
+import com.github.auties00.parley.sdp.SetupRole;
+
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Nested;
 import org.junit.jupiter.api.Test;
@@ -130,19 +132,29 @@ class DtlsValuesTest {
     @DisplayName("a=setup and a=tls-id")
     class Signalling {
         @Test
-        @DisplayName("parses, answers and maps setup values to roles")
+        @DisplayName("maps setup values to roles")
         void setup() {
-            assertEquals(DtlsSetup.ACTPASS, DtlsSetup.parse(" ActPass "));
-            assertEquals("holdconn", DtlsSetup.HOLDCONN.toSdp());
-            assertEquals(DtlsSetup.ACTIVE, DtlsSetup.answerTo(DtlsSetup.ACTPASS));
-            assertEquals(DtlsSetup.PASSIVE, DtlsSetup.answerTo(DtlsSetup.ACTIVE));
-            assertEquals(DtlsSetup.ACTIVE, DtlsSetup.answerTo(DtlsSetup.PASSIVE));
-            assertEquals(Optional.of(DtlsRole.CLIENT), DtlsSetup.ACTIVE.role());
-            assertEquals(DtlsRole.SERVER, DtlsSetup.localRole(DtlsSetup.ACTPASS, DtlsSetup.ACTIVE));
-            assertEquals(DtlsRole.CLIENT, DtlsSetup.localRole(DtlsSetup.ACTIVE, DtlsSetup.ACTPASS));
-            assertThrows(IllegalArgumentException.class, () -> DtlsSetup.localRole(DtlsSetup.ACTIVE, DtlsSetup.ACTIVE));
-            assertThrows(IllegalArgumentException.class, () -> DtlsSetup.localRole(DtlsSetup.ACTPASS, DtlsSetup.ACTPASS));
-            assertThrows(IllegalArgumentException.class, () -> DtlsSetup.parse("both"));
+            assertEquals(Optional.of(DtlsRole.CLIENT), DtlsRole.of(SetupRole.ACTIVE));
+            assertEquals(Optional.of(DtlsRole.SERVER), DtlsRole.of(SetupRole.PASSIVE));
+            assertEquals(Optional.empty(), DtlsRole.of(SetupRole.ACTPASS));
+            assertEquals(DtlsRole.SERVER, DtlsRole.local(SetupRole.ACTPASS, SetupRole.ACTIVE));
+            assertEquals(DtlsRole.CLIENT, DtlsRole.local(SetupRole.ACTIVE, SetupRole.ACTPASS));
+            assertEquals(DtlsRole.SERVER, DtlsRole.CLIENT.opposite());
+            assertThrows(IllegalArgumentException.class, () -> DtlsRole.local(SetupRole.ACTIVE, SetupRole.ACTIVE));
+            assertThrows(IllegalArgumentException.class, () -> DtlsRole.local(SetupRole.ACTPASS, SetupRole.ACTPASS));
+            assertThrows(IllegalArgumentException.class, () -> DtlsRole.local(SetupRole.HOLDCONN, SetupRole.ACTIVE));
+        }
+
+        @Test
+        @DisplayName("tryParse skips unsupported hash functions and malformed values instead of throwing")
+        void tryParseFingerprint() {
+            var fingerprint = CERTIFICATE.fingerprints().getFirst();
+            assertEquals(Optional.of(fingerprint), DtlsFingerprint.tryParse(fingerprint.toSdp()));
+            assertEquals(Optional.empty(), DtlsFingerprint.tryParse("md5 AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99"));
+            assertEquals(Optional.empty(), DtlsFingerprint.tryParse("sha-256 zz"));
+            assertEquals(Optional.empty(), DtlsFingerprint.tryParse(""));
+            assertThrows(IllegalArgumentException.class,
+                    () -> DtlsFingerprint.parse("md5 AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99"));
         }
 
         @Test
@@ -161,16 +173,16 @@ class DtlsValuesTest {
         void restartRule() {
             var fingerprints = CERTIFICATE.fingerprints();
             var id = DtlsTlsId.generate();
-            var current = new DtlsParameters(DtlsSetup.ACTIVE, fingerprints, Optional.of(id));
-            assertFalse(new DtlsParameters(DtlsSetup.ACTIVE, fingerprints, Optional.of(id)).requiresNewAssociation(current));
-            assertTrue(new DtlsParameters(DtlsSetup.ACTIVE, fingerprints, Optional.of(DtlsTlsId.generate()))
+            var current = new DtlsParameters(SetupRole.ACTIVE, fingerprints, Optional.of(id));
+            assertFalse(new DtlsParameters(SetupRole.ACTIVE, fingerprints, Optional.of(id)).requiresNewAssociation(current));
+            assertTrue(new DtlsParameters(SetupRole.ACTIVE, fingerprints, Optional.of(DtlsTlsId.generate()))
                     .requiresNewAssociation(current));
-            var withoutId = new DtlsParameters(DtlsSetup.ACTIVE, fingerprints, Optional.empty());
-            assertFalse(withoutId.requiresNewAssociation(new DtlsParameters(DtlsSetup.ACTIVE, fingerprints, Optional.empty())));
-            assertTrue(new DtlsParameters(DtlsSetup.ACTIVE, DtlsCertificate.generateEcdsa().fingerprints(), Optional.empty())
+            var withoutId = new DtlsParameters(SetupRole.ACTIVE, fingerprints, Optional.empty());
+            assertFalse(withoutId.requiresNewAssociation(new DtlsParameters(SetupRole.ACTIVE, fingerprints, Optional.empty())));
+            assertTrue(new DtlsParameters(SetupRole.ACTIVE, DtlsCertificate.generateEcdsa().fingerprints(), Optional.empty())
                     .requiresNewAssociation(withoutId));
-            assertTrue(new DtlsParameters(DtlsSetup.PASSIVE, fingerprints, Optional.empty()).requiresNewAssociation(withoutId));
-            assertThrows(IllegalArgumentException.class, () -> new DtlsParameters(DtlsSetup.ACTIVE, List.of(), Optional.empty()));
+            assertTrue(new DtlsParameters(SetupRole.PASSIVE, fingerprints, Optional.empty()).requiresNewAssociation(withoutId));
+            assertThrows(IllegalArgumentException.class, () -> new DtlsParameters(SetupRole.ACTIVE, List.of(), Optional.empty()));
         }
     }
 

@@ -32,13 +32,17 @@ import java.util.Optional;
 ///                         the mapped address of a relayed one
 /// @param usernameFragment the ICE username fragment the candidate belongs to (`ufrag`), which tells candidates of an
 ///                         ICE restart apart from older ones
+/// @param relayProtocol    the protocol between this side and the TURN server of a local relayed candidate, as the
+///                         W3C `relayProtocol` reports it; empty for every other candidate, and for any parsed one,
+///                         since the attribute does not carry it
 /// @spec https://www.rfc-editor.org/rfc/rfc8839.html RFC 8839: Session Description Protocol (SDP) Offer/Answer Procedures for Interactive Connectivity Establishment (ICE)
 /// @spec https://www.rfc-editor.org/rfc/rfc8445.html RFC 8445: Interactive Connectivity Establishment (ICE): A Protocol for Network Address Translator (NAT) Traversal
 /// @spec https://www.rfc-editor.org/rfc/rfc6544.html RFC 6544: TCP Candidates with Interactive Connectivity Establishment (ICE)
 /// @spec https://www.rfc-editor.org/rfc/rfc8840.html RFC 8840: A Session Initiation Protocol (SIP) Usage for Incremental Provisioning of Candidates for the Interactive Connectivity Establishment (Trickle ICE)
 public record IceCandidate(String foundation, int component, IceProtocol protocol, long priority, String address,
                            int port, IceCandidateType type, Optional<IceTcpType> tcpType,
-                           Optional<InetSocketAddress> relatedAddress, Optional<String> usernameFragment) {
+                           Optional<InetSocketAddress> relatedAddress, Optional<String> usernameFragment,
+                           Optional<IceProtocol> relayProtocol) {
     /// Creates a candidate.
     ///
     /// @param foundation       the foundation
@@ -51,10 +55,12 @@ public record IceCandidate(String foundation, int component, IceProtocol protoco
     /// @param tcpType          the TCP direction
     /// @param relatedAddress   the related address
     /// @param usernameFragment the username fragment
+    /// @param relayProtocol    the protocol to the TURN server of a relayed candidate
     /// @throws IllegalArgumentException if the foundation is empty or longer than 32 characters, the component is
     ///                                  outside `1..256`, the priority is not an unsigned 32-bit value, the port is
-    ///                                  outside `0..65535`, the address is empty or contains a space, or a TCP
-    ///                                  candidate has no TCP type
+    ///                                  outside `0..65535`, the address is empty or contains a space, a TCP
+    ///                                  candidate has no TCP type, the protocol is [IceProtocol#TLS], or a candidate
+    ///                                  that is not relayed has a relay protocol
     public IceCandidate {
         Objects.requireNonNull(foundation, "foundation cannot be null");
         Objects.requireNonNull(protocol, "protocol cannot be null");
@@ -63,6 +69,13 @@ public record IceCandidate(String foundation, int component, IceProtocol protoco
         Objects.requireNonNull(tcpType, "tcpType cannot be null");
         Objects.requireNonNull(relatedAddress, "relatedAddress cannot be null");
         Objects.requireNonNull(usernameFragment, "usernameFragment cannot be null");
+        Objects.requireNonNull(relayProtocol, "relayProtocol cannot be null");
+        if (protocol == IceProtocol.TLS) {
+            throw new IllegalArgumentException("a candidate is UDP or TCP; TLS is only a relay protocol");
+        }
+        if (relayProtocol.isPresent() && type != IceCandidateType.RELAY) {
+            throw new IllegalArgumentException("only a relayed candidate has a relay protocol");
+        }
         if (foundation.isEmpty() || foundation.length() > 32 || foundation.indexOf(' ') >= 0) {
             throw new IllegalArgumentException("invalid foundation: " + foundation);
         }
@@ -84,6 +97,26 @@ public record IceCandidate(String foundation, int component, IceProtocol protoco
         if (protocol == IceProtocol.UDP && tcpType.isPresent()) {
             throw new IllegalArgumentException("a UDP candidate has no tcptype");
         }
+    }
+
+    /// Creates a candidate without a relay protocol.
+    ///
+    /// @param foundation       the foundation
+    /// @param component        the component id
+    /// @param protocol         the transport protocol
+    /// @param priority         the priority
+    /// @param address          the address
+    /// @param port             the port
+    /// @param type             the candidate type
+    /// @param tcpType          the TCP direction
+    /// @param relatedAddress   the related address
+    /// @param usernameFragment the username fragment
+    /// @throws IllegalArgumentException as the canonical constructor
+    public IceCandidate(String foundation, int component, IceProtocol protocol, long priority, String address,
+                        int port, IceCandidateType type, Optional<IceTcpType> tcpType,
+                        Optional<InetSocketAddress> relatedAddress, Optional<String> usernameFragment) {
+        this(foundation, component, protocol, priority, address, port, type, tcpType, relatedAddress, usernameFragment,
+                Optional.empty());
     }
 
     /// Parses a candidate.
@@ -108,6 +141,9 @@ public record IceCandidate(String foundation, int component, IceProtocol protoco
         }
         try {
             var protocol = IceProtocol.ofToken(tokens[2]);
+            if (protocol == IceProtocol.TLS) {
+                throw new IllegalArgumentException("unknown candidate transport: " + tokens[2]);
+            }
             var type = IceCandidateType.ofToken(tokens[7].toLowerCase(Locale.ROOT));
             String relatedHost = null;
             var relatedPort = -1;
@@ -178,7 +214,7 @@ public record IceCandidate(String foundation, int component, IceProtocol protoco
     /// @param usernameFragment the username fragment
     public IceCandidate withUsernameFragment(String usernameFragment) {
         return new IceCandidate(foundation, component, protocol, priority, address, port, type, tcpType,
-                relatedAddress, Optional.of(usernameFragment));
+                relatedAddress, Optional.of(usernameFragment), relayProtocol);
     }
 
     /// {@return the candidate as a W3C candidate string, `candidate:<foundation> <component> <transport> <priority>

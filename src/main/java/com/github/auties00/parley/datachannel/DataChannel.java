@@ -6,12 +6,14 @@ import java.nio.channels.ClosedChannelException;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.ArrayDeque;
+import java.util.List;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.OptionalInt;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.locks.Condition;
 import java.util.concurrent.locks.ReentrantLock;
+import java.util.function.Consumer;
 
 /// A WebRTC data channel: a bidirectional, message-oriented channel carried on one SCTP stream of an
 /// [SctpTransport], as the W3C `RTCDataChannel`.
@@ -21,25 +23,43 @@ import java.util.concurrent.locks.ReentrantLock;
 /// they arrive in order and whether lost ones are retransmitted indefinitely follows the channel's
 /// [DataChannelInit].
 ///
+/// # Sending
+///
+/// [#send(DataChannelMessage)] never blocks, as the W3C `send()`: the message joins the channel's send buffer, whose
+/// size is [#bufferedAmount()], or the call fails with [DataChannelBufferFullException] when it would take the buffer
+/// past [SctpConfig#maxBufferedAmount()] or the association's buffer is full. A producer that would rather wait uses
+/// [#send(DataChannelMessage,Duration)], or paces itself with [#awaitBufferedAmountLow(Duration)].
+///
+/// # Receiving
+///
+/// Received messages wait in the channel until [#receive()] takes them, up to [SctpConfig#maxReceiveBufferedBytes()].
+/// A message that would pass that bound is dropped and the channel fails with a
+/// [DataChannelReceiveOverflowException] and closes, as browsers do, so a channel the application does not read
+/// never holds up the other channels of the association.
+///
 /// # Lifecycle
 ///
 /// A channel created before its transport connects is [DataChannelState#CONNECTING]; it opens, and receives its
 /// stream id, when the transport connects. [#close()] resets the channel's outgoing stream once everything already
 /// sent has left, and the channel is [DataChannelState#CLOSED] once the peer has reset its outgoing stream too;
 /// a reset started by the peer closes the channel the same way. Messages received before the channel closed can
-/// still be taken with [#receive()].
+/// still be taken with [#receive()]. Every transition is also a [DataChannelEvent].
 ///
 /// # Threading
 ///
-/// All methods are safe to call from any thread. [#receive()] and [#awaitBufferedAmountLow()] block the caller;
-/// [#send(String)] and [#send(ByteBuffer)] block while the association's send buffer is full.
+/// All methods are safe to call from any thread. [#receive()], [#awaitOpen()], [#awaitClosed(Duration)],
+/// [#awaitBufferedAmountLow()] and [#send(DataChannelMessage,Duration)] block the caller; nothing else does.
 ///
 /// @spec https://www.w3.org/TR/webrtc/#rtcdatachannel WebRTC: Real-Time Communication in Browsers, RTCDataChannel
 /// @spec https://www.rfc-editor.org/rfc/rfc8831.html RFC 8831: WebRTC Data Channels
 /// @spec https://www.rfc-editor.org/rfc/rfc6525.html RFC 6525: Stream Control Transmission Protocol (SCTP) Stream Reconfiguration
 public final class DataChannel implements AutoCloseable {
-    /// How often [#awaitBufferedAmountLow()] samples the buffered amount.
+    /// How often a waiter samples the buffered amount.
     private static final long BUFFERED_POLL_NANOS = 5_000_000L;
+
+    /// A sink that drops every event.
+    private static final Consumer<DataChannelEvent> NO_EVENTS = _ -> {
+    };
 
     private final SctpTransport transport;
     private final String label;
@@ -48,6 +68,12 @@ public final class DataChannel implements AutoCloseable {
     private final Condition changed;
     private final ArrayDeque<DataChannelMessage> inbox;
     private final long maxInboxBytes;
+    private final long maxBufferedAmount;
+
+    /// The receiver of this channel's events, called with [#lock] held; the integration replaces it with an event
+    /// source.
+    private volatile Consumer<DataChannelEvent> eventSink = NO_EVENTS;
+
     private int id;
     private DataChannelState state;
     private boolean acknowledged;
@@ -56,22 +82,27 @@ public final class DataChannel implements AutoCloseable {
     private boolean localResetStarted;
     private boolean localResetDone;
     private boolean remoteResetSeen;
+    private boolean watchingBufferedAmount;
     private long messagesSent;
     private long bytesSent;
     private long messagesReceived;
     private long bytesReceived;
+    private long messagesDropped;
 
     /// Creates a channel in the [DataChannelState#CONNECTING] state.
     ///
-    /// @param transport     the owning transport
-    /// @param label         the label
-    /// @param init          the options; a negotiated channel takes its id from them
-    /// @param maxInboxBytes the receive bound
-    DataChannel(SctpTransport transport, String label, DataChannelInit init, long maxInboxBytes) {
+    /// @param transport         the owning transport
+    /// @param label             the label
+    /// @param init              the options; a negotiated channel takes its id from them
+    /// @param maxInboxBytes     the receive bound
+    /// @param maxBufferedAmount the send bound
+    DataChannel(SctpTransport transport, String label, DataChannelInit init, long maxInboxBytes,
+                long maxBufferedAmount) {
         this.transport = transport;
         this.label = label;
         this.init = init;
         this.maxInboxBytes = maxInboxBytes;
+        this.maxBufferedAmount = maxBufferedAmount;
         this.lock = new ReentrantLock();
         this.changed = lock.newCondition();
         this.inbox = new ArrayDeque<>();
@@ -130,6 +161,14 @@ public final class DataChannel implements AutoCloseable {
         return init;
     }
 
+    /// {@return the largest message this channel may send: the peer's `a=max-message-size`, `Long.MAX_VALUE` when the
+    /// peer accepts any size, and [SctpTransport#DEFAULT_REMOTE_MAX_MESSAGE_SIZE] before the transport started}
+    ///
+    /// @spec https://www.rfc-editor.org/rfc/rfc8841.html RFC 8841: Session Description Protocol (SDP) Offer/Answer Procedures for Stream Control Transmission Protocol (SCTP) over Datagram Transport Layer Security (DTLS) Transport
+    public long maxMessageSize() {
+        return transport.maxMessageSize();
+    }
+
     /// {@return the channel's ready state}
     public DataChannelState readyState() {
         lock.lock();
@@ -140,15 +179,13 @@ public final class DataChannel implements AutoCloseable {
         }
     }
 
-    /// Sends a text message, UTF-8 encoded.
+    /// Sends a text message, UTF-8 encoded, without blocking.
     ///
     /// @param text the text, possibly empty
-    /// @throws IllegalStateException    if the channel is not [DataChannelState#OPEN]
-    /// @throws IllegalArgumentException if the encoded text is larger than the transport's
-    ///                                  [SctpTransport#maxMessageSize()]
-    /// @throws IOException              if the association refuses the message or fails, or the thread is
-    ///                                  interrupted while blocked on a full send buffer
-    ///                                  ([java.io.InterruptedIOException], with the interrupt status set)
+    /// @throws DataChannelBufferFullException if the message does not fit in the send buffer
+    /// @throws IllegalStateException          if the channel is not [DataChannelState#OPEN]
+    /// @throws IllegalArgumentException       if the encoded text is larger than [#maxMessageSize()]
+    /// @throws IOException                    if the association refuses the message or fails
     public void send(String text) throws IOException {
         Objects.requireNonNull(text, "text");
         var bytes = text.getBytes(StandardCharsets.UTF_8);
@@ -159,15 +196,14 @@ public final class DataChannel implements AutoCloseable {
         }
     }
 
-    /// Sends the remaining bytes of `binary` as a binary message. The bytes are copied, so the buffer may be reused
-    /// once the call returns; its position is not changed.
+    /// Sends the remaining bytes of `binary` as a binary message, without blocking. The bytes are copied, so the
+    /// buffer may be reused once the call returns; its position is not changed.
     ///
     /// @param binary the message, possibly empty
-    /// @throws IllegalStateException    if the channel is not [DataChannelState#OPEN]
-    /// @throws IllegalArgumentException if the message is larger than the transport's
-    ///                                  [SctpTransport#maxMessageSize()]
-    /// @throws IOException              if the association refuses the message or fails, or the thread is
-    ///                                  interrupted while blocked on a full send buffer
+    /// @throws DataChannelBufferFullException if the message does not fit in the send buffer
+    /// @throws IllegalStateException          if the channel is not [DataChannelState#OPEN]
+    /// @throws IllegalArgumentException       if the message is larger than [#maxMessageSize()]
+    /// @throws IOException                    if the association refuses the message or fails
     public void send(ByteBuffer binary) throws IOException {
         Objects.requireNonNull(binary, "binary");
         var length = binary.remaining();
@@ -180,18 +216,55 @@ public final class DataChannel implements AutoCloseable {
         }
     }
 
-    /// Sends `message`, as [#send(String)] or [#send(ByteBuffer)] would.
+    /// Sends `message`, as [#send(String)] or [#send(ByteBuffer)] would, without blocking.
     ///
     /// @param message the message
-    /// @throws IllegalStateException    if the channel is not [DataChannelState#OPEN]
-    /// @throws IllegalArgumentException if the message is larger than the transport's
-    ///                                  [SctpTransport#maxMessageSize()]
-    /// @throws IOException              if the association refuses the message or fails
+    /// @throws DataChannelBufferFullException if the message does not fit in the send buffer
+    /// @throws IllegalStateException          if the channel is not [DataChannelState#OPEN]
+    /// @throws IllegalArgumentException       if the message is larger than [#maxMessageSize()]
+    /// @throws IOException                    if the association refuses the message or fails
     public void send(DataChannelMessage message) throws IOException {
         Objects.requireNonNull(message, "message");
         switch (message) {
             case DataChannelMessage.Text(var text) -> send(text);
             case DataChannelMessage.Binary binary -> send(binary.value());
+        }
+    }
+
+    /// Sends `message`, waiting at most `timeout` for room in the send buffer.
+    ///
+    /// @param message the message
+    /// @param timeout the longest wait, not negative
+    /// @return `true` once the message is sent, `false` when the buffer had no room for it in time
+    /// @throws IllegalStateException    if the channel is not [DataChannelState#OPEN], or stops being open while
+    ///                                  waiting
+    /// @throws IllegalArgumentException if the message is larger than [#maxMessageSize()] or `timeout` is negative
+    /// @throws IOException              if the association refuses the message or fails
+    /// @throws InterruptedException     if the thread is interrupted while waiting
+    public boolean send(DataChannelMessage message, Duration timeout) throws IOException, InterruptedException {
+        Objects.requireNonNull(message, "message");
+        var deadline = System.nanoTime() + nanos(timeout);
+        while (true) {
+            try {
+                send(message);
+                return true;
+            } catch (DataChannelBufferFullException full) {
+                var remaining = deadline - System.nanoTime();
+                if (remaining <= 0) {
+                    return false;
+                }
+                lock.lock();
+                try {
+                    if (state != DataChannelState.OPEN) {
+                        throw new IllegalStateException("data channel " + label + " is " + state);
+                    }
+                    // TODO: wake on the association's acknowledgement of sent data instead of sampling once the sctp
+                    //  library exposes a buffered-amount callback; it consumes the event internally.
+                    changed.await(Math.min(remaining, BUFFERED_POLL_NANOS), TimeUnit.NANOSECONDS);
+                } finally {
+                    lock.unlock();
+                }
+            }
         }
     }
 
@@ -247,7 +320,8 @@ public final class DataChannel implements AutoCloseable {
         return streamId < 0 ? 0 : transport.bufferedAmount(streamId);
     }
 
-    /// {@return the threshold [#awaitBufferedAmountLow()] waits for, `0` by default}
+    /// {@return the threshold [#awaitBufferedAmountLow()] waits for and [DataChannelEvent.BufferedAmountLow] reports,
+    /// `0` by default}
     public long bufferedAmountLowThreshold() {
         lock.lock();
         try {
@@ -257,7 +331,7 @@ public final class DataChannel implements AutoCloseable {
         }
     }
 
-    /// Sets the threshold [#awaitBufferedAmountLow()] waits for.
+    /// Sets the threshold [#awaitBufferedAmountLow()] waits for and [DataChannelEvent.BufferedAmountLow] reports.
     ///
     /// @param bytes the threshold, not negative
     /// @throws IllegalArgumentException if `bytes` is negative
@@ -357,13 +431,13 @@ public final class DataChannel implements AutoCloseable {
                 return;
             }
             if (state == DataChannelState.CONNECTING) {
-                state = DataChannelState.CLOSED;
-                changed.signalAll();
+                finishLocked();
                 reset = false;
             } else {
                 state = DataChannelState.CLOSING;
                 localResetStarted = true;
                 changed.signalAll();
+                publishLocked(new DataChannelEvent.Closing());
                 reset = true;
             }
         } finally {
@@ -379,6 +453,26 @@ public final class DataChannel implements AutoCloseable {
     @Override
     public String toString() {
         return "DataChannel[label=" + label + ", id=" + id() + ", state=" + readyState() + "]";
+    }
+
+    /// Replaces the receiver of this channel's events.
+    ///
+    /// The sink is called with the channel's lock held, in the order the events happen, so it must neither block nor
+    /// call back into the channel.
+    ///
+    /// @param sink the receiver
+    void eventSink(Consumer<DataChannelEvent> sink) {
+        this.eventSink = Objects.requireNonNull(sink, "sink");
+    }
+
+    /// {@return the received messages dropped because they would have taken the channel past its receive bound}
+    long messagesDropped() {
+        lock.lock();
+        try {
+            return messagesDropped;
+        } finally {
+            lock.unlock();
+        }
     }
 
     /// {@return the stream id, or `-1` while none is assigned}
@@ -416,6 +510,7 @@ public final class DataChannel implements AutoCloseable {
             this.acknowledged = acknowledged;
             state = DataChannelState.OPEN;
             changed.signalAll();
+            publishLocked(new DataChannelEvent.Opened());
             return true;
         } finally {
             lock.unlock();
@@ -432,27 +527,39 @@ public final class DataChannel implements AutoCloseable {
         }
     }
 
-    /// Queues a received message, blocking while the inbox is over its bound.
+    /// Queues received messages, never blocking: a message that would take the inbox past its bound is dropped, and
+    /// the channel fails with a [DataChannelReceiveOverflowException] and closes.
     ///
-    /// @param message the message
-    /// @throws InterruptedException if the transport's reader is interrupted while waiting for room
-    void deliver(DataChannelMessage message) throws InterruptedException {
+    /// @param messages the messages, in arrival order
+    void deliver(List<DataChannelMessage> messages) {
+        var overflow = false;
         lock.lock();
         try {
             acknowledged = true;
-            while (inboxBytes >= maxInboxBytes && state != DataChannelState.CLOSED) {
-                changed.await();
+            for (var message : messages) {
+                if (state == DataChannelState.CLOSED || overflow) {
+                    messagesDropped++;
+                    continue;
+                }
+                if (inboxBytes + message.sizeBytes() > maxInboxBytes && !inbox.isEmpty()) {
+                    messagesDropped++;
+                    overflow = true;
+                    publishLocked(new DataChannelEvent.Error(new DataChannelReceiveOverflowException(
+                            "data channel " + label + " holds " + inboxBytes + " unread bytes, its limit is "
+                                    + maxInboxBytes), OptionalInt.empty()));
+                    continue;
+                }
+                inbox.addLast(message);
+                inboxBytes += message.sizeBytes();
+                messagesReceived++;
+                bytesReceived += message.sizeBytes();
             }
-            if (state == DataChannelState.CLOSED) {
-                return;
-            }
-            inbox.addLast(message);
-            inboxBytes += message.sizeBytes();
-            messagesReceived++;
-            bytesReceived += message.sizeBytes();
             changed.signalAll();
         } finally {
             lock.unlock();
+        }
+        if (overflow) {
+            close();
         }
     }
 
@@ -470,7 +577,10 @@ public final class DataChannel implements AutoCloseable {
                 finishLocked();
                 return false;
             }
-            state = DataChannelState.CLOSING;
+            if (state != DataChannelState.CLOSING) {
+                state = DataChannelState.CLOSING;
+                publishLocked(new DataChannelEvent.Closing());
+            }
             changed.signalAll();
             if (localResetStarted) {
                 return false;
@@ -510,9 +620,38 @@ public final class DataChannel implements AutoCloseable {
         }
     }
 
+    /// Fails the channel with a cause, then closes it at once, as when its association is aborted.
+    ///
+    /// @param cause the failure
+    void fail(IOException cause) {
+        lock.lock();
+        try {
+            if (state != DataChannelState.CLOSED) {
+                publishLocked(new DataChannelEvent.Error(cause, OptionalInt.empty()));
+            }
+            finishLocked();
+        } finally {
+            lock.unlock();
+        }
+    }
+
     private void finishLocked() {
+        if (state == DataChannelState.CLOSED) {
+            return;
+        }
         state = DataChannelState.CLOSED;
         changed.signalAll();
+        publishLocked(new DataChannelEvent.Closed());
+    }
+
+    /// Hands an event to the sink; the caller holds [#lock], which keeps events in order.
+    private void publishLocked(DataChannelEvent event) {
+        try {
+            eventSink.accept(event);
+        } catch (RuntimeException exception) {
+            System.getLogger(DataChannel.class.getName()).log(System.Logger.Level.WARNING,
+                    "a data channel event sink failed", exception);
+        }
     }
 
     private void sendPayload(long ppid, ByteBuffer payload, int messageBytes) throws IOException {
@@ -529,17 +668,74 @@ public final class DataChannel implements AutoCloseable {
             lock.unlock();
         }
         var max = transport.maxMessageSize();
-        if (max > 0 && messageBytes > max) {
+        if (messageBytes > max) {
             throw new IllegalArgumentException("message of " + messageBytes + " bytes exceeds the maximum message size "
                     + max);
         }
-        transport.sendMessage(streamId, ppid, payload, ordered, init);
+        var buffered = transport.bufferedAmount(streamId);
+        if (buffered + messageBytes > maxBufferedAmount) {
+            throw new DataChannelBufferFullException("data channel " + label + " has " + buffered
+                    + " bytes buffered; another " + messageBytes + " would pass its limit of " + maxBufferedAmount);
+        }
+        if (!transport.trySendMessage(streamId, ppid, payload, ordered, init)) {
+            throw new DataChannelBufferFullException("the association's send buffer is full");
+        }
+        boolean watch;
         lock.lock();
         try {
             messagesSent++;
             bytesSent += messageBytes;
+            watch = !watchingBufferedAmount && transport.bufferedAmount(streamId) > bufferedAmountLowThreshold;
+            watchingBufferedAmount |= watch;
         } finally {
             lock.unlock();
+        }
+        if (watch) {
+            transport.threadFactory().newThread(this::watchBufferedAmount).start();
+        }
+    }
+
+    /// Samples the buffered amount until it falls to the threshold, then raises
+    /// [DataChannelEvent.BufferedAmountLow] and wakes the threads waiting for room.
+    private void watchBufferedAmount() {
+        try {
+            while (true) {
+                long threshold;
+                lock.lock();
+                try {
+                    if (state == DataChannelState.CLOSED) {
+                        watchingBufferedAmount = false;
+                        return;
+                    }
+                    threshold = bufferedAmountLowThreshold;
+                } finally {
+                    lock.unlock();
+                }
+                if (bufferedAmount() <= threshold) {
+                    lock.lock();
+                    try {
+                        watchingBufferedAmount = false;
+                        changed.signalAll();
+                        if (state != DataChannelState.CLOSED) {
+                            publishLocked(new DataChannelEvent.BufferedAmountLow());
+                        }
+                    } finally {
+                        lock.unlock();
+                    }
+                    return;
+                }
+                // TODO: wait on the association's buffered-amount-low event instead of sampling once the sctp socket
+                //  exposes it; it currently consumes the event internally.
+                Thread.sleep(Duration.ofNanos(BUFFERED_POLL_NANOS));
+            }
+        } catch (InterruptedException exception) {
+            lock.lock();
+            try {
+                watchingBufferedAmount = false;
+            } finally {
+                lock.unlock();
+            }
+            Thread.currentThread().interrupt();
         }
     }
 

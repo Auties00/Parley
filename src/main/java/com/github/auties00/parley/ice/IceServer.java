@@ -13,8 +13,9 @@ import java.util.Optional;
 /// A STUN or TURN server an ICE agent gathers candidates from, as the W3C `RTCIceServer` describes it.
 ///
 /// Every URL of one server shares the credentials. `stun:` URLs yield server-reflexive candidates and `turn:` and
-/// `turns:` URLs relayed candidates; `stuns:` URLs are accepted but not used, since a TLS mapping gives no UDP
-/// candidate. [#toString()] leaves the credential out.
+/// `turns:` URLs relayed candidates. A `stuns:` URL runs its binding over TLS, which reveals a TCP mapping rather than a
+/// UDP one, so it yields an active TCP server-reflexive candidate when the agent gathers TCP candidates and nothing
+/// otherwise. [#toString()] leaves the credential out.
 ///
 /// {@snippet lang = java :
 /// var servers = List.of(
@@ -75,10 +76,10 @@ public record IceServer(List<URI> urls, Optional<String> username, Optional<Stri
         return new IceServer(List.of(URI.create(url)), Optional.of(username), Optional.of(credential));
     }
 
-    /// {@return the STUN servers among the URLs, `stun:` ones only}
+    /// {@return the STUN servers among the URLs, `stun:` and `stuns:` ones, which [StunServer#secure()] tells apart}
     public List<StunServer> stunServers() {
         return urls.stream()
-                .filter(url -> scheme(url).equals("stun"))
+                .filter(url -> scheme(url).startsWith("stun"))
                 .map(StunServer::parse)
                 .toList();
     }

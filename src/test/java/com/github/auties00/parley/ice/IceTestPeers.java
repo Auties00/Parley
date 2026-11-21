@@ -62,8 +62,9 @@ final class IceTestPeers implements AutoCloseable {
 
     /// Waits until both agents have a selected pair.
     void awaitConnected(Duration timeout) throws Exception {
-        first.awaitConnected(timeout);
-        second.awaitConnected(timeout);
+        if (!first.awaitConnected(timeout) || !second.awaitConnected(timeout)) {
+            throw new AssertionError("ICE did not connect within " + timeout);
+        }
     }
 
     /// Hands a trickled candidate or the end of candidates to the other agent.
@@ -73,7 +74,7 @@ final class IceTestPeers implements AutoCloseable {
         }
         try {
             switch (event) {
-                case IceEvent.CandidateGathered(var candidate) when filter.test(candidate) -> other.addRemoteCandidate(candidate);
+                case IceEvent.CandidateGathered(var candidate, var server) when filter.test(candidate) -> other.addRemoteCandidate(candidate);
                 case IceEvent.GatheringStateChanged(var state) when state == IceGatheringState.COMPLETE -> other.endOfRemoteCandidates();
                 default -> {
                 }

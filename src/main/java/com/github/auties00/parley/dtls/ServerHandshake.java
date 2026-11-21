@@ -76,6 +76,11 @@ final class ServerHandshake extends Handshake {
     }
 
     @Override
+    boolean helloAccepted() {
+        return helloAccepted;
+    }
+
+    @Override
     DtlsRole role() {
         return DtlsRole.SERVER;
     }

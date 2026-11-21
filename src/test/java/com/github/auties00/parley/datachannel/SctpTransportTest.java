@@ -14,6 +14,7 @@ import java.time.Duration;
 import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
+import java.util.OptionalLong;
 import java.util.concurrent.atomic.AtomicReference;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
@@ -46,12 +47,12 @@ class SctpTransportTest {
         var failure = new AtomicReference<Throwable>();
         var serverThread = Thread.ofVirtual().start(() -> {
             try {
-                server.start(DtlsRole.SERVER, clientConfig.localPort(), clientConfig.maxMessageSize(), TIMEOUT);
+                server.start(DtlsRole.SERVER, clientConfig.localPort(), OptionalLong.of(clientConfig.maxMessageSize()), TIMEOUT);
             } catch (Throwable throwable) {
                 failure.set(throwable);
             }
         });
-        client.start(DtlsRole.CLIENT, serverConfig.localPort(), serverConfig.maxMessageSize(), TIMEOUT);
+        client.start(DtlsRole.CLIENT, serverConfig.localPort(), OptionalLong.of(serverConfig.maxMessageSize()), TIMEOUT);
         serverThread.join();
         if (failure.get() != null) {
             throw new AssertionError("server failed to start", failure.get());
@@ -270,12 +271,12 @@ class SctpTransportTest {
         assertThrows(IllegalStateException.class, () -> early.send("too soon"));
         var serverThread = Thread.ofVirtual().start(() -> {
             try {
-                server.start(DtlsRole.SERVER, 5000, 65536, TIMEOUT);
+                server.start(DtlsRole.SERVER, 5000, OptionalLong.empty(), TIMEOUT);
             } catch (Exception exception) {
                 throw new RuntimeException(exception);
             }
         });
-        client.start(DtlsRole.CLIENT, 5000, 65536, TIMEOUT);
+        client.start(DtlsRole.CLIENT, 5000, OptionalLong.empty(), TIMEOUT);
         serverThread.join();
         assertTrue(early.awaitOpen(TIMEOUT));
         assertEquals(0, early.id().orElseThrow() % 2);
@@ -376,11 +377,11 @@ class SctpTransportTest {
         opened.add(client);
         var early = assertDoesNotThrowCreate(client);
         assertThrows(SctpTransportException.class,
-                () -> client.start(DtlsRole.CLIENT, 5000, 65536, Duration.ofMillis(300)));
+                () -> client.start(DtlsRole.CLIENT, 5000, OptionalLong.empty(), Duration.ofMillis(300)));
         assertEquals(SctpTransportState.CLOSED, client.state());
         assertEquals(DataChannelState.CLOSED, early.readyState());
         assertThrows(IllegalStateException.class,
-                () -> client.start(DtlsRole.CLIENT, 5000, 65536, Duration.ofMillis(300)));
+                () -> client.start(DtlsRole.CLIENT, 5000, OptionalLong.empty(), Duration.ofMillis(300)));
     }
 
     private static DataChannel assertDoesNotThrowCreate(SctpTransport transport) {
@@ -397,13 +398,13 @@ class SctpTransportTest {
         var pipe = LoopbackDatagramTransport.pair();
         var transport = SctpTransport.overDatagrams(pipe[0], SctpConfig.defaults());
         opened.add(transport);
-        assertThrows(IllegalArgumentException.class, () -> transport.start(DtlsRole.CLIENT, 0, 0, TIMEOUT));
-        assertThrows(IllegalArgumentException.class, () -> transport.start(DtlsRole.CLIENT, 5000, -1, TIMEOUT));
-        assertThrows(IllegalArgumentException.class, () -> transport.start(DtlsRole.CLIENT, 5000, 0, Duration.ZERO));
+        assertThrows(IllegalArgumentException.class, () -> transport.start(DtlsRole.CLIENT, 0, OptionalLong.of(0), TIMEOUT));
+        assertThrows(IllegalArgumentException.class, () -> transport.start(DtlsRole.CLIENT, 5000, OptionalLong.of(-1), TIMEOUT));
+        assertThrows(IllegalArgumentException.class, () -> transport.start(DtlsRole.CLIENT, 5000, OptionalLong.of(0), Duration.ZERO));
         assertThrows(NullPointerException.class, () -> transport.createDataChannel(null, DataChannelInit.reliable()));
         assertThrows(IllegalArgumentException.class,
                 () -> transport.createDataChannel("x".repeat(70_000), DataChannelInit.reliable()));
-        assertEquals(0, transport.maxMessageSize());
+        assertEquals(SctpTransport.DEFAULT_REMOTE_MAX_MESSAGE_SIZE, transport.maxMessageSize());
         assertEquals(SctpConfig.DEFAULT_PORT, transport.localPort());
     }
 

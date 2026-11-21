@@ -4,6 +4,7 @@ import com.github.auties00.parley.dtls.DtlsSrtpKeys;
 import com.github.auties00.parley.dtls.DtlsTransport;
 import com.github.auties00.parley.net.DatagramTransport;
 import com.github.auties00.parley.net.PacketReceiver;
+import com.github.auties00.parley.sdp.SdesCrypto;
 import com.github.auties00.srtp.SrtpContextFactory;
 import com.github.auties00.srtp.SrtpCryptoSuite;
 import com.github.auties00.srtp.SrtpErrorStatus;
@@ -14,10 +15,12 @@ import com.github.auties00.srtp.SrtpTransformer;
 import java.io.IOException;
 import java.lang.System.Logger.Level;
 import java.nio.ByteBuffer;
+import java.nio.channels.ClosedChannelException;
 import java.util.Objects;
 import java.util.Optional;
-import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.LongAdder;
+import java.util.concurrent.locks.ReentrantLock;
 
 /// The [RtpTransport] of this library: SRTP and SRTCP protection with per-SSRC contexts, keyed either by a DTLS-SRTP
 /// handshake or by SDES keys exchanged in the session descriptions.
@@ -25,8 +28,8 @@ import java.util.concurrent.atomic.LongAdder;
 /// - [#dtlsSrtp(DtlsTransport)] receives the RTP and RTCP that share the DTLS transport's path, and keys itself with
 ///   the [exported keys][DtlsTransport#srtpKeys()] once the handshake completes; until then sends fail and received
 ///   packets are dropped as unkeyed. This is the keying of `UDP/TLS/RTP/SAVPF`.
-/// - [#sdes(DatagramTransport,SrtpCryptoSuite,byte\[\],byte\[\],byte\[\],byte\[\])] is keyed at once with the master
-///   keys of `a=crypto` lines, the keying of `RTP/SAVP` and `RTP/SAVPF` without DTLS.
+/// - [#sdes(DatagramTransport,SdesCrypto,SdesCrypto)] is keyed at once with the master keys of the two `a=crypto`
+///   lines, the keying of `RTP/SAVP` and `RTP/SAVPF` without DTLS.
 ///
 /// {@snippet lang = java :
 /// var srtp = SrtpTransport.dtlsSrtp(dtls);
@@ -38,7 +41,17 @@ import java.util.concurrent.atomic.LongAdder;
 /// }
 ///
 /// Each SSRC gets its own SRTP context on first use, with its own rollover counter and replay window; contexts share
-/// the session keys derived once per direction.
+/// the session keys derived once per direction. Cryptex, when [SrtpOptions#cryptex()] turns it on, applies to every
+/// stream of the transport: RFC 9335 requires every RTP section of one BUNDLE group, and so of one transport, to agree
+/// on it.
+///
+/// # Threading
+///
+/// Every method may be called from any thread. Protection is serialized: one lock is held from protecting a packet
+/// until the path accepted it, so the packets of every stream reach the wire in the order of their SRTP indexes even
+/// when several threads send. Unprotection is serialized per stream, under one of 16 locks chosen by the low bits of
+/// the SSRC, so packets of different streams that arrive on different reader threads are still processed in
+/// parallel. Receivers are called after the lock is released, on the thread that delivered the packet.
 ///
 /// @spec https://www.rfc-editor.org/rfc/rfc3711.html RFC 3711: The Secure Real-time Transport Protocol (SRTP)
 /// @spec https://www.rfc-editor.org/rfc/rfc7714.html RFC 7714: AES-GCM Authenticated Encryption in the Secure Real-time Transport Protocol (SRTP)
@@ -75,8 +88,17 @@ public final class SrtpTransport implements RtpTransport {
     /// The settings.
     private final SrtpOptions options;
 
+    /// The number of locks the unprotection of received packets is striped over, by SSRC.
+    private static final int UNPROTECT_STRIPES = 16;
+
     /// The lock that serializes keying.
     private final Object keyLock = new Object();
+
+    /// The lock held from protecting an outgoing packet until the path accepted it.
+    private final ReentrantLock protectLock = new ReentrantLock();
+
+    /// The locks that serialize unprotection, indexed by `ssrc & 15`.
+    private final ReentrantLock[] unprotectLocks = new ReentrantLock[UNPROTECT_STRIPES];
 
     /// The counters.
     private final LongAdder rtpPacketsSent = new LongAdder();
@@ -115,16 +137,13 @@ public final class SrtpTransport implements RtpTransport {
     private final LongAdder unkeyedPackets = new LongAdder();
 
     /// The authentication failures since the last authenticated packet.
-    private final AtomicInteger consecutiveFailures = new AtomicInteger();
+    private final AtomicLong failuresSinceAuthenticated = new AtomicLong();
 
     /// The receiver of RTP.
     private volatile PacketReceiver rtpReceiver = DISCARD;
 
     /// The receiver of RTCP.
     private volatile PacketReceiver rtcpReceiver = DISCARD;
-
-    /// The listener of authentication failure runs, for [MediaTransport]; `null` for none.
-    private volatile FailureListener failureListener;
 
     /// The protection of outgoing packets, `null` before keying.
     private volatile SrtpTransformer outbound;
@@ -146,6 +165,9 @@ public final class SrtpTransport implements RtpTransport {
         this.sendPath = sendPath;
         this.dtls = dtls;
         this.options = options;
+        for (var index = 0; index < UNPROTECT_STRIPES; index++) {
+            unprotectLocks[index] = new ReentrantLock();
+        }
     }
 
     /// {@return a transport keyed by a DTLS-SRTP handshake}
@@ -171,54 +193,51 @@ public final class SrtpTransport implements RtpTransport {
         return transport;
     }
 
-    /// {@return a transport keyed with SDES master keys and salts}
+    /// {@return a transport keyed with the master keys of two SDES `a=crypto` lines}
     ///
     /// The transport becomes the receiver of `lower`.
     ///
-    /// @param lower      the path to the peer
-    /// @param suite      the crypto suite both `a=crypto` lines agreed
-    /// @param localKey   the master key of the media this side sends
-    /// @param localSalt  the master salt of the media this side sends
-    /// @param remoteKey  the master key of the media the peer sends
-    /// @param remoteSalt the master salt of the media the peer sends
-    /// @throws IllegalArgumentException if a key or salt has the wrong length for the suite
-    public static SrtpTransport sdes(DatagramTransport lower, SrtpCryptoSuite suite, byte[] localKey, byte[] localSalt,
-                                     byte[] remoteKey, byte[] remoteSalt) {
-        return sdes(lower, suite, localKey, localSalt, remoteKey, remoteSalt, SrtpOptions.DEFAULT);
+    /// @param lower  the path to the peer
+    /// @param local  this side's `a=crypto` line, whose key protects the media this side sends
+    /// @param remote the peer's `a=crypto` line, whose key protects the media the peer sends
+    /// @throws IllegalArgumentException if the two lines name different suites
+    public static SrtpTransport sdes(DatagramTransport lower, SdesCrypto local, SdesCrypto remote) {
+        return sdes(lower, local, remote, SrtpOptions.DEFAULT);
     }
 
-    /// {@return a transport keyed with SDES master keys and salts, with options}
+    /// {@return a transport keyed with the master keys of two SDES `a=crypto` lines, with options}
     ///
-    /// @param lower      the path to the peer
-    /// @param suite      the crypto suite
-    /// @param localKey   the master key of the media this side sends
-    /// @param localSalt  the master salt of the media this side sends
-    /// @param remoteKey  the master key of the media the peer sends
-    /// @param remoteSalt the master salt of the media the peer sends
-    /// @param options    the SRTP settings
-    /// @throws IllegalArgumentException if a key or salt has the wrong length for the suite, or cryptex is asked for a
-    ///                                  suite without encryption
-    public static SrtpTransport sdes(DatagramTransport lower, SrtpCryptoSuite suite, byte[] localKey, byte[] localSalt,
-                                     byte[] remoteKey, byte[] remoteSalt, SrtpOptions options) {
+    /// @param lower   the path to the peer
+    /// @param local   this side's `a=crypto` line, whose key protects the media this side sends
+    /// @param remote  the peer's `a=crypto` line, whose key protects the media the peer sends
+    /// @param options the SRTP settings
+    /// @throws IllegalArgumentException if the two lines name different suites, or cryptex is asked for a suite
+    ///                                  without encryption
+    /// @spec https://www.rfc-editor.org/rfc/rfc4568.html RFC 4568: Session Description Protocol (SDP) Security Descriptions for Media Streams
+    public static SrtpTransport sdes(DatagramTransport lower, SdesCrypto local, SdesCrypto remote,
+                                     SrtpOptions options) {
         Objects.requireNonNull(lower, "lower cannot be null");
-        Objects.requireNonNull(suite, "suite cannot be null");
+        Objects.requireNonNull(local, "local cannot be null");
+        Objects.requireNonNull(remote, "remote cannot be null");
         Objects.requireNonNull(options, "options cannot be null");
+        if (local.suite() != remote.suite()) {
+            throw new IllegalArgumentException("the local line uses " + local.suite() + " and the remote one "
+                    + remote.suite());
+        }
         var transport = new SrtpTransport(lower, null, options);
-        transport.key(suite, localKey, localSalt, remoteKey, remoteSalt);
+        transport.key(local.suite(), local.masterKey(), local.masterSalt(), remote.masterKey(), remote.masterSalt());
         lower.setReceiver(transport::onPacket);
         return transport;
     }
 
     @Override
     public void sendRtp(ByteBuffer plainRtp) throws IOException {
-        var transformer = requireOutbound();
-        protectAndSend(plainRtp, false, transformer);
+        protectAndSend(plainRtp, false);
     }
 
     @Override
     public void sendRtcp(ByteBuffer plainCompoundRtcp) throws IOException {
-        var transformer = requireOutbound();
-        protectAndSend(plainCompoundRtcp, true, transformer);
+        protectAndSend(plainCompoundRtcp, true);
     }
 
     @Override
@@ -249,36 +268,39 @@ public final class SrtpTransport implements RtpTransport {
                 replayedPackets.sum(), malformedPackets.sum(), unkeyedPackets.sum());
     }
 
+    /// {@inheritDoc}
+    ///
+    /// Waits for a packet being protected or unprotected on another thread to finish before wiping the keys.
     @Override
     public void close() {
-        synchronized (keyLock) {
-            if (closed) {
-                return;
+        for (var lock : unprotectLocks) {
+            lock.lock();
+        }
+        protectLock.lock();
+        try {
+            synchronized (keyLock) {
+                if (closed) {
+                    return;
+                }
+                closed = true;
+                if (outbound != null) {
+                    outbound.close();
+                }
+                if (inbound != null) {
+                    inbound.close();
+                }
             }
-            closed = true;
-            if (outbound != null) {
-                outbound.close();
-            }
-            if (inbound != null) {
-                inbound.close();
+        } finally {
+            protectLock.unlock();
+            for (var index = unprotectLocks.length - 1; index >= 0; index--) {
+                unprotectLocks[index].unlock();
             }
         }
     }
 
-    /// Sets the listener of authentication failures, used by [MediaTransport] to fail on a long run of them.
-    ///
-    /// @param listener the listener, or `null` for none
-    void setFailureListener(FailureListener listener) {
-        this.failureListener = listener;
-    }
-
-    /// Receives the number of consecutive authentication failures after each failure.
-    @FunctionalInterface
-    interface FailureListener {
-        /// Called after a packet failed authentication.
-        ///
-        /// @param consecutive the failures since the last authenticated packet
-        void onAuthenticationFailure(int consecutive);
+    /// {@return the packets that failed authentication since the last one that authenticated}
+    long failuresSinceAuthenticated() {
+        return failuresSinceAuthenticated.get();
     }
 
     /// Keys the transport from DTLS-SRTP keys.
@@ -319,16 +341,18 @@ public final class SrtpTransport implements RtpTransport {
     }
 
     /// {@return the outbound protection, keying from DTLS first if needed}
-    private SrtpTransformer requireOutbound() {
+    ///
+    /// @throws ClosedChannelException if the transport is closed or not keyed yet
+    private SrtpTransformer requireOutbound() throws ClosedChannelException {
         if (closed) {
-            throw new IllegalStateException("the SRTP transport is closed");
+            throw new ClosedChannelException();
         }
         var transformer = outbound;
         if (transformer == null) {
             transformer = tryKeyFromDtls();
         }
         if (transformer == null) {
-            throw new IllegalStateException("the SRTP transport is not keyed yet");
+            throw new ClosedChannelException();
         }
         return transformer;
     }
@@ -344,39 +368,46 @@ public final class SrtpTransport implements RtpTransport {
         return outbound;
     }
 
-    /// Protects a packet, in place when the buffer allows it, and sends it.
-    private void protectAndSend(ByteBuffer packet, boolean rtcp, SrtpTransformer transformer) throws IOException {
+    /// Protects a packet, in place when the buffer allows it, and sends it, under [#protectLock] so the wire order is
+    /// the index order.
+    private void protectAndSend(ByteBuffer packet, boolean rtcp) throws IOException {
         var length = packet.remaining();
         if (length < (rtcp ? MIN_RTCP_LENGTH : MIN_RTP_LENGTH)) {
             throw new IllegalArgumentException("packet of " + length + " bytes is too short");
         }
-        byte[] array;
-        int offset;
-        if (packet.hasArray() && !packet.isReadOnly()
-                && packet.capacity() - packet.limit() >= overhead) {
-            array = packet.array();
-            offset = packet.arrayOffset() + packet.position();
-        } else {
-            array = new byte[length + overhead];
-            packet.duplicate().get(array, 0, length);
-            offset = 0;
-        }
-        var srtp = new SrtpPacket(array, offset, length);
-        var status = rtcp ? transformer.protectRtcp(srtp) : transformer.protectRtp(srtp);
-        if (status != SrtpErrorStatus.OK) {
-            throw new IOException((rtcp ? "SRTCP" : "SRTP") + " protection failed: " + status);
-        }
-        sendPath.send(ByteBuffer.wrap(array, offset, srtp.length()));
-        if (rtcp) {
-            rtcpPacketsSent.increment();
-            rtcpBytesSent.add(srtp.length());
-        } else {
-            rtpPacketsSent.increment();
-            rtpBytesSent.add(srtp.length());
+        protectLock.lock();
+        try {
+            var transformer = requireOutbound();
+            byte[] array;
+            int offset;
+            if (packet.hasArray() && !packet.isReadOnly()
+                    && packet.capacity() - packet.limit() >= overhead) {
+                array = packet.array();
+                offset = packet.arrayOffset() + packet.position();
+            } else {
+                array = new byte[length + overhead];
+                packet.duplicate().get(array, 0, length);
+                offset = 0;
+            }
+            var srtp = new SrtpPacket(array, offset, length);
+            var status = rtcp ? transformer.protectRtcp(srtp) : transformer.protectRtp(srtp);
+            if (status != SrtpErrorStatus.OK) {
+                throw new IOException((rtcp ? "SRTCP" : "SRTP") + " protection failed: " + status);
+            }
+            sendPath.send(ByteBuffer.wrap(array, offset, srtp.length()));
+            if (rtcp) {
+                rtcpPacketsSent.increment();
+                rtcpBytesSent.add(srtp.length());
+            } else {
+                rtpPacketsSent.increment();
+                rtpBytesSent.add(srtp.length());
+            }
+        } finally {
+            protectLock.unlock();
         }
     }
 
-    /// Unprotects one received packet and hands it to its receiver.
+    /// Unprotects one received packet under the lock of its stream, then hands it to its receiver.
     private void onPacket(ByteBuffer packet, long arrivalNanos) {
         if (closed) {
             return;
@@ -387,14 +418,8 @@ public final class SrtpTransport implements RtpTransport {
             malformedPackets.increment();
             return;
         }
-        var transformer = inbound;
-        if (transformer == null) {
+        if (inbound == null) {
             tryKeyFromDtls();
-            transformer = inbound;
-            if (transformer == null) {
-                unkeyedPackets.increment();
-                return;
-            }
         }
         byte[] array;
         int offset;
@@ -406,11 +431,27 @@ public final class SrtpTransport implements RtpTransport {
             packet.duplicate().get(array);
             offset = 0;
         }
+        var lastSsrcByte = offset + (rtcp ? 7 : 11);
+        var lock = unprotectLocks[array[lastSsrcByte] & (UNPROTECT_STRIPES - 1)];
         var srtp = new SrtpPacket(array, offset, length);
-        var status = rtcp ? transformer.unprotectRtcp(srtp) : transformer.unprotectRtp(srtp);
+        SrtpErrorStatus status;
+        lock.lock();
+        try {
+            var transformer = inbound;
+            if (closed) {
+                return;
+            }
+            if (transformer == null) {
+                unkeyedPackets.increment();
+                return;
+            }
+            status = rtcp ? transformer.unprotectRtcp(srtp) : transformer.unprotectRtp(srtp);
+        } finally {
+            lock.unlock();
+        }
         switch (status) {
             case OK -> {
-                consecutiveFailures.set(0);
+                failuresSinceAuthenticated.set(0);
                 if (rtcp) {
                     rtcpPacketsReceived.increment();
                     rtcpBytesReceived.add(length);
@@ -431,11 +472,7 @@ public final class SrtpTransport implements RtpTransport {
             case INVALID_PACKET -> malformedPackets.increment();
             case AUTH_FAIL, FAIL -> {
                 authenticationFailures.increment();
-                var listener = failureListener;
-                var count = consecutiveFailures.incrementAndGet();
-                if (listener != null) {
-                    listener.onAuthenticationFailure(count);
-                }
+                failuresSinceAuthenticated.incrementAndGet();
             }
         }
     }

@@ -1,7 +1,7 @@
 /// Provides DTLS for WebRTC: [DtlsTransport], a DTLS 1.2 and 1.3 client and server over a datagram path that
 /// negotiates the `use_srtp` extension and exports the SRTP keys of both directions ([DtlsSrtpKeys]), carries
 /// application data for SCTP, and passes RTP and RTCP through; the [DtlsCertificate] each side authenticates with
-/// and its [DtlsFingerprint]s; and the session description attributes of a DTLS association ([DtlsSetup],
+/// and its [DtlsFingerprint]s; and the session description attributes of a DTLS association ([com.github.auties00.parley.sdp.SetupRole],
 /// [DtlsTlsId], [DtlsParameters]).
 ///
 /// The implementation covers what WebRTC peers use: ECDHE over X25519, P-256 or P-384; ECDSA and RSA certificates;
