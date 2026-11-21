@@ -164,11 +164,10 @@ public final class RtpTransceiver {
             var capabilities = connection.codecCapabilities(kind);
             var result = new ArrayList<Codec>();
             for (var codec : copy) {
-                var match = capabilities.stream().filter(capability -> CodecCatalog.matches(capability, codec))
-                        .findFirst()
-                        .orElseThrow(() -> new InvalidModificationException("not a " + kind + " capability: "
-                                + codec.mimeType()));
-                if (!result.contains(match)) {
+                if (capabilities.stream().noneMatch(capability -> CodecCatalog.matches(capability, codec))) {
+                    throw new InvalidModificationException("not a " + kind + " capability: " + codec.mimeType());
+                }
+                if (!result.contains(codec)) {
                     result.add(codec);
                 }
             }
