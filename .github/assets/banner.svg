@@ -1,30 +1,80 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="320" viewBox="0 0 1280 320" role="img" aria-label="Parley: pure-Java WebRTC">
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="320" viewBox="0 0 1280 320" role="img" aria-label="Parley: a pure-Java, codec-agnostic WebRTC stack">
+  <style>
+    .card { fill: url(#card-light); stroke: #d0d7de; }
+    .title { fill: #0b0e14; }
+    .subtitle { fill: #57606a; }
+    .peer { fill: #ffffff; stroke: #d0d7de; }
+    .peer-label { fill: #57606a; }
+    .layer-label { fill: #57606a; }
+    .grid { stroke: #0b0e14; opacity: 0.05; }
+    @media (prefers-color-scheme: dark) {
+      .card { fill: url(#card-dark); stroke: #30363d; }
+      .title { fill: #e6edf3; }
+      .subtitle { fill: #9da7b3; }
+      .peer { fill: #161b22; stroke: #30363d; }
+      .peer-label { fill: #9da7b3; }
+      .layer-label { fill: #9da7b3; }
+      .grid { stroke: #e6edf3; opacity: 0.05; }
+    }
+  </style>
   <defs>
-    <linearGradient id="sky" x1="0" y1="0" x2="1" y2="1">
+    <linearGradient id="card-light" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#f6f8fa"/>
+      <stop offset="1" stop-color="#eef2f8"/>
+    </linearGradient>
+    <linearGradient id="card-dark" x1="0" y1="0" x2="1" y2="1">
       <stop offset="0" stop-color="#0b0e14"/>
       <stop offset="1" stop-color="#141c2e"/>
     </linearGradient>
-    <linearGradient id="wave" x1="0" y1="0" x2="1" y2="0">
-      <stop offset="0" stop-color="#2f81f7"/>
+    <linearGradient id="spectrum" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#f89820"/>
       <stop offset="0.5" stop-color="#a371f7"/>
-      <stop offset="1" stop-color="#f89820"/>
+      <stop offset="1" stop-color="#2f81f7"/>
     </linearGradient>
+    <pattern id="dots" width="24" height="24" patternUnits="userSpaceOnUse">
+      <circle cx="2" cy="2" r="1.2" class="grid" stroke-width="2"/>
+    </pattern>
   </defs>
-  <rect width="1280" height="320" fill="url(#sky)"/>
-  <g fill="none" stroke="url(#wave)" stroke-width="3" opacity="0.85">
-    <path d="M0 230 C 160 170, 320 290, 480 230 S 800 170, 960 230 S 1200 290, 1280 230"/>
-    <path d="M0 250 C 160 200, 320 300, 480 250 S 800 200, 960 250 S 1200 300, 1280 250" opacity="0.5"/>
-    <path d="M0 270 C 160 230, 320 310, 480 270 S 800 230, 960 270 S 1200 310, 1280 270" opacity="0.25"/>
+
+  <rect class="card" x="1" y="1" width="1278" height="318" rx="24" stroke-width="2"/>
+  <rect x="1" y="1" width="1278" height="318" rx="24" fill="url(#dots)"/>
+
+  <!-- the layered path between them: ICE, DTLS, SRTP and SCTP, RTP -->
+  <g fill="none" stroke-linecap="round">
+    <path d="M200 236 C 420 236, 460 268, 640 268 S 860 236, 1080 236" stroke="#f89820" stroke-width="3" opacity="0.9"/>
+    <path d="M200 248 C 420 248, 460 280, 640 280 S 860 248, 1080 248" stroke="#a371f7" stroke-width="3" opacity="0.75"/>
+    <path d="M200 260 C 420 260, 460 292, 640 292 S 860 260, 1080 260" stroke="#2f81f7" stroke-width="3" opacity="0.6"/>
   </g>
-  <g fill="#2f81f7">
-    <circle cx="250" cy="120" r="34" opacity="0.9"/>
-    <circle cx="1030" cy="120" r="34" fill="#f89820" opacity="0.9"/>
+  <g>
+    <rect x="356" y="250" width="22" height="10" rx="3" fill="#f89820"/>
+    <rect x="508" y="268" width="22" height="10" rx="3" fill="#a371f7"/>
+    <rect x="748" y="270" width="22" height="10" rx="3" fill="#2f81f7"/>
+    <rect x="900" y="242" width="22" height="10" rx="3" fill="#a371f7"/>
   </g>
-  <g stroke="#a371f7" stroke-width="2" stroke-dasharray="6 10" opacity="0.8">
-    <line x1="292" y1="120" x2="988" y2="120"/>
+
+  <!-- the two peers -->
+  <g>
+    <rect class="peer" x="64" y="88" width="176" height="184" rx="18" stroke-width="2"/>
+    <circle cx="112" cy="132" r="14" fill="#f89820"/>
+    <rect x="136" y="125" width="72" height="6" rx="3" fill="#f89820" opacity="0.55"/>
+    <rect x="136" y="137" width="48" height="6" rx="3" fill="#f89820" opacity="0.3"/>
+    <text class="peer-label" x="152" y="182" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Consolas, monospace" font-size="16">offer</text>
+    <rect x="88" y="232" width="128" height="8" rx="4" fill="#f89820" opacity="0.35"/>
+    <rect x="88" y="244" width="128" height="8" rx="4" fill="#a371f7" opacity="0.35"/>
+    <rect x="88" y="256" width="128" height="8" rx="4" fill="#2f81f7" opacity="0.35"/>
+
+    <rect class="peer" x="1040" y="88" width="176" height="184" rx="18" stroke-width="2"/>
+    <circle cx="1088" cy="132" r="14" fill="#2f81f7"/>
+    <rect x="1112" y="125" width="72" height="6" rx="3" fill="#2f81f7" opacity="0.55"/>
+    <rect x="1112" y="137" width="48" height="6" rx="3" fill="#2f81f7" opacity="0.3"/>
+    <text class="peer-label" x="1128" y="182" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Consolas, monospace" font-size="16">answer</text>
+    <rect x="1064" y="232" width="128" height="8" rx="4" fill="#f89820" opacity="0.35"/>
+    <rect x="1064" y="244" width="128" height="8" rx="4" fill="#a371f7" opacity="0.35"/>
+    <rect x="1064" y="256" width="128" height="8" rx="4" fill="#2f81f7" opacity="0.35"/>
   </g>
-  <text x="640" y="112" text-anchor="middle" font-family="Segoe UI, Helvetica, Arial, sans-serif" font-size="72"
-        font-weight="700" letter-spacing="18" fill="#e6edf3">PARLEY</text>
-  <text x="640" y="160" text-anchor="middle" font-family="Segoe UI, Helvetica, Arial, sans-serif" font-size="24"
-        fill="#9da7b3">A pure-Java, codec-agnostic WebRTC stack</text>
+
+  <text class="title" x="640" y="124" text-anchor="middle" font-family="Segoe UI, Helvetica Neue, Helvetica, Arial, sans-serif" font-size="76" font-weight="700" letter-spacing="14">PARLEY</text>
+  <rect x="520" y="146" width="240" height="4" rx="2" fill="url(#spectrum)"/>
+  <text class="subtitle" x="640" y="190" text-anchor="middle" font-family="Segoe UI, Helvetica Neue, Helvetica, Arial, sans-serif" font-size="24">A pure-Java, codec-agnostic WebRTC stack</text>
+  <text class="layer-label" x="640" y="224" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Consolas, monospace" font-size="15" letter-spacing="1">ICE  /  DTLS  /  SRTP  /  SCTP  /  RTP</text>
 </svg>
