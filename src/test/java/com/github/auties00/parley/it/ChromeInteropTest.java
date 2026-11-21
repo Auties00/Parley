@@ -145,7 +145,7 @@ class ChromeInteropTest {
                 var audioWriter = loop(running, opus, Duration.ofMillis(20), 960, MediaKind.AUDIO, audio);
                 var videoWriter = loop(running, vp8, Duration.ofMillis(33), 3000, MediaKind.VIDEO, video);
                 try {
-                    assertDataChannel(channel);
+                    assertDataChannel(channel, server, pc);
                     var remoteTracks = new HashMap<MediaKind, RemoteTrack>();
                     for (var kind : MediaKind.values()) {
                         var track = awaitEvent(events, monitor, PeerConnectionEvent.Track.class,
@@ -186,10 +186,26 @@ class ChromeInteropTest {
     }
 
     /// Exchanges text both ways: Chrome greets as the channel opens and echoes what Parley sends.
-    private static void assertDataChannel(DataChannel channel) throws Exception {
+    private static void assertDataChannel(DataChannel channel, SignalingServer server, PeerConnection pc)
+            throws Exception {
         assertTrue(channel.awaitOpen(TIMEOUT), "the data channel did not open: " + channel);
-        assertEquals(new DataChannelMessage.Text("hello from chrome"), channel.receive(TIMEOUT)
-                .orElseThrow(() -> new AssertionError("no greeting from Chrome on " + channel)));
+        var greeting = channel.receive(TIMEOUT);
+        if (greeting.isEmpty()) {
+            var dump = java.nio.file.Path.of(System.getProperty("java.io.tmpdir"),
+                    "chrome-interop-" + System.nanoTime() + ".txt");
+            try {
+                new ProcessBuilder(java.nio.file.Path.of(System.getProperty("java.home"), "bin", "jcmd").toString(),
+                        Long.toString(ProcessHandle.current().pid()), "Thread.dump_to_file", dump.toString())
+                        .inheritIO().start().waitFor(30, TimeUnit.SECONDS);
+            } catch (IOException exception) {
+                // the dump is a diagnostic only
+            }
+            throw new AssertionError("no greeting from Chrome on " + channel + ", " + channel.statistics()
+                    + "; stats " + pc.getStats().all(com.github.auties00.parley.stats.TransportStats.class)
+                    + "; threads " + dump + "; last report " + server.latest("report").orElse("none")
+                    + ", page log " + server.logs());
+        }
+        assertEquals(new DataChannelMessage.Text("hello from chrome"), greeting.get());
         channel.send("ping");
         assertEquals(new DataChannelMessage.Text("echo:ping"), channel.receive(TIMEOUT).orElseThrow());
     }

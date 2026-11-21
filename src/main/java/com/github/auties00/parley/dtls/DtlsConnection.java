@@ -961,8 +961,12 @@ final class DtlsConnection implements DtlsTransport {
     }
 
     /// Releases the lock, then reports the state changes and delivers the application data that queued under it.
+    ///
+    /// Only a thread that queued application data delivers: a thread that only sent (an SCTP writer, a media
+    /// sender) never calls the application receiver, which would re-enter the layer above on its own sending thread.
     private void unlock() {
         List<DtlsState> states = List.of();
+        var queued = false;
         if (lock.getHoldCount() == 1) {
             if (!pendingStates.isEmpty()) {
                 states = List.copyOf(pendingStates);
@@ -971,6 +975,7 @@ final class DtlsConnection implements DtlsTransport {
             if (!pendingData.isEmpty()) {
                 deliveries.addAll(pendingData);
                 pendingData.clear();
+                queued = true;
             }
         }
         lock.unlock();
@@ -981,7 +986,9 @@ final class DtlsConnection implements DtlsTransport {
                 LOGGER.log(Level.WARNING, "a DTLS state listener failed", exception);
             }
         }
-        drainApplicationData();
+        if (queued) {
+            drainApplicationData();
+        }
     }
 
     /// Delivers the released application data, one thread at a time and in record order: a thread that finds another

@@ -39,6 +39,8 @@ public final class DtmfSender {
     public static final Duration MIN_GAP = Duration.ofMillis(30);
     /// The pause a comma stands for.
     public static final Duration COMMA_PAUSE = Duration.ofSeconds(2);
+    /// How often a player whose tones wait for the audio stream checks whether it was wired.
+    private static final Duration SINK_POLL = Duration.ofMillis(20);
 
     /// A tone starting, or the buffer running empty, the W3C `RTCDTMFToneChangeEvent`.
     ///
@@ -77,7 +79,7 @@ public final class DtmfSender {
     private Duration gap = Duration.ofMillis(70);
     /// The thread playing the buffer, or `null`.
     private Thread player;
-    /// The wire side, installed once telephone-event is negotiated.
+    /// The wire side, installed once the audio stream is wired; tones wait for it.
     private volatile ToneSink sink;
 
     /// Creates the DTMF sender of `sender`, whose player threads `threadFactory` creates and `clock` times.
@@ -87,9 +89,14 @@ public final class DtmfSender {
         this.clock = Objects.requireNonNull(clock);
     }
 
-    /// {@return whether tones can be sent now: the transceiver sends and the peer negotiated telephone-event}
+    /// {@return whether tones can be queued: the transceiver's current direction sends and the negotiation agreed on
+    /// telephone-event}
+    ///
+    /// Tones queued while the transport is still connecting are played once the audio stream is wired.
+    ///
+    /// @spec https://www.w3.org/TR/webrtc/#dom-rtcdtmfsender-caninsertdtmf WebRTC: Real-Time Communication in Browsers, canInsertDTMF
     public boolean canInsertDtmf() {
-        return sink != null && sender.connection().isSending(sender);
+        return sender.connection().isSending(sender) && sender.connection().negotiatedTelephoneEvent(sender);
     }
 
     /// {@return the tones not yet played}
@@ -173,9 +180,17 @@ public final class DtmfSender {
                         return;
                     }
                     tone = buffer.charAt(0);
-                    buffer = buffer.substring(1);
+                    if (tone != ',' && sink == null) {
+                        tone = 0;
+                    } else {
+                        buffer = buffer.substring(1);
+                    }
                     toneDuration = duration;
                     toneGap = gap;
+                }
+                if (tone == 0) {
+                    sleep(clock, SINK_POLL);
+                    continue;
                 }
                 events.publish(new ToneChange(Optional.of(tone)));
                 if (tone == ',') {
@@ -184,11 +199,6 @@ public final class DtmfSender {
                 }
                 var current = sink;
                 if (current == null) {
-                    synchronized (lock) {
-                        if (player == self) {
-                            buffer = "";
-                        }
-                    }
                     continue;
                 }
                 current.play(tone, toneDuration);

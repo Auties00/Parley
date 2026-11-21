@@ -1041,6 +1041,13 @@ public final class PeerConnection implements AutoCloseable {
         }
     }
 
+    /// {@return whether the negotiation of a sender's section agreed on telephone-event}
+    boolean negotiatedTelephoneEvent(RtpSender sender) {
+        synchronized (lock) {
+            return negotiatedMedia(sender).flatMap(Negotiated.Media::telephoneEvent).isPresent();
+        }
+    }
+
     /// {@return the DTLS transport of a sender's negotiated section}
     Optional<PeerDtlsTransport> transportOf(RtpSender sender) {
         return transportOf(transceiver -> transceiver.sender() == sender);
