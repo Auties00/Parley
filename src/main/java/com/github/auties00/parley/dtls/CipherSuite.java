@@ -10,7 +10,7 @@ import java.util.Optional;
 ///
 /// @spec https://www.rfc-editor.org/rfc/rfc5289.html RFC 5289: TLS Elliptic Curve Cipher Suites with SHA-256/384 and AES Galois Counter Mode (GCM)
 /// @spec https://www.rfc-editor.org/rfc/rfc7905.html RFC 7905: ChaCha20-Poly1305 Cipher Suites for Transport Layer Security (TLS)
-/// @spec https://www.rfc-editor.org/rfc/rfc8446.html#appendix-B.4 RFC 8446: The Transport Layer Security (TLS) Protocol Version 1.3
+/// @spec https://www.rfc-editor.org/rfc/rfc8446.html RFC 8446: The Transport Layer Security (TLS) Protocol Version 1.3
 enum CipherSuite {
     /// `TLS_AES_128_GCM_SHA256`.
     TLS_AES_128_GCM_SHA256(0x1301, DtlsVersion.DTLS_1_3, null, Aead.AES_128_GCM, HashAlgorithm.SHA256),

@@ -23,7 +23,7 @@ import java.util.Optional;
 /// @param replayedPackets        the packets rejected as replays or as older than the replay window
 /// @param malformedPackets       the packets too short or malformed to process
 /// @param unkeyedPackets         the packets received before the transport was keyed
-/// @spec https://www.w3.org/TR/webrtc-stats/#transportstats-dict* Identifiers for WebRTC's Statistics API
+/// @spec https://www.w3.org/TR/webrtc-stats/ Identifiers for WebRTC's Statistics API
 public record RtpTransportStatistics(Optional<SrtpCryptoSuite> suite, long rtpPacketsSent, long rtpBytesSent,
                                      long rtcpPacketsSent, long rtcpBytesSent, long rtpPacketsReceived,
                                      long rtpBytesReceived, long rtcpPacketsReceived, long rtcpBytesReceived,

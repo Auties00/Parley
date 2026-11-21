@@ -22,7 +22,7 @@ import java.util.Optional;
 /// @param recordsDropped         the records discarded as malformed, replayed, from an unknown epoch or failing
 ///                               authentication
 /// @param authenticationFailures the records, among [#recordsDropped()], that failed authentication
-/// @spec https://www.w3.org/TR/webrtc-stats/#transportstats-dict* Identifiers for WebRTC's Statistics API
+/// @spec https://www.w3.org/TR/webrtc-stats/ Identifiers for WebRTC's Statistics API
 public record DtlsTransportStatistics(DtlsState state, Optional<DtlsRole> role, Optional<DtlsVersion> version,
                                       Optional<String> cipherSuite, Optional<SrtpProfile> srtpProfile, long bytesSent,
                                       long bytesReceived, long packetsSent, long packetsReceived, long retransmissions,

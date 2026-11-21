@@ -23,8 +23,8 @@ import java.util.Map;
 ///
 /// Instances are not thread-safe; the connection uses one under its lock.
 ///
-/// @spec https://www.rfc-editor.org/rfc/rfc6347.html#section-4.1 RFC 6347: Datagram Transport Layer Security Version 1.2
-/// @spec https://www.rfc-editor.org/rfc/rfc9147.html#section-4 RFC 9147: The Datagram Transport Layer Security (DTLS) Protocol Version 1.3
+/// @spec https://www.rfc-editor.org/rfc/rfc6347.html RFC 6347: Datagram Transport Layer Security Version 1.2
+/// @spec https://www.rfc-editor.org/rfc/rfc9147.html RFC 9147: The Datagram Transport Layer Security (DTLS) Protocol Version 1.3
 final class RecordLayer {
     /// The `change_cipher_spec` content type, DTLS 1.2 only.
     static final int CHANGE_CIPHER_SPEC = 20;
@@ -287,10 +287,6 @@ final class RecordLayer {
             dropped++;
             return total;
         }
-        if (!state.window.isFresh(sequence)) {
-            dropped++;
-            return total;
-        }
         byte[] payload;
         if (state.cipher12 == null) {
             payload = java.util.Arrays.copyOfRange(datagram, offset + PLAINTEXT_HEADER_LENGTH, offset + total);
@@ -304,7 +300,7 @@ final class RecordLayer {
                 return total;
             }
         }
-        if (payload.length > MAX_PLAINTEXT) {
+        if (payload.length > MAX_PLAINTEXT || !state.window.isFresh(sequence)) {
             dropped++;
             return total;
         }

@@ -8,7 +8,7 @@ import java.util.Arrays;
 /// A vector is written by reserving its length field with one of the `open` methods, writing the contents, and
 /// filling the length in with [#close(int)].
 ///
-/// @spec https://www.rfc-editor.org/rfc/rfc8446.html#section-3 RFC 8446: The Transport Layer Security (TLS) Protocol Version 1.3
+/// @spec https://www.rfc-editor.org/rfc/rfc8446.html RFC 8446: The Transport Layer Security (TLS) Protocol Version 1.3
 final class TlsWriter {
     /// The bytes written so far, followed by spare capacity.
     private byte[] buffer;

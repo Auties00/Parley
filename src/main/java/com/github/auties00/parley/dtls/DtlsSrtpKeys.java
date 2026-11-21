@@ -9,7 +9,8 @@ import java.util.Objects;
 /// local pair keys an SRTP context that protects outgoing packets and the remote pair one that unprotects incoming
 /// packets, both with [SrtpProfile#suite()] of [#profile()].
 ///
-/// The key material is secret: the record copies it in and out, and [#toString()] leaves it out.
+/// The key material is secret: the record copies it in and out, compares it by content, and [#toString()] leaves it
+/// out.
 ///
 /// @param profile    the negotiated protection profile
 /// @param localKey   the master key of the media this endpoint sends
@@ -55,6 +56,25 @@ public record DtlsSrtpKeys(SrtpProfile profile, byte[] localKey, byte[] localSal
     @Override
     public byte[] remoteSalt() {
         return remoteSalt.clone();
+    }
+
+    /// {@return whether another object holds the same profile and key material}
+    ///
+    /// @param other the object to compare with
+    @Override
+    public boolean equals(Object other) {
+        return other instanceof DtlsSrtpKeys that && profile == that.profile
+                && java.security.MessageDigest.isEqual(localKey, that.localKey)
+                && java.security.MessageDigest.isEqual(localSalt, that.localSalt)
+                && java.security.MessageDigest.isEqual(remoteKey, that.remoteKey)
+                && java.security.MessageDigest.isEqual(remoteSalt, that.remoteSalt);
+    }
+
+    /// {@return a hash of the profile and key material}
+    @Override
+    public int hashCode() {
+        return Objects.hash(profile, java.util.Arrays.hashCode(localKey), java.util.Arrays.hashCode(localSalt),
+                java.util.Arrays.hashCode(remoteKey), java.util.Arrays.hashCode(remoteSalt));
     }
 
     /// {@return the profile, without the key material}

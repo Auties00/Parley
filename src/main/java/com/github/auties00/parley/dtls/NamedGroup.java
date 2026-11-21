@@ -139,6 +139,7 @@ enum NamedGroup {
             var parameters = AlgorithmParameters.getInstance("EC");
             parameters.init(new ECGenParameterSpec(curve));
             var spec = parameters.getParameterSpec(ECParameterSpec.class);
+            requireOnCurve(spec, x, y);
             return KeyFactory.getInstance("EC").generatePublic(new ECPublicKeySpec(new ECPoint(x, y), spec));
         } catch (GeneralSecurityException | IllegalArgumentException exception) {
             throw new DtlsException(DtlsAlert.ILLEGAL_PARAMETER, false, "invalid " + this + " key share", exception);
@@ -166,6 +167,25 @@ enum NamedGroup {
             return secret;
         } catch (GeneralSecurityException exception) {
             throw new DtlsException(DtlsAlert.ILLEGAL_PARAMETER, false, "ECDHE key agreement failed", exception);
+        }
+    }
+
+    /// Fails unless `(x, y)` is a point of the curve: both coordinates in the field and `y^2 = x^3 + ax + b`.
+    ///
+    /// The JDK accepts any coordinates in a public key specification, so without this check a peer could mount an
+    /// invalid-curve attack on the ephemeral key.
+    ///
+    /// @throws DtlsException if the point is not on the curve
+    private static void requireOnCurve(ECParameterSpec spec, BigInteger x, BigInteger y) throws DtlsException {
+        var curve = spec.getCurve();
+        var p = ((java.security.spec.ECFieldFp) curve.getField()).getP();
+        if (x.signum() < 0 || x.compareTo(p) >= 0 || y.signum() < 0 || y.compareTo(p) >= 0) {
+            throw new DtlsException(DtlsAlert.ILLEGAL_PARAMETER, "EC point coordinate out of range");
+        }
+        var left = y.multiply(y).mod(p);
+        var right = x.multiply(x).multiply(x).add(curve.getA().multiply(x)).add(curve.getB()).mod(p);
+        if (!left.equals(right)) {
+            throw new DtlsException(DtlsAlert.ILLEGAL_PARAMETER, "EC point is not on the curve");
         }
     }
 

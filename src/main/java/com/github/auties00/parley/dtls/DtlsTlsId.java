@@ -11,7 +11,7 @@ import java.util.Base64;
 /// The value is 20 to 255 characters from the letters, digits and `+`, `/`, `-`, `_`.
 ///
 /// @param value the attribute value
-/// @spec https://www.rfc-editor.org/rfc/rfc8842.html#section-4 RFC 8842: Session Description Protocol (SDP) Offer/Answer Considerations for Datagram Transport Layer Security (DTLS) and Transport Layer Security (TLS)
+/// @spec https://www.rfc-editor.org/rfc/rfc8842.html RFC 8842: Session Description Protocol (SDP) Offer/Answer Considerations for Datagram Transport Layer Security (DTLS) and Transport Layer Security (TLS)
 public record DtlsTlsId(String value) {
     /// The source of fresh values.
     private static final SecureRandom RANDOM = new SecureRandom();

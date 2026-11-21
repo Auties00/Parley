@@ -14,8 +14,8 @@ import java.util.Optional;
 ///
 /// Instances are not thread-safe.
 ///
-/// @spec https://www.rfc-editor.org/rfc/rfc6347.html#section-4.2.3 RFC 6347: Datagram Transport Layer Security Version 1.2
-/// @spec https://www.rfc-editor.org/rfc/rfc9147.html#section-5.5 RFC 9147: The Datagram Transport Layer Security (DTLS) Protocol Version 1.3
+/// @spec https://www.rfc-editor.org/rfc/rfc6347.html RFC 6347: Datagram Transport Layer Security Version 1.2
+/// @spec https://www.rfc-editor.org/rfc/rfc9147.html RFC 9147: The Datagram Transport Layer Security (DTLS) Protocol Version 1.3
 final class HandshakeReassembler {
     /// The largest handshake message accepted, which bounds the memory a peer can make this side hold.
     static final int MAX_MESSAGE_LENGTH = 1 << 17;

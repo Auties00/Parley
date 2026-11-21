@@ -13,8 +13,8 @@ package com.github.auties00.parley.dtls;
 /// @param type       the handshake type
 /// @param messageSeq the message sequence number
 /// @param body       the body, not copied
-/// @spec https://www.rfc-editor.org/rfc/rfc6347.html#section-4.2.2 RFC 6347: Datagram Transport Layer Security Version 1.2
-/// @spec https://www.rfc-editor.org/rfc/rfc9147.html#section-5.2 RFC 9147: The Datagram Transport Layer Security (DTLS) Protocol Version 1.3
+/// @spec https://www.rfc-editor.org/rfc/rfc6347.html RFC 6347: Datagram Transport Layer Security Version 1.2
+/// @spec https://www.rfc-editor.org/rfc/rfc9147.html RFC 9147: The Datagram Transport Layer Security (DTLS) Protocol Version 1.3
 record HandshakeMessage(int type, int messageSeq, byte[] body) {
     /// `hello_request`, which a DTLS 1.2 server sends to ask for a renegotiation.
     static final int HELLO_REQUEST = 0;

@@ -27,7 +27,7 @@ import java.util.Objects;
 /// @param algorithm the hash function name, lower case, such as `sha-256`
 /// @param value     the digest, whose length matches the hash function
 /// @spec https://www.rfc-editor.org/rfc/rfc8122.html RFC 8122: Connection-Oriented Media Transport over the Transport Layer Security (TLS) Protocol in the Session Description Protocol (SDP)
-/// @spec https://www.rfc-editor.org/rfc/rfc8827.html#section-6.5 RFC 8827: WebRTC Security Architecture
+/// @spec https://www.rfc-editor.org/rfc/rfc8827.html RFC 8827: WebRTC Security Architecture
 public record DtlsFingerprint(String algorithm, byte[] value) {
     /// The supported hash function names, strongest first.
     private static final List<String> ALGORITHMS = List.of("sha-512", "sha-384", "sha-256", "sha-224", "sha-1");
@@ -101,7 +101,7 @@ public record DtlsFingerprint(String algorithm, byte[] value) {
     /// and accepts the certificate when it matches any one of that set.
     ///
     /// @param fingerprints the signalled fingerprints
-    /// @spec https://www.rfc-editor.org/rfc/rfc8122.html#section-5 RFC 8122: Connection-Oriented Media Transport over the Transport Layer Security (TLS) Protocol in the Session Description Protocol (SDP)
+    /// @spec https://www.rfc-editor.org/rfc/rfc8122.html RFC 8122: Connection-Oriented Media Transport over the Transport Layer Security (TLS) Protocol in the Session Description Protocol (SDP)
     public static List<DtlsFingerprint> select(List<DtlsFingerprint> fingerprints) {
         for (var algorithm : ALGORITHMS) {
             var matching = fingerprints.stream().filter(fingerprint -> fingerprint.algorithm.equals(algorithm)).toList();

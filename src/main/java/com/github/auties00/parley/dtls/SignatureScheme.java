@@ -17,8 +17,8 @@ import java.util.Optional;
 /// DTLS 1.3 binds an ECDSA scheme to its curve and allows RSA only with PSS; DTLS 1.2 pairs any ECDSA curve with any
 /// hash and also allows PKCS #1 v1.5. The SHA-1 schemes are accepted from DTLS 1.2 peers but never chosen to sign.
 ///
-/// @spec https://www.rfc-editor.org/rfc/rfc8446.html#section-4.2.3 RFC 8446: The Transport Layer Security (TLS) Protocol Version 1.3
-/// @spec https://www.rfc-editor.org/rfc/rfc5246.html#section-7.4.1.4.1 RFC 5246: The Transport Layer Security (TLS) Protocol Version 1.2
+/// @spec https://www.rfc-editor.org/rfc/rfc8446.html RFC 8446: The Transport Layer Security (TLS) Protocol Version 1.3
+/// @spec https://www.rfc-editor.org/rfc/rfc5246.html RFC 5246: The Transport Layer Security (TLS) Protocol Version 1.2
 enum SignatureScheme {
     /// `ecdsa_secp256r1_sha256`.
     ECDSA_SECP256R1_SHA256(0x0403, "SHA256withECDSA", KeyType.EC, 256, true, null),

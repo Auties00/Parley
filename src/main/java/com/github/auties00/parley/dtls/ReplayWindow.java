@@ -6,8 +6,8 @@ package com.github.auties00.parley.dtls;
 /// [#isFresh(long)] is checked after a record authenticates and [#mark(long)] records it, so a forged record never
 /// moves the window.
 ///
-/// @spec https://www.rfc-editor.org/rfc/rfc6347.html#section-4.1.2.6 RFC 6347: Datagram Transport Layer Security Version 1.2
-/// @spec https://www.rfc-editor.org/rfc/rfc4303.html#section-3.4.3 RFC 4303: IP Encapsulating Security Payload (ESP)
+/// @spec https://www.rfc-editor.org/rfc/rfc6347.html RFC 6347: Datagram Transport Layer Security Version 1.2
+/// @spec https://www.rfc-editor.org/rfc/rfc4303.html RFC 4303: IP Encapsulating Security Payload (ESP)
 final class ReplayWindow {
     /// The window width in records.
     static final int WIDTH = 64;

@@ -18,26 +18,26 @@ import java.util.function.Predicate;
 ///
 /// Each endpoint is either a callback [DatagramTransport] with its own delivery thread, or a blocking queue for peers
 /// such as BouncyCastle that pull datagrams.
-final class MemoryLink implements AutoCloseable {
+public final class MemoryLink implements AutoCloseable {
     /// The conditions of one direction.
     ///
     /// @param lossRate        the probability a datagram is dropped
     /// @param duplicateRate   the probability a datagram is delivered twice
     /// @param reorderRate     the probability a datagram is held back and delivered after the next one
     /// @param seed            the random seed
-    record Conditions(double lossRate, double duplicateRate, double reorderRate, long seed) {
+    public record Conditions(double lossRate, double duplicateRate, double reorderRate, long seed) {
         /// A perfect link.
-        static final Conditions PERFECT = new Conditions(0, 0, 0, 1);
+        public static final Conditions PERFECT = new Conditions(0, 0, 0, 1);
     }
 
     /// The left endpoint.
-    final Endpoint left;
+    public final Endpoint left;
 
     /// The right endpoint.
-    final Endpoint right;
+    public final Endpoint right;
 
     /// Creates a link.
-    MemoryLink(Conditions conditions) {
+    public MemoryLink(Conditions conditions) {
         this.left = new Endpoint("left", conditions, conditions.seed());
         this.right = new Endpoint("right", conditions, conditions.seed() * 31 + 7);
         left.peer = right;
@@ -45,7 +45,7 @@ final class MemoryLink implements AutoCloseable {
     }
 
     /// Creates a perfect link.
-    MemoryLink() {
+    public MemoryLink() {
         this(Conditions.PERFECT);
     }
 
@@ -56,7 +56,7 @@ final class MemoryLink implements AutoCloseable {
     }
 
     /// One endpoint of the link.
-    static final class Endpoint implements DatagramTransport {
+    public static final class Endpoint implements DatagramTransport {
         /// The marker that stops the delivery thread.
         private static final byte[] STOP = new byte[0];
 
@@ -73,7 +73,7 @@ final class MemoryLink implements AutoCloseable {
         final LinkedBlockingQueue<byte[]> inbox = new LinkedBlockingQueue<>();
 
         /// The datagrams sent from this endpoint, as they were sent.
-        final List<byte[]> sent = java.util.Collections.synchronizedList(new ArrayList<>());
+        public final List<byte[]> sent = java.util.Collections.synchronizedList(new ArrayList<>());
 
         /// The datagrams dropped by a filter or the loss rate.
         final AtomicInteger dropped = new AtomicInteger();
@@ -85,7 +85,7 @@ final class MemoryLink implements AutoCloseable {
         private byte[] held;
 
         /// A filter that drops matching datagrams sent from this endpoint, or `null`.
-        volatile Predicate<byte[]> dropFilter;
+        public volatile Predicate<byte[]> dropFilter;
 
         /// The receiver, or `null` for a pulled endpoint.
         private volatile PacketReceiver receiver;
@@ -94,7 +94,7 @@ final class MemoryLink implements AutoCloseable {
         private Thread delivery;
 
         /// The size budget reported.
-        volatile int maxDatagramSize = 1500;
+        public volatile int maxDatagramSize = 1500;
 
         /// Creates an endpoint.
         private Endpoint(String name, Conditions conditions, long seed) {
@@ -107,7 +107,7 @@ final class MemoryLink implements AutoCloseable {
         public synchronized void send(ByteBuffer datagram) throws IOException {
             var bytes = new byte[datagram.remaining()];
             datagram.duplicate().get(bytes);
-            sent.add(bytes);
+            sent.add(bytes.clone());
             var filter = dropFilter;
             if ((filter != null && filter.test(bytes)) || random.nextDouble() < conditions.lossRate()) {
                 dropped.incrementAndGet();
@@ -128,7 +128,7 @@ final class MemoryLink implements AutoCloseable {
         }
 
         /// Sends raw bytes from this endpoint, bypassing the conditions.
-        void inject(byte[] datagram) {
+        public void inject(byte[] datagram) {
             peer.inbox.add(datagram.clone());
         }
 

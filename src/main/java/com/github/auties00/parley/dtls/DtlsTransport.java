@@ -62,7 +62,7 @@ import java.util.function.Consumer;
 /// @spec https://www.rfc-editor.org/rfc/rfc7983.html RFC 7983: Multiplexing Scheme Updates for Secure Real-time Transport Protocol (SRTP) Extension for Datagram Transport Layer Security (DTLS)
 /// @spec https://www.rfc-editor.org/rfc/rfc8122.html RFC 8122: Connection-Oriented Media Transport over the Transport Layer Security (TLS) Protocol in the Session Description Protocol (SDP)
 /// @spec https://www.rfc-editor.org/rfc/rfc8842.html RFC 8842: Session Description Protocol (SDP) Offer/Answer Considerations for Datagram Transport Layer Security (DTLS) and Transport Layer Security (TLS)
-/// @spec https://www.w3.org/TR/webrtc/#rtcdtlstransport-interface WebRTC: Real-Time Communication in Browsers
+/// @spec https://www.w3.org/TR/webrtc/ WebRTC: Real-Time Communication in Browsers
 public sealed interface DtlsTransport extends AutoCloseable permits DtlsConnection {
     /// {@return a transport over a lower datagram transport; the handshake has not started}
     ///
@@ -167,7 +167,7 @@ public sealed interface DtlsTransport extends AutoCloseable permits DtlsConnecti
     /// @throws IOException           if the lower transport fails
     /// @throws IllegalStateException if the transport is not connected with DTLS 1.3, or an earlier update is not
     ///                               acknowledged yet
-    /// @spec https://www.rfc-editor.org/rfc/rfc9147.html#section-8 RFC 9147: The Datagram Transport Layer Security (DTLS) Protocol Version 1.3
+    /// @spec https://www.rfc-editor.org/rfc/rfc9147.html RFC 9147: The Datagram Transport Layer Security (DTLS) Protocol Version 1.3
     void updateKeys(boolean requestPeerUpdate) throws IOException;
 
     /// {@return a new transport over the same lower transport and settings, for a new association with the peer}
@@ -175,7 +175,7 @@ public sealed interface DtlsTransport extends AutoCloseable permits DtlsConnecti
     /// This transport is closed with `close_notify` first; the new one owns the lower transport's receiver and has not
     /// started its handshake. RFC 8842 requires a new association when the peer's `a=tls-id` or fingerprints change.
     ///
-    /// @spec https://www.rfc-editor.org/rfc/rfc8842.html#section-5 RFC 8842: Session Description Protocol (SDP) Offer/Answer Considerations for Datagram Transport Layer Security (DTLS) and Transport Layer Security (TLS)
+    /// @spec https://www.rfc-editor.org/rfc/rfc8842.html RFC 8842: Session Description Protocol (SDP) Offer/Answer Considerations for Datagram Transport Layer Security (DTLS) and Transport Layer Security (TLS)
     DtlsTransport restart();
 
     /// {@return a snapshot of the state and counters}

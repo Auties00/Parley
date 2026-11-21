@@ -7,7 +7,7 @@ import java.util.Arrays;
 /// Every read past the end, and every vector whose length exceeds what remains, fails with a [DtlsException] carrying
 /// [DtlsAlert#DECODE_ERROR], so a parser never reads garbage from a truncated or hostile message.
 ///
-/// @spec https://www.rfc-editor.org/rfc/rfc8446.html#section-3 RFC 8446: The Transport Layer Security (TLS) Protocol Version 1.3
+/// @spec https://www.rfc-editor.org/rfc/rfc8446.html RFC 8446: The Transport Layer Security (TLS) Protocol Version 1.3
 final class TlsReader {
     /// The source array.
     private final byte[] source;

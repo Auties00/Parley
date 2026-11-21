@@ -6,8 +6,8 @@ import java.util.Optional;
 ///
 /// A [DtlsException] names the alert that ended a handshake through [DtlsException#alert()], whichever side sent it.
 ///
-/// @spec https://www.rfc-editor.org/rfc/rfc8446.html#section-6 RFC 8446: The Transport Layer Security (TLS) Protocol Version 1.3
-/// @spec https://www.rfc-editor.org/rfc/rfc5246.html#section-7.2 RFC 5246: The Transport Layer Security (TLS) Protocol Version 1.2
+/// @spec https://www.rfc-editor.org/rfc/rfc8446.html RFC 8446: The Transport Layer Security (TLS) Protocol Version 1.3
+/// @spec https://www.rfc-editor.org/rfc/rfc5246.html RFC 5246: The Transport Layer Security (TLS) Protocol Version 1.2
 public enum DtlsAlert {
     /// `close_notify` (0): the sender closes the association.
     CLOSE_NOTIFY(0),

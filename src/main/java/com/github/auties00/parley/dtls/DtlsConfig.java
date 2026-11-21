@@ -33,8 +33,8 @@ import java.util.concurrent.ThreadFactory;
 ///                          handshake returned (the final DTLS 1.3 flight, a key update)
 /// @param cookieExchange    whether a server demands a cookie (`HelloVerifyRequest` in DTLS 1.2, a
 ///                          `HelloRetryRequest` cookie in DTLS 1.3) before it commits state, which costs one round trip
-/// @spec https://www.rfc-editor.org/rfc/rfc6347.html#section-4.2.4 RFC 6347: Datagram Transport Layer Security Version 1.2
-/// @spec https://www.rfc-editor.org/rfc/rfc9147.html#section-5.1 RFC 9147: The Datagram Transport Layer Security (DTLS) Protocol Version 1.3
+/// @spec https://www.rfc-editor.org/rfc/rfc6347.html RFC 6347: Datagram Transport Layer Security Version 1.2
+/// @spec https://www.rfc-editor.org/rfc/rfc9147.html RFC 9147: The Datagram Transport Layer Security (DTLS) Protocol Version 1.3
 public record DtlsConfig(List<DtlsCertificate> certificates, List<SrtpProfile> srtpProfiles, Set<DtlsVersion> versions,
                          Duration initialRetransmit, MonotonicClock clock, ThreadFactory threadFactory,
                          boolean cookieExchange) {

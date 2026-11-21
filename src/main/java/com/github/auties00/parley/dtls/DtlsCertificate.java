@@ -44,7 +44,7 @@ import java.util.Objects;
 ///
 /// @spec https://www.rfc-editor.org/rfc/rfc8122.html RFC 8122: Connection-Oriented Media Transport over the Transport Layer Security (TLS) Protocol in the Session Description Protocol (SDP)
 /// @spec https://www.rfc-editor.org/rfc/rfc5280.html RFC 5280: Internet X.509 Public Key Infrastructure Certificate and Certificate Revocation List (CRL) Profile
-/// @spec https://www.w3.org/TR/webrtc/#dom-rtccertificate WebRTC: Real-Time Communication in Browsers
+/// @spec https://www.w3.org/TR/webrtc/ WebRTC: Real-Time Communication in Browsers
 public final class DtlsCertificate {
     /// The source of serial numbers and keys.
     private static final SecureRandom RANDOM = new SecureRandom();

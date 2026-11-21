@@ -7,7 +7,7 @@ package com.github.auties00.parley.transport;
 /// @param replayProtection whether received packets are checked against a 64-packet replay window per SSRC; turning it
 ///                         off is only for test tools and recorders that must see retransmitted duplicates
 /// @spec https://www.rfc-editor.org/rfc/rfc9335.html RFC 9335: Completely Encrypting RTP Header Extensions and Contributing Sources
-/// @spec https://www.rfc-editor.org/rfc/rfc3711.html#section-3.3.2 RFC 3711: The Secure Real-time Transport Protocol (SRTP)
+/// @spec https://www.rfc-editor.org/rfc/rfc3711.html RFC 3711: The Secure Real-time Transport Protocol (SRTP)
 public record SrtpOptions(boolean cryptex, boolean replayProtection) {
     /// The defaults: no cryptex, replay protection on.
     public static final SrtpOptions DEFAULT = new SrtpOptions(false, true);

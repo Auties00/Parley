@@ -10,8 +10,8 @@ import java.util.List;
 /// of the same `ClientHello` (see [HandshakeMessage]). After a DTLS 1.3 `HelloRetryRequest` the first `ClientHello` is
 /// replaced by the synthetic `message_hash` message.
 ///
-/// @spec https://www.rfc-editor.org/rfc/rfc8446.html#section-4.4.1 RFC 8446: The Transport Layer Security (TLS) Protocol Version 1.3
-/// @spec https://www.rfc-editor.org/rfc/rfc5246.html#section-7.4.9 RFC 5246: The Transport Layer Security (TLS) Protocol Version 1.2
+/// @spec https://www.rfc-editor.org/rfc/rfc8446.html RFC 8446: The Transport Layer Security (TLS) Protocol Version 1.3
+/// @spec https://www.rfc-editor.org/rfc/rfc5246.html RFC 5246: The Transport Layer Security (TLS) Protocol Version 1.2
 final class Transcript {
     /// The messages, in order.
     private final List<HandshakeMessage> messages = new ArrayList<>();
