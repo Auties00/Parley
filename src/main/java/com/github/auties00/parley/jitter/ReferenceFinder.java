@@ -92,6 +92,8 @@ final class ReferenceFinder {
             return new Identity(metadata.frameId().getAsLong(), keyframe, new Rule.Fixed(metadata.dependencies()));
         }
         if (metadata instanceof Vp8FrameMetadata vp8 && vp8.pictureId().isPresent()) {
+            // TODO: unwrap 7-bit picture ids modulo 128; the metadata does not carry the field width, so a sender
+            //  using 7-bit ids is unwrapped as 15-bit and its frames stall at every wrap until a keyframe.
             var id = longPictureIds.unwrap(vp8.pictureId().getAsInt());
             if (keyframe) {
                 remember(vp8.tl0PicIndex().isPresent() ? tl0Indices.unwrap(vp8.tl0PicIndex().getAsInt()) : -1, 0, 0, id);

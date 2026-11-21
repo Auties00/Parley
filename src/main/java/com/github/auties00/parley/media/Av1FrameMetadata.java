@@ -50,11 +50,6 @@ public record Av1FrameMetadata(int spatialId, int temporalId, boolean sequenceHe
         return NONE;
     }
 
-    /// {@return a copy with a frame id and the frame ids it references}
-    ///
-    /// @param frameId      the frame id, non-negative
-    /// @param dependencies the referenced frame ids, each below `frameId`
-    /// @throws IllegalArgumentException if a dependency is negative or not below `frameId`
     @Override
     public Av1FrameMetadata withDependencies(long frameId, List<Long> dependencies) {
         return new Av1FrameMetadata(spatialId, temporalId, sequenceHeader, newCodedVideoSequence, resolution,

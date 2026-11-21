@@ -49,11 +49,6 @@ public record H265FrameMetadata(boolean irap, int temporalId, List<Integer> nalU
         return NONE;
     }
 
-    /// {@return a copy with a frame id and the frame ids it references}
-    ///
-    /// @param frameId      the frame id, non-negative
-    /// @param dependencies the referenced frame ids, each below `frameId`
-    /// @throws IllegalArgumentException if a dependency is negative or not below `frameId`
     @Override
     public H265FrameMetadata withDependencies(long frameId, List<Long> dependencies) {
         return new H265FrameMetadata(irap, temporalId, nalUnitTypes, resolution, OptionalLong.of(frameId),

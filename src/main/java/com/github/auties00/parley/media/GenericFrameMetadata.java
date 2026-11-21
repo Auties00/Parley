@@ -40,11 +40,6 @@ public record GenericFrameMetadata(MediaKind kind, int spatialId, int temporalId
         return new GenericFrameMetadata(kind, 0, 0, Optional.empty(), OptionalLong.empty(), List.of());
     }
 
-    /// {@return a copy with a frame id and the frame ids it references}
-    ///
-    /// @param frameId      the frame id, non-negative
-    /// @param dependencies the referenced frame ids, each below `frameId`
-    /// @throws IllegalArgumentException if a dependency is negative or not below `frameId`
     @Override
     public GenericFrameMetadata withDependencies(long frameId, List<Long> dependencies) {
         return new GenericFrameMetadata(kind, spatialId, temporalId, resolution, OptionalLong.of(frameId),

@@ -67,11 +67,6 @@ public record Vp8FrameMetadata(OptionalInt pictureId, OptionalInt tl0PicIndex, O
                 OptionalInt.empty(), false, Optional.empty(), OptionalLong.empty(), List.of());
     }
 
-    /// {@return a copy with a frame id and the frame ids it references}
-    ///
-    /// @param frameId      the frame id, non-negative
-    /// @param dependencies the referenced frame ids, each below `frameId`
-    /// @throws IllegalArgumentException if a dependency is negative or not below `frameId`
     @Override
     public Vp8FrameMetadata withDependencies(long frameId, List<Long> dependencies) {
         return new Vp8FrameMetadata(pictureId, tl0PicIndex, temporalId, layerSync, keyIndex, nonReference,

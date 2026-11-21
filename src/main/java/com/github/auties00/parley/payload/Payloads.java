@@ -58,9 +58,10 @@ final class Payloads {
         return buffer.get(index) & 0xFF;
     }
 
-    /// {@return the fragments of a body (a NAL unit without its header, a frame), balanced so they differ in size by at most one byte}
+    /// {@return the fragments of a body (a NAL unit without its header, a frame), as slices balanced so they differ
+    /// in size by at most one byte}
     ///
-    /// @param body     the NAL unit without its header
+    /// @param body     the bytes to split, from position to limit
     /// @param capacity the largest fragment
     static List<ByteBuffer> split(ByteBuffer body, int capacity) {
         var length = body.remaining();

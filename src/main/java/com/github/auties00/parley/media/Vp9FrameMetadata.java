@@ -93,11 +93,6 @@ public record Vp9FrameMetadata(OptionalInt pictureId, OptionalInt tl0PicIndex, O
                 Optional.empty(), true, Optional.empty(), OptionalLong.empty(), List.of());
     }
 
-    /// {@return a copy with a frame id and the frame ids it references}
-    ///
-    /// @param frameId      the frame id, non-negative
-    /// @param dependencies the referenced frame ids, each below `frameId`
-    /// @throws IllegalArgumentException if a dependency is negative or not below `frameId`
     @Override
     public Vp9FrameMetadata withDependencies(long frameId, List<Long> dependencies) {
         return new Vp9FrameMetadata(pictureId, tl0PicIndex, spatialId, temporalId, switchingUpPoint,

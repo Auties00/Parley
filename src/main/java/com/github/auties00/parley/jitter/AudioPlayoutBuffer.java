@@ -142,19 +142,43 @@ public final class AudioPlayoutBuffer implements AutoCloseable {
     /// Whether the buffer is closed.
     private boolean closed;
 
-    /// The counters.
+    /// The packets inserted.
     private long packetsReceived;
+
+    /// The packets that arrived after their playout instant.
     private long packetsLate;
+
+    /// The packets dropped.
     private long packetsDiscarded;
+
+    /// The summed time from arrival to playout, in nanoseconds.
     private long jitterBufferDelayNanos;
+
+    /// The summed target delay at each playout, in nanoseconds.
     private long jitterBufferTargetDelayNanos;
+
+    /// The summed network delay at each playout, in nanoseconds.
     private long jitterBufferMinimumDelayNanos;
+
+    /// The frames emitted.
     private long emittedCount;
+
+    /// The samples emitted or concealed.
     private long totalSamples;
+
+    /// The samples concealed or filled with silence.
     private long concealedSamples;
+
+    /// The samples filled with silence.
     private long silentConcealedSamples;
+
+    /// The runs of missing outcomes.
     private long concealmentEvents;
+
+    /// The samples concealed to grow the delay.
     private long insertedSamples;
+
+    /// The samples skipped to shrink the delay.
     private long removedSamples;
 
     /// One buffered packet.
