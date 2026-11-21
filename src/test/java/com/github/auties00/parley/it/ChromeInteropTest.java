@@ -2,11 +2,13 @@ package com.github.auties00.parley.it;
 
 import com.github.auties00.parley.datachannel.DataChannel;
 import com.github.auties00.parley.datachannel.DataChannelMessage;
+import com.github.auties00.parley.dtls.DtlsVersion;
 import com.github.auties00.parley.media.Codec;
 import com.github.auties00.parley.media.EncodedFrame;
 import com.github.auties00.parley.media.MediaKind;
 import com.github.auties00.parley.peer.JsepDescription;
 import com.github.auties00.parley.peer.JsepType;
+import com.github.auties00.parley.peer.Configuration;
 import com.github.auties00.parley.peer.LocalTrack;
 import com.github.auties00.parley.peer.PeerConnection;
 import com.github.auties00.parley.peer.PeerConnectionEvent;
@@ -18,7 +20,8 @@ import com.github.auties00.parley.peer.TransceiverInit;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Tag;
 import org.junit.jupiter.params.ParameterizedTest;
-import org.junit.jupiter.params.provider.EnumSource;
+import org.junit.jupiter.params.provider.Arguments;
+import org.junit.jupiter.params.provider.MethodSource;
 import org.junit.jupiter.api.Timeout;
 
 import java.io.IOException;
@@ -34,6 +37,8 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
+import java.util.stream.Stream;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -65,10 +70,16 @@ class ChromeInteropTest {
         PARLEY, CHROME
     }
 
-    @ParameterizedTest(name = "{0} offers")
-    @EnumSource(Offerer.class)
+    /// {@return every offerer with Parley restricted to DTLS 1.2, and with DTLS 1.3 forced on both sides}
+    static Stream<Arguments> calls() {
+        return Stream.of(Offerer.values()).flatMap(offerer -> Stream.of(Arguments.of(offerer, false),
+                Arguments.of(offerer, true)));
+    }
+
+    @ParameterizedTest(name = "{0} offers, DTLS 1.3 forced: {1}")
+    @MethodSource("calls")
     @DisplayName("connects to Chrome with Opus audio, VP8 video and a data channel in both directions")
-    void call(Offerer offerer) throws Exception {
+    void call(Offerer offerer, boolean dtls13) throws Exception {
         var chrome = chromeExecutable();
         assumeTrue(chrome.isPresent(), "no Chrome: set parley.chrome or PARLEY_CHROME");
         var opus = fixture("opus.bin");
@@ -76,7 +87,9 @@ class ChromeInteropTest {
         var page = resource("chrome-peer.html");
         var profile = Files.createTempDirectory("parley-chrome-");
         try (var server = SignalingServer.start(page);
-             var pc = PeerConnection.builder().tcpCandidates(false).build()) {
+             var pc = PeerConnection.create(Configuration.builder().tcpCandidates(false)
+                     .dtlsVersions(Set.of(dtls13 ? DtlsVersion.DTLS_1_3 : DtlsVersion.DTLS_1_2))
+                     .build())) {
             var events = new CopyOnWriteArrayList<PeerConnectionEvent>();
             var monitor = new Object();
             pc.addListener(event -> {
@@ -94,12 +107,12 @@ class ChromeInteropTest {
                 preferFixtureCodecs(pc);
                 created = Optional.of(pc.createDataChannel("chat"));
                 pc.setLocalDescription(pc.createOffer());
-                awaitGathering(pc);
+                assertTrue(pc.awaitIceGatheringComplete(TIMEOUT), "gathering did not complete");
                 server.publish("offer", pc.localDescription().orElseThrow().sdp());
             }
 
             var role = offerer == Offerer.PARLEY ? "answer" : "offer";
-            var process = launch(chrome.get(), profile, server.url() + "?role=" + role);
+            var process = launch(chrome.get(), profile, server.url() + "?role=" + role, dtls13);
             try {
                 if (offerer == Offerer.PARLEY) {
                     var answer = server.await("answer", TIMEOUT)
@@ -115,11 +128,15 @@ class ChromeInteropTest {
                     }
                     preferFixtureCodecs(pc);
                     pc.setLocalDescription(pc.createAnswer());
-                    awaitGathering(pc);
+                    assertTrue(pc.awaitIceGatheringComplete(TIMEOUT), "gathering did not complete");
                     server.publish("answer", pc.localDescription().orElseThrow().sdp());
                 }
                 awaitEvent(events, monitor, PeerConnectionEvent.ConnectionStateChanged.class,
                         event -> event.state() == PeerConnectionState.CONNECTED, server);
+                assertTrue(pc.awaitConnectionState(PeerConnectionState.CONNECTED, Duration.ZERO));
+                var version = pc.getStats().all(com.github.auties00.parley.stats.TransportStats.class).getFirst()
+                        .tlsVersion();
+                assertEquals(Optional.of(dtls13 ? "FEFC" : "FEFD"), version, "the negotiated DTLS version");
                 var channel = created.isPresent() ? created.get() : awaitEvent(events, monitor,
                         PeerConnectionEvent.DataChannel.class, event -> event.channel().label().equals("chat"),
                         server).channel();
@@ -180,11 +197,13 @@ class ChromeInteropTest {
     private static void assertAudioFromChrome(RemoteTrack track) throws InterruptedException {
         var frames = 0;
         var deadline = System.nanoTime() + TIMEOUT.toNanos();
-        while (frames < 25 && System.nanoTime() < deadline) {
-            var frame = track.read(Duration.ofMillis(500));
-            if (frame.isPresent()) {
-                assertTrue(frame.get().data().remaining() > 0);
-                frames++;
+        try (var stream = track.frames()) {
+            while (frames < 25 && System.nanoTime() < deadline) {
+                var frame = stream.next(Duration.ofMillis(500));
+                if (frame.isPresent()) {
+                    assertTrue(frame.get().data().remaining() > 0);
+                    frames++;
+                }
             }
         }
         assertTrue(frames >= 25, "Opus frames from Chrome: " + frames);
@@ -194,8 +213,9 @@ class ChromeInteropTest {
     private static void assertVideoFromChrome(RemoteTrack track) throws InterruptedException {
         var deadline = System.nanoTime() + TIMEOUT.toNanos();
         var frames = 0;
+        try (var stream = track.frames()) {
         while (System.nanoTime() < deadline) {
-            var frame = track.read(Duration.ofMillis(500));
+            var frame = stream.next(Duration.ofMillis(500));
             if (frame.isEmpty()) {
                 continue;
             }
@@ -209,6 +229,7 @@ class ChromeInteropTest {
                 assertEquals(0x2a, data.get(start + 5) & 0xff);
                 return;
             }
+        }
         }
         throw new AssertionError("no VP8 key frame from Chrome among " + frames + " frames");
     }
@@ -303,21 +324,11 @@ class ChromeInteropTest {
         }
     }
 
-    private static void awaitGathering(PeerConnection pc) throws InterruptedException {
-        var deadline = System.nanoTime() + TIMEOUT.toNanos();
-        while (pc.iceGatheringState() != com.github.auties00.parley.ice.IceGatheringState.COMPLETE) {
-            if (System.nanoTime() > deadline) {
-                throw new AssertionError("gathering did not complete: " + pc.iceGatheringState());
-            }
-            Thread.sleep(10);
-        }
-    }
-
     /// Starts Chrome headless on `url`: fake media devices granted without a prompt, host candidates with plain
     /// addresses (no mDNS names), autoplay allowed, and no sandbox, which CI containers and some Windows
     /// directories do not permit.
-    private static Process launch(Path chrome, Path profile, String url) throws IOException {
-        var command = List.of(chrome.toString(),
+    private static Process launch(Path chrome, Path profile, String url, boolean dtls13) throws IOException {
+        var command = new ArrayList<>(List.of(chrome.toString(),
                 "--headless=new",
                 "--no-sandbox",
                 "--disable-gpu",
@@ -327,8 +338,11 @@ class ChromeInteropTest {
                 "--use-fake-device-for-media-stream",
                 "--use-fake-ui-for-media-stream",
                 "--autoplay-policy=no-user-gesture-required",
-                "--disable-features=WebRtcHideLocalIpsWithMdns",
-                url);
+                "--disable-features=WebRtcHideLocalIpsWithMdns"));
+        if (dtls13) {
+            command.add("--force-fieldtrials=WebRTC-ForceDtls13/Enabled/");
+        }
+        command.add(url);
         return new ProcessBuilder(command)
                 .redirectErrorStream(true)
                 .redirectOutput(profile.resolve("chrome.log").toFile())

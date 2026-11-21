@@ -27,7 +27,10 @@ final class FakeBackend implements PeerBackend {
     final List<String> endedCandidates = new CopyOnWriteArrayList<>();
     final List<String> channels = new CopyOnWriteArrayList<>();
     final List<RtcStats> statistics = new ArrayList<>();
+    final List<String> keyFrameRequests = new CopyOnWriteArrayList<>();
     volatile boolean closed;
+    /// Whether [#close()] throws after recording, as a transport closed mid-handshake once did.
+    volatile boolean failOnClose;
 
     FakeBackend(Configuration configuration, Listener listener) {
         this.configuration = configuration;
@@ -79,8 +82,26 @@ final class FakeBackend implements PeerBackend {
     }
 
     @Override
+    public void requestKeyFrame(RtpReceiver receiver, Optional<String> rid) {
+        keyFrameRequests.add(rid.orElse(""));
+    }
+
+    @Override
+    public Optional<PeerDtlsTransport> dtlsTransport(String transportId) {
+        return Optional.empty();
+    }
+
+    @Override
+    public Optional<PeerSctpTransport> sctpTransport() {
+        return Optional.empty();
+    }
+
+    @Override
     public void close() {
         closed = true;
+        if (failOnClose) {
+            throw new IllegalStateException("the DTLS association is not connected");
+        }
     }
 
     /// {@return the last negotiation applied}

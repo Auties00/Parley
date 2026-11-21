@@ -4,8 +4,10 @@ package com.github.auties00.parley.peer;
 ///
 /// Thrown, for example, by `setRemoteDescription` with an answer while no offer is pending, or by any method of a closed peer connection.
 ///
+/// It extends [IllegalStateException], so callers that already catch the JDK type for a misuse catch it too.
+///
 /// @spec https://www.w3.org/TR/webrtc/ WebRTC: Real-Time Communication in Browsers
-public final class InvalidStateException extends RuntimeException {
+public final class InvalidStateException extends IllegalStateException {
     /// Creates the exception.
     ///
     /// @param message the detail message

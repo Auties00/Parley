@@ -60,13 +60,14 @@ module my.app {
 A peer connection that sends audio and a data channel, with signaling left to your application:
 
 ```java
-var pc = PeerConnection.builder()
-        .iceServers(List.of(IceServer.of("stun:stun.example.org")))
+var pc = PeerConnection.create(Configuration.builder()
+        .iceServers(IceServer.of("stun:stun.example.org"))
         .bundlePolicy(BundlePolicy.MAX_BUNDLE)
-        .build();
+        .build());
+var events = pc.events();          // the first stream also gets every event raised before it was opened
 
 var mic = LocalTrack.audio("mic");
-pc.addTrack(mic, List.of("stream-1"));
+pc.addTrack(mic, "stream-1");
 var chat = pc.createDataChannel("chat");
 
 var offer = pc.createOffer();
@@ -74,11 +75,11 @@ pc.setLocalDescription(offer);
 signaling.send(offer.sdp());
 pc.setRemoteDescription(JsepDescription.answer(signaling.receive()));
 
-try (var events = pc.events()) {
+try (events) {
     for (var event : events) {
         switch (event) {
-            case PeerConnectionEvent.IceCandidate(var candidate) -> signaling.send(candidate);
-            case PeerConnectionEvent.Track(var receiver, var streams, var transceiver) -> play(receiver.track());
+            case PeerConnectionEvent.IceCandidate candidate -> signaling.send(candidate.candidate());
+            case PeerConnectionEvent.Track track -> play(track.receiver().track());
             case PeerConnectionEvent.ConnectionStateChanged(var state) when state == PeerConnectionState.FAILED ->
                     pc.restartIce();
             default -> { }
@@ -88,7 +89,9 @@ try (var events = pc.events()) {
 ```
 
 Every call that waits blocks the calling thread and takes a timeout or can be interrupted; nothing returns a future.
-Events arrive in order through an `EventStream` (iterable, closable) or through `addListener`.
+Events arrive in order through an `EventStream` (iterable, closable, bounded) or through `addListener`. A server that
+does not trickle candidates (WHIP, WHEP) waits with `pc.awaitIceGatheringComplete(timeout)` before sending its
+description, and `pc.awaitConnectionState(PeerConnectionState.CONNECTED, timeout)` tells when media can flow.
 
 ---
 
@@ -139,21 +142,24 @@ channel.send(ByteBuffer.wrap(bytes));
 DataChannelMessage reply = channel.receive();
 ```
 
-Channels the peer opens arrive as `PeerConnectionEvent.DataChannel`. A channel created before the first offer opens once
-the data section is negotiated and SCTP is up.
+Channels the peer opens arrive as `PeerConnectionEvent.DataChannel`. A channel created before the first offer, or added
+to a connection that so far carried only media, opens once the data section is negotiated and SCTP is up;
+`pc.sctp()` then reports the association's state and the largest message it carries.
 
 ### Sending encoded media
 
 ```java
 var camera = LocalTrack.video("camera");
-pc.addTrack(camera, List.of("stream-1"));
+var cameraEvents = camera.events();
+pc.addTrack(camera, "stream-1");
 
 Thread.ofVirtual().start(() -> {
-    try (var events = camera.events()) {
-        for (var event : events) {
+    try (cameraEvents) {
+        for (var event : cameraEvents) {
             switch (event) {
                 case LocalTrackEvent.KeyframeRequested(var rid) -> encoder.forceKeyframe();
                 case LocalTrackEvent.TargetBitrateChanged(var rid, var bps) -> encoder.setBitrate(bps);
+                case LocalTrackEvent.EncodingChanged(var rid, var encoding) -> encoder.configure(encoding);
                 case LocalTrackEvent.Ended() -> { }
             }
         }
@@ -164,21 +170,24 @@ camera.write(EncodedFrame.of(MediaKind.VIDEO, ByteBuffer.wrap(vp8Frame), rtpTime
 ```
 
 The track packetizes with the negotiated codec, the pacer spaces the packets out, and congestion control turns the
-peer's transport-wide feedback into the target bitrate your encoder receives.
+peer's transport-wide feedback into the target bitrate your encoder receives. Frames written before the sender is
+negotiated, or for a layer `setParameters` made inactive, are dropped and counted in `camera.framesDropped()`;
+`camera.isSending()` tells whether a frame written now would leave.
 
 ### Receiving media
 
 ```java
-case PeerConnectionEvent.Track(var receiver, var streams, var transceiver) -> Thread.ofVirtual().start(() -> {
-    var track = receiver.track();
-    while (true) {
-        EncodedFrame frame = track.read();     // complete, decodable frames in decode order
-        decoder.decode(frame);
+case PeerConnectionEvent.Track track -> Thread.ofVirtual().start(() -> {
+    try (var frames = track.receiver().track().frames()) {
+        for (var frame : frames) {             // complete, decodable frames in decode order; ends with the track
+            decoder.decode(frame);
+        }
     }
 });
 ```
 
-For audio, `track.readPlayout()` also reports the gaps to conceal and the silences of DTX, at their playout time.
+For audio, `track.playout()` also streams the gaps to conceal and the silences of DTX, at their playout time, and
+`track.events()` raises `Muted`, `Unmuted` and `Ended` as the peer stops and resumes sending.
 
 ### Simulcast
 
@@ -198,18 +207,40 @@ camera.write(lowFrame, "l");
 
 ### Building an SFU
 
+An SFU receives each publisher's packets raw and forwards them to every subscriber without decoding:
+
 ```java
-var pc = PeerConnection.builder()
-        .iceLite(true)
-        .remoteTrackMode(RemoteTrackMode.RAW_PACKETS)
-        .build();
-...
-var packet = receiver.track().readPacket();   // RtpPacket copy, the simulcast rid, the arrival time
-forward(packet.rid(), packet.packet());
+var server = Configuration.builder().iceLite(true);
+var publisher = PeerConnection.create(server.remoteTrackMode(RemoteTrackMode.RAW_PACKETS).build());
+var subscriber = PeerConnection.create(server.remoteTrackMode(RemoteTrackMode.JITTER_BUFFERED).build());
+
+// once the publisher's track arrives (PeerConnectionEvent.Track)
+var incoming = track.receiver();
+var relay = LocalTrack.forwarded("relay-" + incoming.track().id(), incoming.track().kind());
+subscriber.addTrack(relay, "stream-1");
+
+Thread.ofVirtual().start(() -> {            // forward the selected simulcast layer
+    try (var packets = incoming.track().packets()) {
+        for (var packet : packets) {
+            if (packet.rid().equals(Optional.of(selectedLayer))) {
+                relay.write(packet);
+            }
+        }
+    }
+});
+Thread.ofVirtual().start(() -> {            // pass the subscriber's key frame requests on to the publisher
+    for (var event : relay.events()) {
+        if (event instanceof LocalTrackEvent.KeyframeRequested) {
+            incoming.requestKeyFrame(selectedLayer);
+        }
+    }
+});
 ```
 
-`rtp.session.RtpStreamRewriter` keeps sequence numbers and timestamps continuous across layer switches, and the VP8 and
-VP9 payload rewriters fix the picture ids.
+Each subscriber's sender keeps its own SSRC, sequence numbers and timestamps, continuous when the forwarded layer
+changes; it maps the payload type by codec and the header extensions by URI, renumbers the VP8 and VP9 picture ids, and
+holds a new layer back until its next key frame, asking for one. Retransmission, FEC, pacing and congestion control are
+the subscriber connection's own.
 
 ### Routing through a proxy
 
@@ -217,11 +248,11 @@ Every socket goes through a `NetworkStack`. Implement it to send TURN over your 
 servers can run on top of your TCP connections with `StreamConnection.startTls(...)`.
 
 ```java
-var pc = PeerConnection.builder()
-        .iceServers(List.of(IceServer.of("turns:turn.example.org:443?transport=tcp", "user", "secret")))
+var pc = PeerConnection.create(Configuration.builder()
+        .iceServers(IceServer.of("turns:turn.example.org:443?transport=tcp", "user", "secret"))
         .iceTransportPolicy(IceTransportPolicy.RELAY)
         .networkStack(new ProxiedNetworkStack(proxy))
-        .build();
+        .build());
 ```
 
 ### Statistics
@@ -307,7 +338,10 @@ SDP, while `RtpSession` and the payload formats work on top of it as usual.
 ## Things to keep in mind
 
 - Parley does not capture, encode, decode or render media; pair it with a codec library.
-- DTLS 1.3 is verified against itself and the RFC test vectors; browsers still negotiate DTLS 1.2 by default.
+- DTLS 1.3 is verified against itself, the RFC test vectors and Chrome for Testing 158, which negotiates it when both
+  sides offer it; DTLS 1.2 interop is tested by restricting Parley to 1.2.
+- Parley starts every thread through the configuration's `ThreadFactory`, except the SCTP association's internal
+  threads, which the `sctp` library starts itself.
 - Plan B SDP, the identity provider API, TURN over DTLS and RTP over QUIC are not supported, as no browser ships them.
 - The interop test against Chrome (tagged `chrome`) runs only when `PARLEY_CHROME` (or `-Dparley.chrome`) names a
   Chrome executable, Chrome for Testing in CI: `PARLEY_CHROME=/path/to/chrome mvn test -Dgroups=chrome`.
