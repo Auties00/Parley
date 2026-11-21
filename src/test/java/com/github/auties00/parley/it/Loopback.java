@@ -1,5 +1,6 @@
 package com.github.auties00.parley.it;
 
+import com.github.auties00.parley.peer.Configuration;
 import com.github.auties00.parley.peer.JsepDescription;
 import com.github.auties00.parley.peer.PeerConnection;
 import com.github.auties00.parley.peer.PeerConnectionEvent;
@@ -81,13 +82,13 @@ final class Loopback {
     }
 
     /// {@return a connection gathering loopback UDP candidates only, configured further by `configure`}
-    static Peer peer(UnaryOperator<PeerConnection.Builder> configure) {
+    static Peer peer(UnaryOperator<Configuration.Builder> configure) {
         Objects.requireNonNull(configure);
-        var builder = PeerConnection.builder()
+        var builder = Configuration.builder()
                 .loopbackCandidates(true)
                 .tcpCandidates(false)
                 .networkStack(LoopbackOnlyStack.create());
-        return new Peer(configure.apply(builder).build());
+        return new Peer(PeerConnection.create(configure.apply(builder).build()));
     }
 
     /// {@return a connection with the loopback defaults}

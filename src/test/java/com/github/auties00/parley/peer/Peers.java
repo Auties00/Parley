@@ -1,6 +1,9 @@
 package com.github.auties00.parley.peer;
 
+import com.github.auties00.parley.event.EventStream;
 import com.github.auties00.parley.sdp.SessionDescription;
+
+import java.time.Duration;
 
 import java.util.ArrayList;
 import java.util.List;
@@ -17,8 +20,12 @@ final class Peers {
         /// {@return the events raised since the last call, without waiting}
         List<PeerConnectionEvent> drain() {
             var result = new ArrayList<PeerConnectionEvent>();
-            for (var event = events.poll(); event.isPresent(); event = events.poll()) {
-                result.add(event.get());
+            try {
+                for (var event = events.next(Duration.ZERO); event.isPresent(); event = events.next(Duration.ZERO)) {
+                    result.add(event.get());
+                }
+            } catch (InterruptedException exception) {
+                Thread.currentThread().interrupt();
             }
             return result;
         }
@@ -35,13 +42,13 @@ final class Peers {
     }
 
     /// {@return a connection configured by `configure`}
-    static Peer peer(UnaryOperator<PeerConnection.Builder> configure) {
+    static Peer peer(UnaryOperator<Configuration.Builder> configure) {
         var backend = new AtomicReference<FakeBackend>();
-        var pc = configure.apply(PeerConnection.builder()).backendFactory((configuration, listener) -> {
+        var pc = PeerConnection.create(configure.apply(Configuration.builder()).build(), (configuration, listener) -> {
             var fake = new FakeBackend(configuration, listener);
             backend.set(fake);
             return fake;
-        }).build();
+        });
         return new Peer(pc, backend.get(), pc.events());
     }
 

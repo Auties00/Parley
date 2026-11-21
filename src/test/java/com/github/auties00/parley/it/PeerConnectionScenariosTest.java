@@ -133,9 +133,11 @@ class PeerConnectionScenariosTest {
     static void assertFrames(com.github.auties00.parley.peer.RemoteTrack track, int count) throws Exception {
         var received = 0;
         var deadline = System.nanoTime() + Loopback.TIMEOUT.toNanos();
-        while (received < count && System.nanoTime() < deadline) {
-            if (track.read(Duration.ofMillis(500)).isPresent()) {
-                received++;
+        try (var frames = track.frames()) {
+            while (received < count && System.nanoTime() < deadline) {
+                if (frames.next(Duration.ofMillis(500)).isPresent()) {
+                    received++;
+                }
             }
         }
         assertTrue(received >= count, "received " + received + " of " + count + " frames");
@@ -154,11 +156,11 @@ class PeerConnectionScenariosTest {
             connect(a, b);
             var remote = b.await(PeerConnectionEvent.Track.class, event -> true).receiver().track();
             var perRid = new HashMap<String, Integer>();
-            try (var _ = videoWriter(track, 3000, List.of("h", "m", "l"))) {
+            try (var _ = videoWriter(track, 3000, List.of("h", "m", "l")); var packets = remote.packets()) {
                 var deadline = System.nanoTime() + Loopback.TIMEOUT.toNanos();
                 while (perRid.values().stream().filter(count -> count >= 10).count() < 3
                         && System.nanoTime() < deadline) {
-                    var packet = remote.readPacket(Duration.ofMillis(500));
+                    var packet = packets.next(Duration.ofMillis(500));
                     packet.ifPresent(value -> perRid.merge(value.rid().orElse("?"), 1, Integer::sum));
                 }
             }
@@ -190,15 +192,18 @@ class PeerConnectionScenariosTest {
                         == MediaKind.AUDIO).receiver().track());
                 tracks.add(b.await(PeerConnectionEvent.Track.class, event -> event.receiver().track().kind()
                         == MediaKind.VIDEO).receiver().track());
+                var streams = tracks.stream().map(com.github.auties00.parley.peer.RemoteTrack::packets).toList();
                 var deadline = System.nanoTime() + Loopback.TIMEOUT.toNanos();
                 while (counts.values().stream().filter(count -> count >= 10).count() < 4
                         && System.nanoTime() < deadline) {
-                    for (var track : tracks) {
-                        var packet = track.readPacket(Duration.ofMillis(50));
-                        packet.ifPresent(value -> counts.merge(track.kind() + value.rid().map(rid -> "/" + rid)
+                    for (var index = 0; index < tracks.size(); index++) {
+                        var kind = tracks.get(index).kind();
+                        var packet = streams.get(index).next(Duration.ofMillis(50));
+                        packet.ifPresent(value -> counts.merge(kind + value.rid().map(rid -> "/" + rid)
                                 .orElse(""), 1, Integer::sum));
                     }
                 }
+                streams.forEach(com.github.auties00.parley.event.EventStream::close);
             }
             assertTrue(counts.getOrDefault("AUDIO", 0) >= 10, "packets: " + counts);
             for (var rid : List.of("h", "m", "l")) {
@@ -381,8 +386,9 @@ class PeerConnectionScenariosTest {
             var events = 0;
             var ends = 0;
             var deadline = System.nanoTime() + Loopback.TIMEOUT.toNanos();
+            var packets = remote.packets();
             while (ends < 6 && System.nanoTime() < deadline) {
-                var packet = remote.readPacket(Duration.ofMillis(500));
+                var packet = packets.next(Duration.ofMillis(500));
                 if (packet.isEmpty()) {
                     continue;
                 }

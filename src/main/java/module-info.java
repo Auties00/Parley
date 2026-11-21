@@ -11,7 +11,8 @@
 ///
 /// | Package | Contents |
 /// |---|---|
-/// | [com.github.auties00.parley.peer] | [com.github.auties00.parley.peer.PeerConnection], transceivers, senders, receivers, tracks and events: the W3C object model and the JSEP engine |
+/// | [com.github.auties00.parley.peer] | [com.github.auties00.parley.peer.PeerConnection], transceivers, senders, receivers, tracks, transport views and events: the W3C object model and the JSEP engine |
+/// | [com.github.auties00.parley.event] | The bounded, blocking event streams the application-level objects expose |
 /// | [com.github.auties00.parley.stats] | The statistics records of `getStats()` |
 /// | [com.github.auties00.parley.sdp] | The session description model with typed attributes |
 /// | [com.github.auties00.parley.datachannel] | SCTP over DTLS and the data channels on it |
@@ -34,8 +35,10 @@
 ///
 /// Parley starts its threads through the [java.util.concurrent.ThreadFactory] of the peer connection's configuration
 /// (virtual threads by default), or of the [com.github.auties00.parley.net.NetworkStack] for the sockets' readers, so
-/// the application decides how they are named and run. Every call that waits on the network blocks the calling thread and takes a timeout or can be interrupted;
-/// nothing returns a future. Parley logs through [System#getLogger(String)], under the name of the logging class,
+/// the application decides how they are named and run; the one exception is the SCTP association's internal reader,
+/// timer and writer threads, which the `sctp` library starts as virtual threads of its own. Every call that waits on
+/// the network blocks the calling thread and takes a timeout or can be interrupted; nothing returns a future, and
+/// events arrive through blocking [com.github.auties00.parley.event.EventStream]s. Parley logs through [System#getLogger(String)], under the name of the logging class,
 /// and never logs key material or ICE credentials.
 ///
 /// @spec https://www.w3.org/TR/webrtc/ WebRTC: Real-Time Communication in Browsers
@@ -53,6 +56,7 @@ module com.github.auties00.parley {
     requires com.github.auties00.sctp;
 
     exports com.github.auties00.parley.peer;
+    exports com.github.auties00.parley.event;
     exports com.github.auties00.parley.stats;
     exports com.github.auties00.parley.sdp;
     exports com.github.auties00.parley.datachannel;

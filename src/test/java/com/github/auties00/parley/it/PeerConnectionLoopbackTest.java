@@ -74,14 +74,16 @@ class PeerConnectionLoopbackTest {
             var received = 0;
             var last = -1L;
             var deadline = System.nanoTime() + Loopback.TIMEOUT.toNanos();
-            while (received < 20 && System.nanoTime() < deadline) {
-                var frame = remote.read(Duration.ofSeconds(2));
-                if (frame.isEmpty()) {
-                    continue;
+            try (var frames = remote.frames()) {
+                while (received < 20 && System.nanoTime() < deadline) {
+                    var frame = frames.next(Duration.ofSeconds(2));
+                    if (frame.isEmpty()) {
+                        continue;
+                    }
+                    assertTrue(frame.get().rtpTimestamp() > last, "frames arrive in timestamp order");
+                    last = frame.get().rtpTimestamp();
+                    received++;
                 }
-                assertTrue(frame.get().rtpTimestamp() > last, "frames arrive in timestamp order");
-                last = frame.get().rtpTimestamp();
-                received++;
             }
             writer.interrupt();
             assertTrue(received >= 20, "received " + received + " frames");

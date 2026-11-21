@@ -2,6 +2,9 @@ package com.github.auties00.parley.peer;
 
 import com.github.auties00.parley.dtls.DtlsState;
 import com.github.auties00.parley.ice.IceGatheringState;
+import com.github.auties00.parley.jitter.AudioPlayout;
+import com.github.auties00.parley.rtp.RtpFormatException;
+import com.github.auties00.parley.rtp.RtpPacket;
 import com.github.auties00.parley.ice.IceTransportPolicy;
 import com.github.auties00.parley.ice.IceTransportState;
 import com.github.auties00.parley.media.EncodedFrame;
@@ -20,6 +23,8 @@ import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
+import java.util.NoSuchElementException;
 import java.util.Optional;
 import java.util.OptionalDouble;
 import java.util.OptionalInt;
@@ -154,41 +159,87 @@ class PeerApiTest {
             var a = peer();
             var track = LocalTrack.video("cam");
             var sender = a.pc().addTrack(track, List.of());
-            var seen = new ArrayList<EncodedFrame>();
-            sender.setPipeline((frame, rid) -> seen.add(frame));
+            track.write(frame(MediaKind.VIDEO));
+            assertEquals(1, track.framesDropped(), "a frame written before negotiation is dropped and counted");
+            assertFalse(track.isSending());
+            var seen = new CopyOnWriteArrayList<EncodedFrame>();
+            sender.setPipeline(new RecordingSink(seen), sender.layers());
+            assertTrue(track.isSending());
             track.write(frame(MediaKind.VIDEO));
             assertEquals(1, seen.size());
-            sender.setTransform(frame -> frame.withData(ByteBuffer.wrap(new byte[]{9})));
+            sender.setTransform((frame, output) -> output.accept(frame.withData(ByteBuffer.wrap(new byte[]{9}))));
             track.write(frame(MediaKind.VIDEO));
             assertEquals(1, seen.get(1).data().remaining());
-            sender.setTransform(frame -> {
+            sender.setTransform((frame, output) -> {
+                output.accept(frame);
+                output.accept(frame);
+            });
+            track.write(frame(MediaKind.VIDEO));
+            assertEquals(4, seen.size(), "a transform may emit several frames");
+            sender.setTransform((frame, output) -> {
+            });
+            track.write(frame(MediaKind.VIDEO));
+            assertEquals(4, seen.size(), "a transform may drop a frame");
+            sender.setTransform((frame, output) -> {
                 throw new IllegalStateException("boom");
             });
             track.write(frame(MediaKind.VIDEO));
-            assertEquals(2, seen.size(), "a throwing transform drops the frame");
+            assertEquals(4, seen.size(), "a throwing transform drops the frame");
+            assertEquals(1, sender.transformFailures());
+            assertEquals(2, track.framesDropped());
+            sender.clearTransform();
             track.setEnabled(false);
             track.write(frame(MediaKind.VIDEO));
-            assertEquals(1, track.framesDropped());
+            assertEquals(3, track.framesDropped());
+            assertFalse(track.isSending());
+            track.setEnabled(true);
+            sender.stopSending();
+            track.write(frame(MediaKind.VIDEO));
+            assertEquals(4, track.framesDropped(), "a sender that stopped sending drops the frame");
             assertThrows(IllegalArgumentException.class, () -> track.write(frame(MediaKind.AUDIO)));
             track.stop();
             assertThrows(IllegalStateException.class, () -> track.write(frame(MediaKind.VIDEO)));
         }
 
         @Test
-        @DisplayName("raise keyframe requests and target bitrates as events")
+        @DisplayName("drop the frames of an inactive layer")
+        void inactiveLayer() {
+            var a = peer();
+            var track = LocalTrack.video("cam");
+            var sender = a.pc().addTransceiver(track, TransceiverInit.builder()
+                    .sendEncodings(List.of(Encoding.rid("h"), Encoding.rid("l"))).build()).sender();
+            var seen = new CopyOnWriteArrayList<EncodedFrame>();
+            sender.setPipeline(new RecordingSink(seen, sender), sender.layers());
+            var parameters = sender.getParameters();
+            sender.setParameters(parameters.withEncodings(List.of(parameters.encodings().get(0),
+                    parameters.encodings().get(1).active(false))));
+            track.write(frame(MediaKind.VIDEO), "h");
+            track.write(frame(MediaKind.VIDEO), "l");
+            assertEquals(1, seen.size());
+            assertEquals(1, track.framesDropped());
+        }
+
+        @Test
+        @DisplayName("raise keyframe requests, coalesced target bitrates and encoding changes as events")
         void localEvents() throws InterruptedException {
             var track = LocalTrack.video("cam");
+            track.requestKeyframe(Optional.of("h"));
+            track.updateTargetBitrate(Optional.empty(), 400_000);
+            track.updateTargetBitrate(Optional.empty(), 500_000);
+            track.updateTargetBitrate(Optional.empty(), 500_000);
             try (var events = track.events()) {
-                track.requestKeyframe(Optional.of("h"));
-                track.updateTargetBitrate(Optional.empty(), 500_000);
-                track.updateTargetBitrate(Optional.empty(), 500_000);
                 assertEquals(new LocalTrackEvent.KeyframeRequested(Optional.of("h")), events.next());
-                assertEquals(new LocalTrackEvent.TargetBitrateChanged(Optional.empty(), 500_000), events.next());
-                assertTrue(events.poll().isEmpty(), "an unchanged bitrate raises nothing");
+                assertEquals(new LocalTrackEvent.TargetBitrateChanged(Optional.empty(), 500_000), events.next(),
+                        "the events raised before the first stream are kept, and a newer bitrate replaces an older");
+                assertTrue(events.next(Duration.ZERO).isEmpty(), "an unchanged bitrate raises nothing");
                 assertEquals(OptionalLong.of(500_000), track.targetBitrate());
+                track.encodingChanged(Optional.of("l"), Encoding.rid("l"));
+                assertEquals(new LocalTrackEvent.EncodingChanged(Optional.of("l"), Encoding.rid("l")),
+                        events.next());
                 track.stop();
                 assertEquals(new LocalTrackEvent.Ended(), events.next());
                 assertTrue(events.next(Duration.ofMillis(10)).isEmpty());
+                assertTrue(events.isEnded());
             }
             assertThrows(IllegalArgumentException.class, () -> LocalTrack.audio("has space"));
         }
@@ -198,28 +249,133 @@ class PeerApiTest {
         void remoteRead() throws InterruptedException {
             var track = new RemoteTrack("t", MediaKind.AUDIO, RemoteTrackMode.JITTER_BUFFERED);
             assertTrue(track.isMuted());
-            track.deliver(new com.github.auties00.parley.jitter.AudioPlayout.Silence(Duration.ofMillis(20)));
-            track.deliver(frame(MediaKind.AUDIO));
+            var frames = track.frames();
+            var playout = track.playout();
+            track.received();
+            track.deliverPlayout(new AudioPlayout.Silence(Duration.ofMillis(20)));
+            track.deliverPlayout(new AudioPlayout.Frame(frame(MediaKind.AUDIO), Duration.ofMillis(20)));
             assertFalse(track.isMuted());
-            assertEquals(1000, track.read().rtpTimestamp(), "read skips the silence");
-            assertTrue(track.read(Duration.ofMillis(5)).isEmpty());
-            assertThrows(IllegalStateException.class, track::readPacket);
+            assertEquals(1000, frames.next().rtpTimestamp(), "frames skip the silence");
+            assertTrue(frames.next(Duration.ofMillis(5)).isEmpty());
+            assertTrue(playout.next() instanceof AudioPlayout.Silence);
+            assertTrue(playout.next() instanceof AudioPlayout.Frame);
+            assertThrows(InvalidStateException.class, track::packets);
             track.end();
-            assertThrows(IllegalStateException.class, track::read);
+            assertThrows(NoSuchElementException.class, frames::next);
+            assertTrue(frames.isEnded());
             var raw = new RemoteTrack("r", MediaKind.VIDEO, RemoteTrackMode.RAW_PACKETS);
-            assertThrows(IllegalStateException.class, raw::read);
-            assertTrue(raw.readPacket(Duration.ofMillis(5)).isEmpty());
+            assertThrows(InvalidStateException.class, raw::frames);
+            assertThrows(InvalidStateException.class, raw::playout);
+            assertTrue(raw.packets().next(Duration.ofMillis(5)).isEmpty());
+            var video = new RemoteTrack("v", MediaKind.VIDEO, RemoteTrackMode.JITTER_BUFFERED);
+            assertThrows(InvalidStateException.class, video::playout, "only audio has playout outcomes");
         }
 
         @Test
-        @DisplayName("drop the oldest item when the reader falls behind")
+        @DisplayName("raise mute, unmute and ended events")
+        void remoteEvents() throws InterruptedException {
+            var track = new RemoteTrack("t", MediaKind.VIDEO, RemoteTrackMode.JITTER_BUFFERED);
+            track.received();
+            track.received();
+            track.mute();
+            track.mute();
+            track.received();
+            track.end();
+            track.end();
+            try (var events = track.events()) {
+                assertEquals(List.of(new RemoteTrackEvent.Unmuted(), new RemoteTrackEvent.Muted(),
+                        new RemoteTrackEvent.Unmuted(), new RemoteTrackEvent.Ended()), events.stream().toList());
+            }
+            assertTrue(track.isEnded());
+            assertTrue(track.isMuted());
+        }
+
+        @Test
+        @DisplayName("drop the oldest frame when the reader falls behind")
         void overflow() throws InterruptedException {
             var track = new RemoteTrack("t", MediaKind.VIDEO, RemoteTrackMode.JITTER_BUFFERED);
-            for (var index = 0; index < 1030; index++) {
-                track.deliver(EncodedFrame.of(MediaKind.VIDEO, ByteBuffer.allocate(1), index, false));
+            try (var frames = track.frames()) {
+                for (var index = 0; index < 1030; index++) {
+                    track.deliverFrame(EncodedFrame.of(MediaKind.VIDEO, ByteBuffer.allocate(1), index, false));
+                }
+                assertEquals(6, frames.dropped());
+                assertEquals(6, frames.next().rtpTimestamp());
             }
-            assertEquals(6, track.dropped());
-            assertEquals(6, track.read().rtpTimestamp());
+        }
+
+        @Test
+        @DisplayName("forward packets through a forwarded track, counting those no sender takes")
+        void forwarded() {
+            var a = peer();
+            var track = LocalTrack.forwarded("relay", MediaKind.VIDEO);
+            var sender = a.pc().addTrack(track, "s");
+            var packet = new RemoteTrack.Packet(rtp(), Optional.of("h"), 0, Optional.empty(), Map.of());
+            track.write(packet);
+            assertEquals(1, track.framesDropped());
+            var forwarded = new CopyOnWriteArrayList<FrameSink.Forwarded>();
+            sender.setPipeline(new RecordingSink(new CopyOnWriteArrayList<>(), forwarded), sender.layers());
+            track.write(packet);
+            track.write(rtp(), Optional.empty());
+            assertEquals(2, forwarded.size());
+            assertEquals(Optional.of("h"), forwarded.getFirst().rid());
+            assertEquals(Optional.of(Map.of()), forwarded.getFirst().extensions());
+            assertEquals(Optional.empty(), forwarded.get(1).extensions(), "a raw packet is in the sender's numbering");
+            assertEquals(1, track.framesDropped());
+        }
+
+        static RtpPacket rtp() {
+            try {
+                var buffer = ByteBuffer.allocate(13);
+                buffer.put((byte) 0x80).put((byte) 96).putShort((short) 1).putInt(1000).putInt(42).put((byte) 7);
+                return RtpPacket.parse(buffer.flip());
+            } catch (RtpFormatException exception) {
+                throw new AssertionError(exception);
+            }
+        }
+    }
+
+    /// A pipeline that records what a sender hands it.
+    static final class RecordingSink implements FrameSink {
+        private final List<EncodedFrame> frames;
+        private final List<FrameSink.Forwarded> packets;
+        private final RtpSender sender;
+
+        RecordingSink(List<EncodedFrame> frames) {
+            this(frames, new CopyOnWriteArrayList<>(), null);
+        }
+
+        RecordingSink(List<EncodedFrame> frames, RtpSender sender) {
+            this(frames, new CopyOnWriteArrayList<>(), sender);
+        }
+
+        RecordingSink(List<EncodedFrame> frames, List<FrameSink.Forwarded> packets) {
+            this(frames, packets, null);
+        }
+
+        private RecordingSink(List<EncodedFrame> frames, List<FrameSink.Forwarded> packets, RtpSender sender) {
+            this.frames = frames;
+            this.packets = packets;
+            this.sender = sender;
+        }
+
+        @Override
+        public boolean accept(EncodedFrame frame, Optional<String> rid) {
+            if (sender != null && !sender.isLayerActive(rid.orElse(""))) {
+                return false;
+            }
+            frames.add(frame);
+            return true;
+        }
+
+        @Override
+        public boolean forward(FrameSink.Forwarded packet) {
+            packets.add(packet);
+            return true;
+        }
+
+        @Override
+        public boolean isSending() {
+            return true;
         }
     }
 
@@ -366,7 +522,10 @@ class PeerApiTest {
         void validation() {
             assertThrows(IllegalArgumentException.class, () -> Configuration.builder().iceCandidatePoolSize(256)
                     .build());
-            assertThrows(IllegalArgumentException.class, () -> Configuration.builder().bitrates(10, 5, 20).build());
+            assertThrows(IllegalArgumentException.class, () -> new Bitrates(10, 5, 20));
+            assertThrows(IllegalArgumentException.class, () -> new Bitrates(0, 0, 0));
+            assertEquals(new Bitrates(1, 2, 3), Configuration.builder().bitrates(new Bitrates(1, 2, 3)).build()
+                    .bitrates());
             assertThrows(IllegalArgumentException.class, () -> Configuration.builder().codecs(List.of()).build());
         }
 

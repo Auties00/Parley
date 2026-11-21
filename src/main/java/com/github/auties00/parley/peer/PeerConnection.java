@@ -4,7 +4,10 @@ import com.github.auties00.parley.datachannel.DataChannel;
 import com.github.auties00.parley.datachannel.DataChannelInit;
 import com.github.auties00.parley.datachannel.DataChannelPriority;
 import com.github.auties00.parley.dtls.DtlsState;
+import com.github.auties00.parley.event.EventSource;
+import com.github.auties00.parley.event.EventStream;
 import com.github.auties00.parley.ice.IceGatheringState;
+import com.github.auties00.parley.ice.IceProtocol;
 import com.github.auties00.parley.ice.IceTransportState;
 import com.github.auties00.parley.media.Codec;
 import com.github.auties00.parley.media.MediaKind;
@@ -13,10 +16,13 @@ import com.github.auties00.parley.stats.PeerConnectionStats;
 import com.github.auties00.parley.stats.RtcStats;
 import com.github.auties00.parley.stats.StatsReport;
 
+import java.lang.System.Logger.Level;
 import java.net.URI;
 import java.security.SecureRandom;
+import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
@@ -27,7 +33,11 @@ import java.util.OptionalInt;
 import java.util.OptionalLong;
 import java.util.Set;
 import java.util.UUID;
+import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.Consumer;
+import java.util.function.Predicate;
+import java.util.function.Supplier;
+import java.util.stream.Collectors;
 
 /// A WebRTC peer connection, the W3C `RTCPeerConnection`: it negotiates media and data with a remote peer through
 /// JSEP offers and answers, and runs the ICE, DTLS, SRTP, RTP and SCTP transports the negotiation calls for.
@@ -36,27 +46,30 @@ import java.util.function.Consumer;
 /// signals by itself. Media flows as encoded frames: [LocalTrack]s in, [RemoteTrack]s out.
 ///
 /// {@snippet lang = java :
-/// var pc = PeerConnection.builder()
-///         .iceServers(List.of(new IceServer(List.of(URI.create("stun:stun.example.org")), Optional.empty(),
-///                 Optional.empty())))
+/// var pc = PeerConnection.create(Configuration.builder()
+///         .iceServers(IceServer.of("stun:stun.example.org"))
 ///         .bundlePolicy(BundlePolicy.MAX_BUNDLE)
-///         .build();
-/// var audio = LocalTrack.audio("mic");
-/// pc.addTrack(audio, List.of("stream-1"));
+///         .build());
+/// var events = pc.events();               // the first stream gets every event, even those raised before it
+/// pc.addTrack(LocalTrack.audio("mic"), "stream-1");
 /// var offer = pc.createOffer();
 /// pc.setLocalDescription(offer);
 /// signaling.send(offer.sdp());
 /// pc.setRemoteDescription(JsepDescription.answer(signaling.receiveAnswer()));
-/// try (var events = pc.events()) {
+/// try (events) {
 ///     for (var event : events) {
 ///         switch (event) {
-///             case PeerConnectionEvent.IceCandidate(var candidate) -> signaling.send(candidate);
-///             case PeerConnectionEvent.Track(var receiver, var streams, var transceiver) -> play(receiver.track());
+///             case PeerConnectionEvent.IceCandidate candidate -> signaling.send(candidate.candidate());
+///             case PeerConnectionEvent.Track track -> play(track.receiver().track());
 ///             default -> { }
 ///         }
 ///     }
 /// }
 /// }
+///
+/// A server that does not trickle candidates (WHIP, WHEP) waits for them instead:
+/// [#awaitIceGatheringComplete(Duration)] returns once the local description holds every candidate, and
+/// [#awaitConnectionState(PeerConnectionState, Duration)] once the transports connect.
 ///
 /// # Perfect negotiation
 ///
@@ -66,25 +79,40 @@ import java.util.function.Consumer;
 ///
 /// # Threading
 ///
-/// Every method is safe for concurrent use; the signaling methods run one at a time under the connection's lock, as
-/// the W3C operations chain orders them. None blocks on the network: transports connect on threads of the configured
-/// factory and report through events. Events go to every [EventStream] and listener in the order they were raised.
+/// Every method is safe for concurrent use; the signaling methods run one at a time, as the W3C operations chain
+/// orders them. None blocks on the network: transports connect on threads of the configured factory and report
+/// through events, and only the `await` methods wait. Events go to every [EventStream] and listener in the order
+/// they were raised; the first stream opened, by [#events()] or [#addListener(Consumer)], also receives every event
+/// raised since the connection was created.
 ///
 /// # Lifecycle
 ///
 /// [#close()] stops every transceiver, closes the transports and data channels, ends the event streams and moves the
 /// connection to the `CLOSED` states; afterwards most methods throw [InvalidStateException].
 ///
+/// # Errors
+///
+/// Misuse throws the W3C exceptions, each extending the JDK type Java callers already catch:
+/// [InvalidStateException] and [OperationErrorException] extend [IllegalStateException], [InvalidAccessException]
+/// and [InvalidModificationException] extend [IllegalArgumentException]. Transport failures are not thrown: they
+/// move the connection to [PeerConnectionState#FAILED] and raise its events.
+///
 /// @spec https://www.w3.org/TR/webrtc/ WebRTC: Real-Time Communication in Browsers
 /// @spec https://www.rfc-editor.org/rfc/rfc9429.html RFC 9429: JavaScript Session Establishment Protocol (JSEP)
 /// @spec https://www.w3.org/TR/webrtc-extensions/ WebRTC Extensions
 public final class PeerConnection implements AutoCloseable {
-    /// The lock the W3C operations chain is modelled on, shared with the transceivers.
+    private static final System.Logger LOGGER = System.getLogger(PeerConnection.class.getName());
+
+    /// The lock that guards the connection's state, shared with the transceivers; never held while the transports
+    /// are applied or closed, and never taken by media threads.
     private final Object lock = new Object();
+    /// Serializes the operations that apply a negotiation to the transports, and [#close()], as the W3C operations
+    /// chain does; taken before [#lock].
+    private final ReentrantLock operations = new ReentrantLock();
     /// The source of synchronization sources.
     private final SecureRandom random = new SecureRandom();
-    /// The events.
-    private final EventHub<PeerConnectionEvent> events;
+    /// The events, buffered from construction for the first stream.
+    private final EventSource<PeerConnectionEvent> events = new EventSource<>();
     /// The transceivers, in creation order; guarded by [#lock].
     private final List<RtpTransceiver> transceivers = new ArrayList<>();
     /// The synchronization sources in use; guarded by [#lock].
@@ -111,27 +139,33 @@ public final class PeerConnection implements AutoCloseable {
     private PeerConnectionState connectionState = PeerConnectionState.NEW;
     /// Whether the connection is closed; guarded by [#lock].
     private boolean closed;
-    /// The data channels opened and closed, for the peer-connection statistics.
-    private final long[] dataChannelCounters = new long[2];
+    /// The data channels that became open; guarded by [#lock].
+    private long dataChannelsOpened;
+    /// The data channels that closed after being open; guarded by [#lock].
+    private long dataChannelsClosed;
 
     /// Creates a connection whose transports `backendFactory` creates.
-    PeerConnection(Configuration configuration, PeerBackend.Factory backendFactory) {
+    private PeerConnection(Configuration configuration, PeerBackend.Factory backendFactory) {
         this.configuration = Objects.requireNonNull(configuration, "configuration cannot be null");
-        this.events = new EventHub<>(configuration.threadFactory());
         this.engine = new JsepEngine(this);
         this.backend = backendFactory.create(configuration, new BackendListener());
     }
 
-    /// {@return a builder with the default configuration}
-    public static Builder builder() {
-        return new Builder();
-    }
-
     /// {@return a connection with `configuration`}
     ///
-    /// @param configuration the configuration
+    /// @param configuration the configuration, which [Configuration#builder()] builds
     public static PeerConnection create(Configuration configuration) {
         return new PeerConnection(configuration, TransportBackend::new);
+    }
+
+    /// {@return a connection with the default configuration, which [Configuration#builder()] describes}
+    public static PeerConnection create() {
+        return create(Configuration.builder().build());
+    }
+
+    /// {@return a connection whose transports `backendFactory` creates, for tests that exercise the signaling alone}
+    static PeerConnection create(Configuration configuration, PeerBackend.Factory backendFactory) {
+        return new PeerConnection(configuration, Objects.requireNonNull(backendFactory));
     }
 
 
@@ -181,11 +215,17 @@ public final class PeerConnection implements AutoCloseable {
     /// @throws OperationErrorException      if the SDP cannot be parsed
     public void setLocalDescription(JsepDescription description) {
         Objects.requireNonNull(description, "description cannot be null");
-        synchronized (lock) {
-            checkOpen();
-            var result = engine.setLocalDescription(description);
-            result.ifPresent(negotiated -> applyNegotiation(negotiated, description.type() == JsepType.ANSWER));
-            updateNegotiationNeeded();
+        operations.lock();
+        try {
+            Optional<Negotiated> result;
+            synchronized (lock) {
+                checkOpen();
+                result = engine.setLocalDescription(description);
+                result.ifPresent(negotiated -> trackTransports(negotiated, description.type() == JsepType.ANSWER));
+            }
+            applyNegotiation(result, description.type() == JsepType.ANSWER);
+        } finally {
+            operations.unlock();
         }
     }
 
@@ -195,13 +235,21 @@ public final class PeerConnection implements AutoCloseable {
     /// @return the applied description, to send to the peer
     /// @throws InvalidStateException if the connection is closed
     public JsepDescription setLocalDescription() {
-        synchronized (lock) {
-            checkOpen();
-            var state = engine.state();
-            var description = state == SignalingState.HAVE_REMOTE_OFFER || state == SignalingState.HAVE_LOCAL_PRANSWER
-                    ? engine.createAnswer() : engine.createOffer(OfferOptions.DEFAULT);
+        operations.lock();
+        try {
+            JsepDescription description;
+            synchronized (lock) {
+                checkOpen();
+                var state = engine.state();
+                description = state == SignalingState.HAVE_REMOTE_OFFER || state == SignalingState.HAVE_LOCAL_PRANSWER
+                        ? engine.createAnswer() : engine.createOffer(OfferOptions.DEFAULT);
+            }
             setLocalDescription(description);
-            return engine.localDescription().orElse(description);
+            synchronized (lock) {
+                return engine.localDescription().orElse(description);
+            }
+        } finally {
+            operations.unlock();
         }
     }
 
@@ -217,16 +265,24 @@ public final class PeerConnection implements AutoCloseable {
     /// @throws OperationErrorException if the SDP cannot be parsed or lacks what the transports need
     public void setRemoteDescription(JsepDescription description) {
         Objects.requireNonNull(description, "description cannot be null");
-        synchronized (lock) {
-            checkOpen();
-            var result = engine.setRemoteDescription(description);
-            result.ifPresent(negotiated -> applyNegotiation(negotiated, description.type() == JsepType.ANSWER));
-            updateNegotiationNeeded();
+        operations.lock();
+        try {
+            Optional<Negotiated> result;
+            synchronized (lock) {
+                checkOpen();
+                // TODO: catch sdp.SdpFormatException and rethrow it as OperationErrorException (the W3C
+                //  sdp-syntax-error) once SessionDescription.parse throws that checked exception.
+                result = engine.setRemoteDescription(description);
+                result.ifPresent(negotiated -> trackTransports(negotiated, description.type() == JsepType.ANSWER));
+            }
+            applyNegotiation(result, description.type() == JsepType.ANSWER);
+        } finally {
+            operations.unlock();
         }
     }
 
-    /// Hands a negotiation outcome to the transports and wires the senders and receivers.
-    private void applyNegotiation(Negotiated negotiated, boolean finalAnswer) {
+    /// Registers the transports of a negotiation outcome for the aggregate states; the caller holds [#lock].
+    private void trackTransports(Negotiated negotiated, boolean finalAnswer) {
         for (var transport : negotiated.transports()) {
             iceStates.putIfAbsent(transport.id(), IceTransportState.NEW);
             dtlsStates.putIfAbsent(transport.id(), DtlsState.NEW);
@@ -238,8 +294,18 @@ public final class PeerConnection implements AutoCloseable {
             dtlsStates.keySet().retainAll(ids);
             gatheringStates.keySet().retainAll(ids);
         }
-        backend.apply(negotiated, finalAnswer);
-        updateAggregateStates();
+    }
+
+    /// Hands a negotiation outcome to the transports without holding [#lock], then recomputes the states; the caller
+    /// holds [#operations].
+    private void applyNegotiation(Optional<Negotiated> negotiated, boolean finalAnswer) {
+        if (negotiated.isPresent()) {
+            backend.apply(negotiated.get(), finalAnswer);
+        }
+        synchronized (lock) {
+            updateAggregateStates();
+            updateNegotiationNeeded();
+        }
     }
 
     /// {@return the pending local description if any, else the current one, with the candidates gathered so far}
@@ -323,7 +389,8 @@ public final class PeerConnection implements AutoCloseable {
     }
 
     /// Adds a candidate the peer trickled, the W3C `addIceCandidate`; an empty candidate string ends the peer's
-    /// candidates for its media section.
+    /// candidates for its media section, or, with neither a media section tag nor an index
+    /// ([IceCandidateInit#endOfCandidates()]), for every section.
     ///
     /// @param candidate the candidate
     /// @throws InvalidStateException   if the connection is closed or no remote description is applied
@@ -332,13 +399,37 @@ public final class PeerConnection implements AutoCloseable {
         Objects.requireNonNull(candidate, "candidate cannot be null");
         synchronized (lock) {
             checkOpen();
-            var target = engine.addIceCandidate(candidate);
-            if (target.isPresent()) {
-                if (target.get().getValue().isEmpty()) {
-                    backend.endOfRemoteCandidates(target.get().getKey());
-                } else {
-                    backend.addRemoteCandidate(target.get().getKey(), target.get().getValue());
-                }
+            if (candidate.isEndOfCandidates() && candidate.sdpMid().isEmpty()
+                    && candidate.sdpMLineIndex().isEmpty()) {
+                endOfRemoteCandidates(candidate);
+                return;
+            }
+            addRemoteCandidate(engine.addIceCandidate(candidate));
+        }
+    }
+
+    /// Ends the peer's candidates on every media section of the remote description; the caller holds [#lock].
+    private void endOfRemoteCandidates(IceCandidateInit candidate) {
+        var description = engine.remoteDescription()
+                .orElseThrow(() -> new InvalidStateException("addIceCandidate needs a remote description"));
+        var sections = description.sdp().lines().filter(line -> line.startsWith("m=")).count();
+        for (var index = 0; index < sections; index++) {
+            try {
+                addRemoteCandidate(engine.addIceCandidate(new IceCandidateInit("", Optional.empty(),
+                        OptionalInt.of(index), candidate.usernameFragment())));
+            } catch (OperationErrorException exception) {
+                LOGGER.log(Level.DEBUG, "section " + index + " takes no end of candidates");
+            }
+        }
+    }
+
+    /// Hands what the engine accepted to the transport it belongs to; the caller holds [#lock].
+    private void addRemoteCandidate(Optional<Map.Entry<String, String>> target) {
+        if (target.isPresent()) {
+            if (target.get().getValue().isEmpty()) {
+                backend.endOfRemoteCandidates(target.get().getKey());
+            } else {
+                backend.addRemoteCandidate(target.get().getKey(), target.get().getValue());
             }
         }
     }
@@ -413,6 +504,10 @@ public final class PeerConnection implements AutoCloseable {
     /// @throws InvalidAccessException if a sender of the connection already sends the track
     public RtpSender addTrack(LocalTrack track, List<String> streams) {
         Objects.requireNonNull(track, "track cannot be null");
+        Objects.requireNonNull(streams, "streams cannot be null");
+        if (streams.stream().anyMatch(Objects::isNull)) {
+            throw new NullPointerException("streams cannot contain null");
+        }
         var streamIds = List.copyOf(streams);
         synchronized (lock) {
             checkOpen();
@@ -444,6 +539,18 @@ public final class PeerConnection implements AutoCloseable {
         }
     }
 
+    /// Sends a track, the W3C `addTrack`, as [#addTrack(LocalTrack, List)] does.
+    ///
+    /// @param track     the track
+    /// @param streamIds the ids of the media streams the peer sees the track in; none for a track in no stream
+    /// @return the sender of the track
+    /// @throws InvalidStateException  if the connection is closed
+    /// @throws InvalidAccessException if a sender of the connection already sends the track
+    public RtpSender addTrack(LocalTrack track, String... streamIds) {
+        Objects.requireNonNull(streamIds, "streamIds cannot be null");
+        return addTrack(track, Arrays.asList(streamIds));
+    }
+
     /// Stops sending a sender's track, the W3C `removeTrack`: detaches the track and drops the sending half of the
     /// transceiver's direction, which makes a negotiation needed.
     ///
@@ -463,6 +570,24 @@ public final class PeerConnection implements AutoCloseable {
             transceiver.direction = TransceiverDirection.of(false, transceiver.direction.receives());
             updateNegotiationNeeded();
         }
+    }
+
+    /// Adds a `SENDRECV` transceiver of a media kind, without a track, the W3C `addTransceiver`.
+    ///
+    /// @param kind the media kind
+    /// @return the transceiver
+    /// @throws InvalidStateException if the connection is closed
+    public RtpTransceiver addTransceiver(MediaKind kind) {
+        return addTransceiver(kind, TransceiverInit.of(TransceiverDirection.SENDRECV));
+    }
+
+    /// Adds a `SENDRECV` transceiver that sends a track, the W3C `addTransceiver`.
+    ///
+    /// @param track the track
+    /// @return the transceiver
+    /// @throws InvalidStateException if the connection is closed
+    public RtpTransceiver addTransceiver(LocalTrack track) {
+        return addTransceiver(track, TransceiverInit.of(TransceiverDirection.SENDRECV));
     }
 
     /// Adds a transceiver of a media kind, without a track, the W3C `addTransceiver`.
@@ -573,10 +698,11 @@ public final class PeerConnection implements AutoCloseable {
     public StatsReport getStats() {
         var now = Instant.now();
         var objects = new ArrayList<RtcStats>();
+        var transports = backend.statistics(now);
         synchronized (lock) {
-            objects.add(new PeerConnectionStats("P", now, dataChannelCounters[0], dataChannelCounters[1]));
+            objects.add(new PeerConnectionStats("P", now, dataChannelsOpened, dataChannelsClosed));
         }
-        objects.addAll(backend.statistics(now));
+        objects.addAll(transports);
         return StatsReport.of(objects);
     }
 
@@ -605,41 +731,152 @@ public final class PeerConnection implements AutoCloseable {
     }
 
 
-    /// {@return a stream of the events raised from now on}
+    /// {@return a stream of the connection's events}
+    ///
+    /// Each call opens a new stream. The first stream ever opened (by this method or [#addListener(Consumer)])
+    /// receives every event raised since the connection was created, so it may be opened after the calls that raise
+    /// the first candidates and tracks; later streams receive the events raised from their opening on. A stream
+    /// ends when the connection closes.
     public EventStream<PeerConnectionEvent> events() {
         return events.open();
     }
 
-    /// Calls `listener` with every event raised from now on, in order, on a thread of the configured factory.
+    /// Calls `listener` with every event, in order, on a thread of the configured factory; the first stream opened
+    /// on the connection also gets the events raised before it, as [#events()] describes.
     ///
     /// @param listener the listener
     /// @return the registration, which stops the listener when closed
     public Subscription addListener(Consumer<? super PeerConnectionEvent> listener) {
-        return events.addListener(listener)::close;
+        return events.addListener(listener, configuration.threadFactory())::close;
+    }
+
+    /// Waits until the connection reaches `state`, the blocking counterpart of the W3C `connectionstatechange`
+    /// event.
+    ///
+    /// @param state   the state to wait for
+    /// @param timeout the longest time to wait
+    /// @return `true` once the connection is in `state`; `false` when the timeout elapsed, or the connection reached
+    ///         `FAILED` or `CLOSED` while waiting for another state
+    /// @throws InterruptedException if the calling thread is interrupted while waiting
+    public boolean awaitConnectionState(PeerConnectionState state, Duration timeout) throws InterruptedException {
+        Objects.requireNonNull(state, "state cannot be null");
+        Objects.requireNonNull(timeout, "timeout cannot be null");
+        return await(timeout, () -> {
+            if (connectionState == state) {
+                return Optional.of(true);
+            }
+            var terminal = connectionState == PeerConnectionState.FAILED
+                    || connectionState == PeerConnectionState.CLOSED;
+            return terminal ? Optional.of(false) : Optional.empty();
+        });
+    }
+
+    /// Waits until every transport finished gathering candidates, so [#localDescription()] holds them all, as a
+    /// peer that does not trickle (WHIP, WHEP) needs.
+    ///
+    /// @param timeout the longest time to wait
+    /// @return `true` once the gathering state is `COMPLETE`; `false` when the timeout elapsed or the connection
+    ///         closed
+    /// @throws InterruptedException if the calling thread is interrupted while waiting
+    public boolean awaitIceGatheringComplete(Duration timeout) throws InterruptedException {
+        Objects.requireNonNull(timeout, "timeout cannot be null");
+        return await(timeout, () -> {
+            if (iceGatheringState == IceGatheringState.COMPLETE) {
+                return Optional.of(true);
+            }
+            return closed ? Optional.of(false) : Optional.empty();
+        });
+    }
+
+    /// Waits on [#lock] until `outcome` decides, or the timeout elapses (`false`).
+    private boolean await(Duration timeout, Supplier<Optional<Boolean>> outcome) throws InterruptedException {
+        var deadline = System.nanoTime() + saturatedNanos(timeout);
+        synchronized (lock) {
+            while (true) {
+                var decided = outcome.get();
+                if (decided.isPresent()) {
+                    return decided.get();
+                }
+                var left = deadline - System.nanoTime();
+                if (left <= 0) {
+                    return false;
+                }
+                lock.wait(Math.max(1, left / 1_000_000));
+            }
+        }
+    }
+
+    /// {@return `timeout` in nanoseconds, floored at zero and capped far below overflow}
+    private static long saturatedNanos(Duration timeout) {
+        if (timeout.isNegative()) {
+            return 0;
+        }
+        try {
+            return Math.min(timeout.toNanos(), Long.MAX_VALUE / 4);
+        } catch (ArithmeticException exception) {
+            return Long.MAX_VALUE / 4;
+        }
+    }
+
+    /// {@return the SCTP transport of the data channels, the W3C `RTCPeerConnection.sctp`, or an empty optional
+    /// until a data section is negotiated and after the connection closes}
+    public Optional<PeerSctpTransport> sctp() {
+        synchronized (lock) {
+            if (closed) {
+                return Optional.empty();
+            }
+        }
+        return backend.sctpTransport();
     }
 
     /// Closes the connection, the W3C `close`: stops every transceiver, closes the transports and data channels,
-    /// and ends the event streams after a final [PeerConnectionEvent.SignalingStateChanged] to `CLOSED`. Idempotent.
+    /// and ends the event streams after a final [PeerConnectionEvent.SignalingStateChanged] to `CLOSED`. Idempotent;
+    /// never throws, whatever a transport does while closing, and does not wait for a graceful SCTP shutdown while
+    /// holding the connection's state.
     @Override
     public void close() {
-        synchronized (lock) {
-            if (closed) {
-                return;
+        operations.lock();
+        try {
+            List<RtpTransceiver> stopped;
+            synchronized (lock) {
+                if (closed) {
+                    return;
+                }
+                closed = true;
+                stopped = List.copyOf(transceivers);
+                for (var transceiver : stopped) {
+                    transceiver.stopped = true;
+                    transceiver.stopping = false;
+                    transceiver.currentDirection = null;
+                }
+                iceConnectionState = IceTransportState.CLOSED;
+                connectionState = PeerConnectionState.CLOSED;
+                lock.notifyAll();
             }
-            closed = true;
-            for (var transceiver : transceivers) {
-                transceiver.stopped = true;
-                transceiver.stopping = false;
-                transceiver.currentDirection = null;
-                transceiver.sender().stopSending();
-                transceiver.receiver().track().end();
+            try {
+                for (var transceiver : stopped) {
+                    closeQuietly(transceiver.sender()::close, "a sender");
+                    closeQuietly(transceiver.receiver().track()::end, "a remote track");
+                }
+                synchronized (lock) {
+                    closeQuietly(engine::close, "the negotiation engine");
+                }
+                closeQuietly(backend::close, "the transports");
+            } finally {
+                events.publish(new PeerConnectionEvent.SignalingStateChanged(SignalingState.CLOSED));
+                events.end();
             }
-            engine.close();
-            backend.close();
-            iceConnectionState = IceTransportState.CLOSED;
-            connectionState = PeerConnectionState.CLOSED;
-            events.publish(new PeerConnectionEvent.SignalingStateChanged(SignalingState.CLOSED));
-            events.end();
+        } finally {
+            operations.unlock();
+        }
+    }
+
+    /// Runs one step of [#close()], logging a failure at `DEBUG` instead of propagating it.
+    private static void closeQuietly(Runnable step, String what) {
+        try {
+            step.run();
+        } catch (RuntimeException exception) {
+            LOGGER.log(Level.DEBUG, what + " failed to close", exception);
         }
     }
 
@@ -796,7 +1033,42 @@ public final class PeerConnection implements AutoCloseable {
         }
     }
 
-    /// Recomputes the aggregate gathering, ICE and connection states and raises their changes.
+    /// {@return the DTLS transport of a sender's negotiated section}
+    Optional<PeerDtlsTransport> transportOf(RtpSender sender) {
+        return transportOf(transceiver -> transceiver.sender() == sender);
+    }
+
+    /// {@return the DTLS transport of a receiver's negotiated section}
+    Optional<PeerDtlsTransport> transportOf(RtpReceiver receiver) {
+        return transportOf(transceiver -> transceiver.receiver() == receiver);
+    }
+
+    /// {@return the DTLS transport of the negotiated section of the first transceiver `filter` accepts}
+    private Optional<PeerDtlsTransport> transportOf(Predicate<RtpTransceiver> filter) {
+        String transportId;
+        synchronized (lock) {
+            if (closed) {
+                return Optional.empty();
+            }
+            transportId = transceivers.stream().filter(filter).map(transceiver -> transceiver.negotiated)
+                    .filter(Objects::nonNull).map(Negotiated.Media::transportId).findFirst().orElse(null);
+        }
+        return transportId == null ? Optional.empty() : backend.dtlsTransport(transportId);
+    }
+
+    /// {@return the lowercase names of the codecs a sender negotiated, or of the configured codecs of its kind
+    /// before a negotiation; the caller holds the lock}
+    Set<String> sendCodecNames(RtpSender sender) {
+        var media = negotiatedMedia(sender);
+        var codecs = media.isPresent() && !media.get().codecs().isEmpty()
+                ? media.get().codecs().stream().map(Negotiated.CodecEntry::codec).toList()
+                : codecCapabilities(sender.kind());
+        return codecs.stream().map(codec -> codec.name().toLowerCase(java.util.Locale.ROOT))
+                .collect(Collectors.toUnmodifiableSet());
+    }
+
+    /// Recomputes the aggregate gathering, ICE and connection states and raises their changes; the caller holds
+    /// [#lock].
     private void updateAggregateStates() {
         if (closed) {
             return;
@@ -819,6 +1091,7 @@ public final class PeerConnection implements AutoCloseable {
             connectionState = connection;
             events.publish(new PeerConnectionEvent.ConnectionStateChanged(connection));
         }
+        lock.notifyAll();
     }
 
     /// {@return the W3C `RTCIceGatheringState` of the transports}
@@ -880,13 +1153,14 @@ public final class PeerConnection implements AutoCloseable {
     /// Receives the backend's transport events.
     private final class BackendListener implements PeerBackend.Listener {
         @Override
-        public void onLocalCandidate(String transportId, String candidate) {
+        public void onLocalCandidate(String transportId, String candidate, Optional<URI> url,
+                                     Optional<IceProtocol> relayProtocol) {
             synchronized (lock) {
                 if (closed) {
                     return;
                 }
-                engine.localCandidate(transportId, candidate)
-                        .ifPresent(init -> events.publish(new PeerConnectionEvent.IceCandidate(init)));
+                engine.localCandidate(transportId, candidate).ifPresent(init -> events.publish(
+                        new PeerConnectionEvent.IceCandidate(init, url, relayProtocol)));
             }
         }
 
@@ -905,8 +1179,9 @@ public final class PeerConnection implements AutoCloseable {
         }
 
         @Override
-        public void onCandidateError(String transportId, URI server, int errorCode, String reason) {
-            events.publish(new PeerConnectionEvent.IceCandidateError(server, errorCode, reason));
+        public void onCandidateError(String transportId, Optional<String> address, OptionalInt port, URI server,
+                                     int errorCode, String reason) {
+            events.publish(new PeerConnectionEvent.IceCandidateError(address, port, server, errorCode, reason));
         }
 
         @Override
@@ -937,46 +1212,22 @@ public final class PeerConnection implements AutoCloseable {
                 if (closed) {
                     return;
                 }
-                dataChannelCounters[0]++;
             }
             events.publish(new PeerConnectionEvent.DataChannel(channel));
         }
-    }
 
-    /// Builds [PeerConnection]s.
-    public static final class Builder extends ConfigurationBuilder<Builder> {
-        /// The transports, replaceable by tests.
-        private PeerBackend.Factory backendFactory = TransportBackend::new;
-
-        /// Creates a builder with the defaults.
-        Builder() {
+        @Override
+        public void onDataChannelOpened() {
+            synchronized (lock) {
+                dataChannelsOpened++;
+            }
         }
 
         @Override
-        Builder self() {
-            return this;
-        }
-
-        /// Replaces the transports, for tests that exercise the signaling alone.
-        Builder backendFactory(PeerBackend.Factory factory) {
-            backendFactory = Objects.requireNonNull(factory);
-            return this;
-        }
-
-        /// Starts from an existing configuration.
-        ///
-        /// @param configuration the configuration
-        /// @return this builder
-        public Builder configuration(Configuration configuration) {
-            copyFrom(Objects.requireNonNull(configuration, "configuration cannot be null"));
-            return this;
-        }
-
-        /// {@return a connection with the configured settings}
-        ///
-        /// @throws IllegalArgumentException as the [Configuration] constructor does
-        public PeerConnection build() {
-            return new PeerConnection(configuration(), backendFactory);
+        public void onDataChannelClosed() {
+            synchronized (lock) {
+                dataChannelsClosed++;
+            }
         }
     }
 }

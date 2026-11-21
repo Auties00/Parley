@@ -1,64 +1,80 @@
 package com.github.auties00.parley.peer;
 
+import com.github.auties00.parley.event.EventSource;
+import com.github.auties00.parley.event.EventStream;
 import com.github.auties00.parley.jitter.AudioPlayout;
+import com.github.auties00.parley.media.Codec;
 import com.github.auties00.parley.media.EncodedFrame;
 import com.github.auties00.parley.media.MediaKind;
 import com.github.auties00.parley.rtp.RtpPacket;
 
-import java.time.Duration;
-import java.util.ArrayDeque;
+import java.net.URI;
+import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
-import java.util.concurrent.atomic.AtomicLong;
-import java.util.concurrent.locks.Condition;
-import java.util.concurrent.locks.ReentrantLock;
 
 /// The media a receiver gets from the peer, the counterpart of a W3C remote `MediaStreamTrack`: encoded frames the
 /// application decodes, or raw RTP packets an SFU forwards.
 ///
-/// The [mode][#mode()] is fixed by the peer connection's configuration:
+/// The [mode][#mode()] decides what the track delivers:
 ///
-/// - [RemoteTrackMode#JITTER_BUFFERED]: [#read()] returns encoded frames in decode order after the jitter buffer
-///   (video frames once complete and decodable, audio frames at their playout time); for audio, [#readPlayout()]
-///   also reports the gaps the application must conceal.
-/// - [RemoteTrackMode#RAW_PACKETS]: [#readPacket()] returns each RTP packet as it arrives, after SRTP and
-///   retransmission recovery, with the RTP stream id of its simulcast layer.
+/// - [RemoteTrackMode#JITTER_BUFFERED]: [#frames()] streams encoded frames in decode order after the jitter buffer
+///   (video frames once complete and decodable, audio frames at their playout time); for audio, [#playout()] also
+///   streams the gaps the application must conceal.
+/// - [RemoteTrackMode#RAW_PACKETS]: [#packets()] streams each RTP packet as it arrives, after SRTP and retransmission
+///   recovery, with the RTP stream id of its simulcast layer, its codec and its header extension map, ready for
+///   [LocalForwardedTrack#write(RemoteTrack.Packet)].
 ///
 /// {@snippet lang = java :
 /// var track = transceiver.receiver().track();
-/// while (true) {
-///     EncodedFrame frame = track.read();       // blocks until the next decodable frame
-///     decoder.decode(frame);
+/// try (var frames = track.frames()) {
+///     for (var frame : frames) {      // ends when the track ends
+///         decoder.decode(frame);
+///     }
 /// }
 /// }
 ///
-/// The track keeps at most 1024 undelivered items; when the application reads too slowly the oldest are dropped and
-/// counted in [#dropped()].
+/// Each stream holds at most [EventSource#DEFAULT_CAPACITY] undelivered items; when the application reads too slowly
+/// the oldest are dropped and counted in [EventStream#dropped()]. The first stream of each kind opened also gets
+/// what the track received before it was opened, within that bound.
+///
+/// # Events
+///
+/// A track starts muted. [#events()] raises [RemoteTrackEvent.Unmuted] when RTP arrives while it is muted,
+/// [RemoteTrackEvent.Muted] when the peer sends an RTCP BYE or a negotiation stops its sending direction, and
+/// [RemoteTrackEvent.Ended] when its transceiver stops or the connection closes; every stream of the track ends
+/// then.
 ///
 /// # Threading
 ///
-/// Reads may come from any thread; each item goes to one reader.
+/// Every method is safe for concurrent use; each stream is meant for one reader.
 ///
 /// @spec https://www.w3.org/TR/mediacapture-streams/ Media Capture and Streams
 /// @spec https://www.w3.org/TR/webrtc/ WebRTC: Real-Time Communication in Browsers
 public final class RemoteTrack {
-    /// The capacity of the delivery queue.
-    private static final int CAPACITY = 1024;
-
-    /// A received RTP packet, as [RemoteTrack#readPacket()] returns it.
+    /// A received RTP packet, as [RemoteTrack#packets()] delivers it.
     ///
     /// @param packet       a copy of the packet, which the reader owns
     /// @param rid          the RTP stream id of the simulcast layer it belongs to, or an empty optional
     /// @param arrivalNanos when it arrived, in the connection's monotonic clock
-    public record Packet(RtpPacket packet, Optional<String> rid, long arrivalNanos) {
-        /// Creates the packet.
+    /// @param codec        the codec its payload type was negotiated for, or an empty optional for a payload type
+    ///                     the receiver did not negotiate
+    /// @param extensions   the header extension ids negotiated on the receiving section, mapped to their URIs, so a
+    ///                     forwarder can renumber them for another peer
+    public record Packet(RtpPacket packet, Optional<String> rid, long arrivalNanos, Optional<Codec> codec,
+                         Map<Integer, URI> extensions) {
+        /// Creates the packet, copying the map.
         ///
         /// @param packet       the packet
         /// @param rid          the layer, or an empty optional
         /// @param arrivalNanos the arrival time
+        /// @param codec        the codec, or an empty optional
+        /// @param extensions   the extension map
         public Packet {
             Objects.requireNonNull(packet, "packet cannot be null");
             Objects.requireNonNull(rid, "rid cannot be null");
+            Objects.requireNonNull(codec, "codec cannot be null");
+            extensions = Map.copyOf(extensions);
         }
     }
 
@@ -68,24 +84,30 @@ public final class RemoteTrack {
     private final MediaKind kind;
     /// The delivery mode.
     private final RemoteTrackMode mode;
-    /// Guards [#queue], [#ended] and [#muted].
-    private final ReentrantLock lock = new ReentrantLock();
-    /// Signals a new item or the end.
-    private final Condition available = lock.newCondition();
-    /// The undelivered frames, playout outcomes or packets.
-    private final ArrayDeque<Object> queue = new ArrayDeque<>();
-    /// The items dropped because the queue was full.
-    private final AtomicLong dropped = new AtomicLong();
+    /// The frames, in `JITTER_BUFFERED` mode; `null` otherwise.
+    private final EventSource<EncodedFrame> frames;
+    /// The audio playout outcomes, for an audio track in `JITTER_BUFFERED` mode; `null` otherwise.
+    private final EventSource<AudioPlayout> playout;
+    /// The packets, in `RAW_PACKETS` mode; `null` otherwise.
+    private final EventSource<Packet> packets;
+    /// The mute, unmute and end events.
+    private final EventSource<RemoteTrackEvent> events = new EventSource<>();
+    /// Guards the transitions of [#muted] and [#ended].
+    private final Object stateLock = new Object();
+    /// Whether the track has received nothing since it was created or last muted.
+    private volatile boolean muted = true;
     /// Whether the track has ended.
-    private boolean ended;
-    /// Whether the track has received nothing since the peer last stopped sending.
-    private boolean muted = true;
+    private volatile boolean ended;
 
     /// Creates a track.
     RemoteTrack(String id, MediaKind kind, RemoteTrackMode mode) {
         this.id = Objects.requireNonNull(id);
         this.kind = Objects.requireNonNull(kind);
         this.mode = Objects.requireNonNull(mode);
+        var buffered = mode == RemoteTrackMode.JITTER_BUFFERED;
+        this.frames = buffered ? new EventSource<>() : null;
+        this.playout = buffered && kind == MediaKind.AUDIO ? new EventSource<>() : null;
+        this.packets = buffered ? null : new EventSource<>();
     }
 
     /// {@return the track id}
@@ -105,187 +127,129 @@ public final class RemoteTrack {
 
     /// {@return whether the track is muted: nothing has arrived yet, or the peer stopped sending}
     public boolean isMuted() {
-        lock.lock();
-        try {
-            return muted;
-        } finally {
-            lock.unlock();
-        }
+        return muted;
     }
 
     /// {@return whether the track has ended: its transceiver stopped or the connection closed}
     public boolean isEnded() {
-        lock.lock();
-        try {
-            return ended;
-        } finally {
-            lock.unlock();
-        }
+        return ended;
     }
 
-    /// {@return the items dropped because the application read too slowly}
-    public long dropped() {
-        return dropped.get();
-    }
-
-    /// Waits for the next encoded frame.
+    /// Opens a stream of the encoded frames, in decode order, ending when the track ends.
     ///
-    /// For audio, the gaps [#readPlayout()] would report are skipped.
+    /// For audio, the gaps [#playout()] reports are skipped.
     ///
-    /// @return the frame
-    /// @throws IllegalStateException if the mode is not `JITTER_BUFFERED`, or the track has ended and every frame was
-    ///                               read
-    /// @throws InterruptedException  if the calling thread is interrupted while waiting
-    public EncodedFrame read() throws InterruptedException {
+    /// @return the stream, which the caller should close when done
+    /// @throws InvalidStateException if the mode is not `JITTER_BUFFERED`
+    public EventStream<EncodedFrame> frames() {
         requireMode(RemoteTrackMode.JITTER_BUFFERED);
-        while (true) {
-            var item = take(Long.MAX_VALUE).orElseThrow(() -> new IllegalStateException("the track has ended"));
-            var frame = asFrame(item);
-            if (frame.isPresent()) {
-                return frame.get();
-            }
-        }
+        return frames.open();
     }
 
-    /// Waits up to `timeout` for the next encoded frame.
+    /// Opens a stream of the playout outcomes of an audio track: a frame to decode, a gap to conceal, or silence
+    /// while the peer sends no audio (DTX), one per packet time, ending when the track ends.
     ///
-    /// @param timeout the longest time to wait
-    /// @return the frame, or an empty optional when the timeout elapsed or the track has ended
-    /// @throws IllegalStateException if the mode is not `JITTER_BUFFERED`
-    /// @throws InterruptedException  if the calling thread is interrupted while waiting
-    public Optional<EncodedFrame> read(Duration timeout) throws InterruptedException {
+    /// @return the stream, which the caller should close when done
+    /// @throws InvalidStateException if the track is not an audio track in `JITTER_BUFFERED` mode
+    public EventStream<AudioPlayout> playout() {
         requireMode(RemoteTrackMode.JITTER_BUFFERED);
-        var deadline = System.nanoTime() + timeout.toNanos();
-        while (true) {
-            var item = take(deadline);
-            if (item.isEmpty()) {
-                return Optional.empty();
-            }
-            var frame = asFrame(item.get());
-            if (frame.isPresent()) {
-                return frame;
-            }
+        if (playout == null) {
+            throw new InvalidStateException("only an audio track has playout outcomes");
         }
+        return playout.open();
     }
 
-    /// Waits for the next playout outcome of an audio track: a frame to decode, a gap to conceal, or silence while
-    /// the peer sends no audio (DTX).
+    /// Opens a stream of the RTP packets as they arrive, ending when the track ends.
     ///
-    /// @return the outcome
-    /// @throws IllegalStateException if the track is not an audio track in `JITTER_BUFFERED` mode, or it has ended
-    ///                               and every outcome was read
-    /// @throws InterruptedException  if the calling thread is interrupted while waiting
-    public AudioPlayout readPlayout() throws InterruptedException {
-        requireMode(RemoteTrackMode.JITTER_BUFFERED);
-        if (kind != MediaKind.AUDIO) {
-            throw new IllegalStateException("only an audio track has playout outcomes");
-        }
-        var item = take(Long.MAX_VALUE).orElseThrow(() -> new IllegalStateException("the track has ended"));
-        return item instanceof AudioPlayout playout ? playout : new AudioPlayout.Frame((EncodedFrame) item,
-                java.time.Duration.ZERO);
-    }
-
-    /// Waits for the next RTP packet.
-    ///
-    /// @return the packet
-    /// @throws IllegalStateException if the mode is not `RAW_PACKETS`, or the track has ended and every packet was
-    ///                               read
-    /// @throws InterruptedException  if the calling thread is interrupted while waiting
-    public Packet readPacket() throws InterruptedException {
+    /// @return the stream, which the caller should close when done
+    /// @throws InvalidStateException if the mode is not `RAW_PACKETS`
+    public EventStream<Packet> packets() {
         requireMode(RemoteTrackMode.RAW_PACKETS);
-        return (Packet) take(Long.MAX_VALUE).orElseThrow(() -> new IllegalStateException("the track has ended"));
+        return packets.open();
     }
 
-    /// Waits up to `timeout` for the next RTP packet.
+    /// {@return a stream of the track's mute, unmute and end events}
     ///
-    /// @param timeout the longest time to wait
-    /// @return the packet, or an empty optional when the timeout elapsed or the track has ended
-    /// @throws IllegalStateException if the mode is not `RAW_PACKETS`
-    /// @throws InterruptedException  if the calling thread is interrupted while waiting
-    public Optional<Packet> readPacket(Duration timeout) throws InterruptedException {
-        requireMode(RemoteTrackMode.RAW_PACKETS);
-        return take(System.nanoTime() + timeout.toNanos()).map(Packet.class::cast);
+    /// The first stream opened also gets the events raised since the track was created.
+    public EventStream<RemoteTrackEvent> events() {
+        return events.open();
     }
 
     /// Fails unless the track delivers in `expected` mode.
     private void requireMode(RemoteTrackMode expected) {
         if (mode != expected) {
-            throw new IllegalStateException("the track delivers in " + mode + " mode");
+            throw new InvalidStateException("the track delivers in " + mode + " mode");
         }
     }
 
-    /// {@return the frame an item carries, if any}
-    private static Optional<EncodedFrame> asFrame(Object item) {
-        return switch (item) {
-            case EncodedFrame frame -> Optional.of(frame);
-            case AudioPlayout.Frame(var frame, var ignored) -> Optional.of(frame);
-            default -> Optional.empty();
-        };
+    /// Delivers an assembled frame, in `JITTER_BUFFERED` mode.
+    void deliverFrame(EncodedFrame frame) {
+        if (frames != null) {
+            frames.publish(frame);
+        }
     }
 
-    /// Takes the next item, waiting until `deadlineNanos` (`Long.MAX_VALUE` for no deadline).
-    private Optional<Object> take(long deadlineNanos) throws InterruptedException {
-        lock.lockInterruptibly();
-        try {
-            while (queue.isEmpty()) {
-                if (ended) {
-                    return Optional.empty();
-                }
-                if (deadlineNanos == Long.MAX_VALUE) {
-                    available.await();
-                } else {
-                    var left = deadlineNanos - System.nanoTime();
-                    if (left <= 0) {
-                        return Optional.empty();
-                    }
-                    available.awaitNanos(left);
-                }
+    /// Delivers an audio playout outcome; a frame outcome also reaches [#frames()].
+    void deliverPlayout(AudioPlayout outcome) {
+        if (playout != null) {
+            playout.publish(outcome);
+        }
+        if (outcome instanceof AudioPlayout.Frame(var frame, var ignored)) {
+            deliverFrame(frame);
+        }
+    }
+
+    /// Delivers a packet, in `RAW_PACKETS` mode.
+    void deliverPacket(Packet packet) {
+        if (packets != null) {
+            packets.publish(packet);
+        }
+    }
+
+    /// Notes that RTP arrived, unmuting the track if it was muted; cheap when it is not.
+    void received() {
+        if (!muted) {
+            return;
+        }
+        synchronized (stateLock) {
+            if (!muted || ended) {
+                return;
             }
-            return Optional.of(queue.removeFirst());
-        } finally {
-            lock.unlock();
+            muted = false;
+            events.publish(new RemoteTrackEvent.Unmuted());
         }
     }
 
-    /// Queues a frame, playout outcome or packet for the reader, unmuting the track.
-    void deliver(Object item) {
-        Objects.requireNonNull(item);
-        lock.lock();
-        try {
+    /// Mutes the track, as when the peer sends a BYE or stops sending.
+    void mute() {
+        synchronized (stateLock) {
+            if (muted || ended) {
+                return;
+            }
+            muted = true;
+            events.publish(new RemoteTrackEvent.Muted());
+        }
+    }
+
+    /// Ends the track: every stream delivers what it queued, then ends; idempotent.
+    void end() {
+        synchronized (stateLock) {
             if (ended) {
                 return;
             }
-            if (queue.size() >= CAPACITY) {
-                queue.removeFirst();
-                dropped.incrementAndGet();
-            }
-            queue.addLast(item);
-            muted = false;
-            available.signal();
-        } finally {
-            lock.unlock();
-        }
-    }
-
-    /// Mutes the track, as when the peer stops sending.
-    void mute() {
-        lock.lock();
-        try {
-            muted = true;
-        } finally {
-            lock.unlock();
-        }
-    }
-
-    /// Ends the track; readers get the queued items, then the end.
-    void end() {
-        lock.lock();
-        try {
             ended = true;
             muted = true;
-            available.signalAll();
-        } finally {
-            lock.unlock();
+            events.publish(new RemoteTrackEvent.Ended());
+        }
+        events.end();
+        if (frames != null) {
+            frames.end();
+        }
+        if (playout != null) {
+            playout.end();
+        }
+        if (packets != null) {
+            packets.end();
         }
     }
 

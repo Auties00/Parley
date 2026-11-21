@@ -1,16 +1,20 @@
 package com.github.auties00.parley.peer;
 
 import com.github.auties00.parley.ice.IceGatheringState;
+import com.github.auties00.parley.ice.IceProtocol;
 import com.github.auties00.parley.ice.IceTransportState;
 
 import java.net.URI;
 import java.util.List;
 import java.util.Objects;
+import java.util.Optional;
+import java.util.OptionalInt;
 
 /// An event of a [PeerConnection], the W3C `RTCPeerConnection` event handlers as one sealed hierarchy.
 ///
 /// The events arrive through [PeerConnection#events()] or [PeerConnection#addListener(java.util.function.Consumer)],
-/// in the order the connection raised them.
+/// in the order the connection raised them; the first stream opened also receives every event raised since the
+/// connection was created.
 ///
 /// @spec https://www.w3.org/TR/webrtc/ WebRTC: Real-Time Communication in Browsers
 public sealed interface PeerConnectionEvent {
@@ -21,13 +25,22 @@ public sealed interface PeerConnectionEvent {
 
     /// A local candidate was gathered and should be sent to the peer, the W3C `icecandidate` event.
     ///
-    /// @param candidate the candidate, with the media section it belongs to
-    record IceCandidate(IceCandidateInit candidate) implements PeerConnectionEvent {
+    /// @param candidate     the candidate, with the media section it belongs to
+    /// @param url           the URL of the STUN or TURN server the candidate was gathered from, the W3C
+    ///                      `RTCPeerConnectionIceEvent.url`, or an empty optional for a host candidate
+    /// @param relayProtocol the protocol between Parley and the TURN server of a relayed candidate, the W3C
+    ///                      `RTCIceCandidate.relayProtocol`, or an empty optional for any other candidate
+    record IceCandidate(IceCandidateInit candidate, Optional<URI> url, Optional<IceProtocol> relayProtocol)
+            implements PeerConnectionEvent {
         /// Creates the event.
         ///
-        /// @param candidate the candidate
+        /// @param candidate     the candidate
+        /// @param url           the server URL, or an empty optional
+        /// @param relayProtocol the relay protocol, or an empty optional
         public IceCandidate {
             Objects.requireNonNull(candidate, "candidate cannot be null");
+            Objects.requireNonNull(url, "url cannot be null");
+            Objects.requireNonNull(relayProtocol, "relayProtocol cannot be null");
         }
     }
 
@@ -38,16 +51,24 @@ public sealed interface PeerConnectionEvent {
 
     /// A STUN or TURN server could not be used, the W3C `icecandidateerror` event.
     ///
+    /// @param address   the local address the request was sent from, or an empty optional when it is not known or
+    ///                  must not be exposed
+    /// @param port      the local port the request was sent from, or an empty optional with `address`
     /// @param url       the server URL
     /// @param errorCode the STUN error code, or a value of 700 and above for a failure to reach the server
     /// @param errorText the reason
-    record IceCandidateError(URI url, int errorCode, String errorText) implements PeerConnectionEvent {
+    record IceCandidateError(Optional<String> address, OptionalInt port, URI url, int errorCode, String errorText)
+            implements PeerConnectionEvent {
         /// Creates the event.
         ///
+        /// @param address   the local address, or an empty optional
+        /// @param port      the local port, or an empty optional
         /// @param url       the server URL
         /// @param errorCode the error code
         /// @param errorText the reason
         public IceCandidateError {
+            Objects.requireNonNull(address, "address cannot be null");
+            Objects.requireNonNull(port, "port cannot be null");
             Objects.requireNonNull(url, "url cannot be null");
             Objects.requireNonNull(errorText, "errorText cannot be null");
         }

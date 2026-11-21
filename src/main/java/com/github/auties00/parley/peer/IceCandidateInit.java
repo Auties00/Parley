@@ -7,7 +7,8 @@ import java.util.OptionalInt;
 /// An ICE candidate as signaling carries it, the W3C `RTCIceCandidateInit`.
 ///
 /// A trickled candidate names the media section it belongs to by its identification tag, its index, or both; the tag
-/// wins when both are present. An empty candidate string signals the end of candidates for that section.
+/// wins when both are present. An empty candidate string signals the end of candidates for that section, or, with
+/// neither a tag nor an index ([#endOfCandidates()]), for every section.
 ///
 /// @param candidate        the `candidate:` attribute text, with or without its `candidate:` prefix; empty for the
 ///                         end of candidates
@@ -25,13 +26,14 @@ public record IceCandidateInit(String candidate, Optional<String> sdpMid, Option
     /// @param sdpMid           the media section tag, or an empty optional
     /// @param sdpMLineIndex    the media section index, or an empty optional
     /// @param usernameFragment the username fragment, or an empty optional
-    /// @throws IllegalArgumentException if both `sdpMid` and `sdpMLineIndex` are empty, or the index is negative
+    /// @throws IllegalArgumentException if both `sdpMid` and `sdpMLineIndex` are empty while `candidate` is not
+    ///                                  blank, or the index is negative
     public IceCandidateInit {
         Objects.requireNonNull(candidate, "candidate cannot be null");
         Objects.requireNonNull(sdpMid, "sdpMid cannot be null");
         Objects.requireNonNull(sdpMLineIndex, "sdpMLineIndex cannot be null");
         Objects.requireNonNull(usernameFragment, "usernameFragment cannot be null");
-        if (sdpMid.isEmpty() && sdpMLineIndex.isEmpty()) {
+        if (sdpMid.isEmpty() && sdpMLineIndex.isEmpty() && !candidate.isBlank()) {
             throw new IllegalArgumentException("a candidate needs sdpMid or sdpMLineIndex");
         }
         if (sdpMLineIndex.isPresent() && sdpMLineIndex.getAsInt() < 0) {
@@ -45,6 +47,12 @@ public record IceCandidateInit(String candidate, Optional<String> sdpMid, Option
     /// @param sdpMid    the media section tag
     public static IceCandidateInit of(String candidate, String sdpMid) {
         return new IceCandidateInit(candidate, Optional.of(sdpMid), OptionalInt.empty(), Optional.empty());
+    }
+
+    /// {@return the end of the peer's candidates for every media section, the W3C `addIceCandidate` argument with an
+    /// empty candidate and neither `sdpMid` nor `sdpMLineIndex`}
+    public static IceCandidateInit endOfCandidates() {
+        return new IceCandidateInit("", Optional.empty(), OptionalInt.empty(), Optional.empty());
     }
 
     /// {@return whether this marks the end of candidates rather than carrying one}

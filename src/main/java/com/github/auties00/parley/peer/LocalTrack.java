@@ -1,9 +1,12 @@
 package com.github.auties00.parley.peer;
 
+import com.github.auties00.parley.event.EventSource;
+import com.github.auties00.parley.event.EventStream;
 import com.github.auties00.parley.media.EncodedFrame;
 import com.github.auties00.parley.media.MediaKind;
 
 import java.time.Duration;
+import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
@@ -16,19 +19,23 @@ import java.util.concurrent.atomic.AtomicLong;
 /// sender.
 ///
 /// Parley does not capture or encode: the application encodes frames with its own codec and writes them with
-/// [#write(EncodedFrame)]; every sender the track is attached to packetizes and sends them. In the other direction the
-/// track tells the encoder what the network asks for through its [events][#events()]: a key frame after a picture
-/// loss indication or full intra request from the peer, and the target bitrate the congestion controller allocates.
+/// [#write(EncodedFrame)]; every sender the track is attached to packetizes and sends them. A
+/// [forwarded track][#forwarded(String, MediaKind)] instead takes RTP packets received from another peer, as an SFU
+/// does. In the other direction the track tells the encoder what the network asks for through its
+/// [events][#events()]: a key frame after a picture loss indication or full intra request from the peer, the target
+/// bitrate the congestion controller allocates, and the encoding parameters the application or the negotiation set.
 ///
 /// {@snippet lang = java :
 /// var video = LocalTrack.video("camera");
-/// peerConnection.addTrack(video, List.of("stream-1"));
+/// var events = video.events();            // opened first: it also gets what addTrack raises
+/// peerConnection.addTrack(video, "stream-1");
 /// Thread.ofVirtual().start(() -> {
-///     try (var events = video.events()) {
+///     try (events) {
 ///         for (var event : events) {
 ///             switch (event) {
 ///                 case LocalTrackEvent.KeyframeRequested(var rid) -> encoder.forceKeyframe(rid);
 ///                 case LocalTrackEvent.TargetBitrateChanged(var rid, var bps) -> encoder.setBitrate(rid, bps);
+///                 case LocalTrackEvent.EncodingChanged(var rid, var encoding) -> encoder.configure(rid, encoding);
 ///                 case LocalTrackEvent.Ended() -> { }
 ///             }
 ///         }
@@ -42,26 +49,27 @@ import java.util.concurrent.atomic.AtomicLong;
 /// # Threading
 ///
 /// Every method is safe for concurrent use. [#write(EncodedFrame)] packetizes on the calling thread and hands the
-/// packets to the pacer without waiting for the network.
+/// packets to the pacer without waiting for the network. The track starts no thread of its own.
 ///
 /// @spec https://www.w3.org/TR/mediacapture-streams/ Media Capture and Streams
 /// @spec https://www.w3.org/TR/webrtc-encoded-transform/ WebRTC Encoded Transform
-public abstract sealed class LocalTrack permits LocalAudioTrack, LocalVideoTrack {
+public abstract sealed class LocalTrack permits LocalAudioTrack, LocalVideoTrack, LocalForwardedTrack {
     /// The track id, which `a=msid` carries.
     private final String id;
     /// The media kind.
     private final MediaKind kind;
     /// The senders the track feeds.
     private final CopyOnWriteArrayList<FrameSink> sinks = new CopyOnWriteArrayList<>();
-    /// The track events.
-    private final EventHub<LocalTrackEvent> events = new EventHub<>(Thread.ofVirtual().name("parley-track-", 0).factory());
+    /// The track events; bitrate and encoding changes of one layer coalesce.
+    private final EventSource<LocalTrackEvent> events = new EventSource<>(EventSource.DEFAULT_CAPACITY,
+            LocalTrack::coalescingKey);
     /// The last target bitrate per encoding, keyed by RTP stream id (`""` without simulcast).
     private final Map<String, Long> targets = new ConcurrentHashMap<>();
     /// The frames written.
     private final AtomicLong framesWritten = new AtomicLong();
     /// The key frames written.
     private final AtomicLong keyFramesWritten = new AtomicLong();
-    /// The frames dropped because the track was disabled or attached to no sender.
+    /// The frames or packets no sender took.
     private final AtomicLong framesDropped = new AtomicLong();
     /// Whether frames are sent.
     private volatile boolean enabled = true;
@@ -93,6 +101,15 @@ public abstract sealed class LocalTrack permits LocalAudioTrack, LocalVideoTrack
         return new LocalVideoTrack(id);
     }
 
+    /// {@return a new track that forwards RTP packets received from another peer, as an SFU does}
+    ///
+    /// @param id   the track id, 1 to 64 visible ASCII characters, which the peer sees in `a=msid`
+    /// @param kind the media kind of the packets
+    /// @throws IllegalArgumentException if `id` is not a valid track id
+    public static LocalForwardedTrack forwarded(String id, MediaKind kind) {
+        return new LocalForwardedTrack(id, kind);
+    }
+
     /// {@return the track id}
     public String id() {
         return id;
@@ -121,6 +138,20 @@ public abstract sealed class LocalTrack permits LocalAudioTrack, LocalVideoTrack
         return ended;
     }
 
+    /// {@return whether a frame written now would be sent: the track is enabled, not ended, and attached to a
+    /// sender whose transceiver is negotiated to send}
+    public boolean isSending() {
+        if (!enabled || ended) {
+            return false;
+        }
+        for (var sink : sinks) {
+            if (sink.isSending()) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     /// Ends the track: writes fail from now on, its senders send nothing more, and its event streams end after an
     /// [LocalTrackEvent.Ended] event. Idempotent.
     public void stop() {
@@ -133,8 +164,9 @@ public abstract sealed class LocalTrack permits LocalAudioTrack, LocalVideoTrack
 
     /// Writes one encoded frame to every sender the track is attached to.
     ///
-    /// A frame written while the track is disabled or attached to no negotiated sender is dropped. On a simulcast
-    /// sender the frame goes to the first encoding; [LocalVideoTrack#write(EncodedFrame, String)] targets a layer.
+    /// A frame no sender takes is dropped and counted in [#framesDropped()]: the track is disabled, attached to no
+    /// sender, or its senders are not negotiated yet or do not send. On a simulcast sender the frame goes to the
+    /// first encoding; [LocalVideoTrack#write(EncodedFrame, String)] targets a layer.
     ///
     /// @param frame the frame, whose RTP timestamp is in the clock rate of the negotiated codec
     /// @throws IllegalArgumentException if the frame's kind differs from the track's
@@ -149,36 +181,61 @@ public abstract sealed class LocalTrack permits LocalAudioTrack, LocalVideoTrack
         if (frame.kind() != kind) {
             throw new IllegalArgumentException("a " + kind + " track cannot carry a " + frame.kind() + " frame");
         }
-        if (ended) {
-            throw new IllegalStateException("the track has ended");
-        }
+        checkNotEnded();
         framesWritten.incrementAndGet();
         if (frame.keyframe()) {
             keyFramesWritten.incrementAndGet();
         }
-        if (!enabled || sinks.isEmpty()) {
-            framesDropped.incrementAndGet();
-            return;
+        var taken = false;
+        if (enabled) {
+            for (var sink : sinks) {
+                taken |= sink.accept(frame, rid);
+            }
         }
-        for (var sink : sinks) {
-            sink.accept(frame, rid);
+        if (!taken) {
+            framesDropped.incrementAndGet();
         }
     }
 
-    /// {@return a stream of the events raised from now on: key frame requests, target bitrates and the end}
+    /// Forwards a packet to every sender the track is attached to, counting it as dropped when none takes it.
+    void forward(FrameSink.Forwarded packet) {
+        checkNotEnded();
+        var taken = false;
+        if (enabled) {
+            for (var sink : sinks) {
+                taken |= sink.forward(packet);
+            }
+        }
+        if (!taken) {
+            framesDropped.incrementAndGet();
+        }
+    }
+
+    /// Fails when the track has ended.
+    private void checkNotEnded() {
+        if (ended) {
+            throw new IllegalStateException("the track has ended");
+        }
+    }
+
+    /// {@return a stream of the track's events: key frame requests, target bitrates, encoding changes and the end}
+    ///
+    /// The first stream opened also gets every event raised since the track was created.
     public EventStream<LocalTrackEvent> events() {
         return events.open();
     }
 
-    /// Waits for the next key frame request.
+    /// Waits for the next key frame request raised after this call.
     ///
     /// @param timeout the longest time to wait
     /// @return the request, or an empty optional when the timeout elapsed or the track ended
     /// @throws InterruptedException if the calling thread is interrupted while waiting
     public Optional<LocalTrackEvent.KeyframeRequested> awaitKeyframeRequest(Duration timeout)
             throws InterruptedException {
+        Objects.requireNonNull(timeout, "timeout cannot be null");
         var deadline = System.nanoTime() + timeout.toNanos();
-        try (var stream = events.open()) {
+        var stream = events.open();
+        try (stream) {
             while (true) {
                 var left = deadline - System.nanoTime();
                 if (left <= 0) {
@@ -224,7 +281,8 @@ public abstract sealed class LocalTrack permits LocalAudioTrack, LocalVideoTrack
         return keyFramesWritten.get();
     }
 
-    /// {@return the frames dropped because the track was disabled or attached to no sender}
+    /// {@return the frames (or, for a forwarded track, packets) written that no sender took: the track was disabled,
+    /// attached to no sender, its senders were not negotiated or not sending, or the layer was inactive}
     public long framesDropped() {
         return framesDropped.get();
     }
@@ -252,6 +310,23 @@ public abstract sealed class LocalTrack permits LocalAudioTrack, LocalVideoTrack
         if (!ended && (previous == null || previous != bitsPerSecond)) {
             events.publish(new LocalTrackEvent.TargetBitrateChanged(rid, bitsPerSecond));
         }
+    }
+
+    /// Raises the parameters of an encoding the track feeds.
+    void encodingChanged(Optional<String> rid, Encoding encoding) {
+        if (!ended) {
+            events.publish(new LocalTrackEvent.EncodingChanged(rid, encoding));
+        }
+    }
+
+    /// {@return the key under which an event replaces an undelivered one of the same layer}
+    private static Optional<?> coalescingKey(LocalTrackEvent event) {
+        return switch (event) {
+            case LocalTrackEvent.TargetBitrateChanged(var rid, var ignored) -> Optional.of(List.of("bitrate", rid));
+            case LocalTrackEvent.EncodingChanged(var rid, var ignored) -> Optional.of(List.of("encoding", rid));
+            case LocalTrackEvent.KeyframeRequested ignored -> Optional.empty();
+            case LocalTrackEvent.Ended ignored -> Optional.empty();
+        };
     }
 
     /// {@return the kind and id of the track}

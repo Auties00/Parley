@@ -491,7 +491,9 @@ class JsepTest {
             assertEquals(SignalingState.CLOSED, a.pc().signalingState());
             assertEquals(PeerConnectionState.CLOSED, a.pc().connectionState());
             assertTrue(a.backend().closed);
-            assertTrue(a.events().isClosed());
+            assertTrue(a.drain().getLast() instanceof PeerConnectionEvent.SignalingStateChanged(var state)
+                    && state == SignalingState.CLOSED);
+            assertTrue(a.events().isEnded());
             assertThrows(InvalidStateException.class, () -> a.pc().createOffer());
             a.pc().close();
         }
@@ -591,7 +593,8 @@ class JsepTest {
             a.pc().setLocalDescription(a.pc().createOffer());
             var transport = a.backend().gathering.getFirst().getKey();
             a.drain();
-            a.backend().listener.onLocalCandidate(transport, "1 1 udp 2122260223 192.0.2.1 5000 typ host");
+            a.backend().listener.onLocalCandidate(transport, "1 1 udp 2122260223 192.0.2.1 5000 typ host",
+                    Optional.empty(), Optional.empty());
             a.backend().listener.onGatheringState(transport, com.github.auties00.parley.ice.IceGatheringState.COMPLETE);
             var events = a.drain();
             var candidate = events.stream().filter(PeerConnectionEvent.IceCandidate.class::isInstance)
@@ -625,6 +628,8 @@ class JsepTest {
             assertEquals(1, b.backend().remoteCandidates.size());
             b.pc().addIceCandidate(IceCandidateInit.of("", "0"));
             assertEquals(1, b.backend().endedCandidates.size());
+            b.pc().addIceCandidate(IceCandidateInit.endOfCandidates());
+            assertEquals(2, b.backend().endedCandidates.size(), "the end of candidates for every section");
             assertThrows(OperationErrorException.class,
                     () -> b.pc().addIceCandidate(IceCandidateInit.of("candidate:3 1 udp 1 192.0.2.9 1 typ host", "9")));
             assertThrows(OperationErrorException.class, () -> b.pc().addIceCandidate(new IceCandidateInit(

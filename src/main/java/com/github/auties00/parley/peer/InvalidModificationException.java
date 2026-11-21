@@ -4,8 +4,10 @@ package com.github.auties00.parley.peer;
 ///
 /// Thrown, for example, by `setLocalDescription` with a description edited beyond what RFC 9429 section 5.4 allows, by `setParameters` with a different transaction id or encoding count, and by `setConfiguration` with another bundle policy.
 ///
+/// It extends [IllegalArgumentException], so callers that already catch the JDK type for a misuse catch it too.
+///
 /// @spec https://www.w3.org/TR/webrtc/ WebRTC: Real-Time Communication in Browsers
-public final class InvalidModificationException extends RuntimeException {
+public final class InvalidModificationException extends IllegalArgumentException {
     /// Creates the exception.
     ///
     /// @param message the detail message

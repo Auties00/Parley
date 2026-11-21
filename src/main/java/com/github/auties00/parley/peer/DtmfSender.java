@@ -1,16 +1,23 @@
 package com.github.auties00.parley.peer;
 
+import com.github.auties00.parley.event.EventSource;
+import com.github.auties00.parley.event.EventStream;
+import com.github.auties00.parley.net.MonotonicClock;
+
 import java.lang.System.Logger.Level;
 import java.time.Duration;
 import java.util.Locale;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.concurrent.ThreadFactory;
 
 /// Sends DTMF tones as RFC 4733 telephone events on an audio sender, the W3C `RTCDTMFSender`.
 ///
-/// [#insertDtmf(String, Duration, Duration)] queues tones and returns at once; a thread plays them one by one, each for
-/// its duration followed by the gap, and raises a [ToneChange] as each starts and once the buffer is empty. A comma
-/// pauses for two seconds. Calling it again replaces the tones not yet played.
+/// [#insertDtmf(String, Duration, Duration)] queues tones and returns at once; a thread of the connection's
+/// configured factory plays them one by one, each for its duration followed by the gap, timed by the configured
+/// clock, and raises a [ToneChange] as each starts and once the buffer is empty. A comma pauses for two seconds.
+/// Calling it again replaces the tones not yet played; the tones left are dropped when the sender stops sending or
+/// the connection closes.
 ///
 /// {@snippet lang = java :
 /// var dtmf = sender.dtmf().orElseThrow();
@@ -54,10 +61,14 @@ public final class DtmfSender {
 
     /// The sender this DTMF sender belongs to.
     private final RtpSender sender;
+    /// The factory of the player thread.
+    private final ThreadFactory threadFactory;
+    /// The clock tones and gaps are timed with.
+    private final MonotonicClock clock;
     /// Guards [#buffer], [#duration], [#gap] and [#player].
     private final Object lock = new Object();
     /// The tone events.
-    private final EventHub<ToneChange> events = new EventHub<>(Thread.ofVirtual().name("parley-dtmf-", 0).factory());
+    private final EventSource<ToneChange> events = new EventSource<>();
     /// The tones not yet played.
     private String buffer = "";
     /// The duration of each tone.
@@ -69,9 +80,11 @@ public final class DtmfSender {
     /// The wire side, installed once telephone-event is negotiated.
     private volatile ToneSink sink;
 
-    /// Creates the DTMF sender of `sender`.
-    DtmfSender(RtpSender sender) {
+    /// Creates the DTMF sender of `sender`, whose player threads `threadFactory` creates and `clock` times.
+    DtmfSender(RtpSender sender, ThreadFactory threadFactory, MonotonicClock clock) {
         this.sender = sender;
+        this.threadFactory = Objects.requireNonNull(threadFactory);
+        this.clock = Objects.requireNonNull(clock);
     }
 
     /// {@return whether tones can be sent now: the transceiver sends and the peer negotiated telephone-event}
@@ -123,24 +136,37 @@ public final class DtmfSender {
             duration = clamp(toneDuration, MIN_DURATION, MAX_DURATION);
             gap = interToneGap.compareTo(MIN_GAP) < 0 ? MIN_GAP : interToneGap;
             if (player == null && !buffer.isEmpty()) {
-                player = Thread.ofVirtual().name("parley-dtmf").start(this::play);
+                var thread = threadFactory.newThread(this::play);
+                if (thread == null) {
+                    buffer = "";
+                    throw new OperationErrorException("the thread factory refused to create the DTMF player");
+                }
+                player = thread;
+                thread.start();
             }
         }
     }
 
-    /// {@return a stream of the tone changes raised from now on}
+    /// {@return a stream of the tone changes}
+    ///
+    /// The first stream opened also gets the changes raised since the sender was created; the streams end when the
+    /// connection closes.
     public EventStream<ToneChange> events() {
         return events.open();
     }
 
     /// Plays the buffer until it is empty.
     private void play() {
+        var self = Thread.currentThread();
         try {
             while (true) {
                 char tone;
                 Duration toneDuration;
                 Duration toneGap;
                 synchronized (lock) {
+                    if (player != self) {
+                        return;
+                    }
                     if (buffer.isEmpty()) {
                         player = null;
                         events.publish(new ToneChange(Optional.empty()));
@@ -153,30 +179,66 @@ public final class DtmfSender {
                 }
                 events.publish(new ToneChange(Optional.of(tone)));
                 if (tone == ',') {
-                    Thread.sleep(COMMA_PAUSE);
+                    sleep(clock, COMMA_PAUSE);
                     continue;
                 }
                 var current = sink;
                 if (current == null) {
                     synchronized (lock) {
-                        buffer = "";
+                        if (player == self) {
+                            buffer = "";
+                        }
                     }
                     continue;
                 }
                 current.play(tone, toneDuration);
-                Thread.sleep(toneGap);
+                sleep(clock, toneGap);
             }
         } catch (InterruptedException exception) {
-            synchronized (lock) {
-                player = null;
-                buffer = "";
-            }
+            release(self);
         } catch (RuntimeException exception) {
             LOGGER.log(Level.WARNING, "DTMF playout failed", exception);
-            synchronized (lock) {
+            release(self);
+        }
+    }
+
+    /// Forgets the player and its tones, unless another player replaced it.
+    private void release(Thread self) {
+        synchronized (lock) {
+            if (player == self) {
                 player = null;
                 buffer = "";
             }
+        }
+    }
+
+    /// Drops the tones not yet played and stops the player, as when the sender stops sending.
+    void cancel() {
+        synchronized (lock) {
+            buffer = "";
+            if (player != null) {
+                player.interrupt();
+                player = null;
+            }
+        }
+    }
+
+    /// Cancels the tones and ends the event streams, as when the connection closes.
+    void close() {
+        cancel();
+        events.end();
+    }
+
+    /// Sleeps until `duration` has elapsed on `clock`, waking at most every 20 ms to read it again, so a clock
+    /// other than the system's still paces the tones.
+    static void sleep(MonotonicClock clock, Duration duration) throws InterruptedException {
+        var deadline = clock.nanos() + duration.toNanos();
+        while (true) {
+            var left = deadline - clock.nanos();
+            if (left <= 0) {
+                return;
+            }
+            Thread.sleep(Duration.ofNanos(Math.min(left, 20_000_000L)));
         }
     }
 

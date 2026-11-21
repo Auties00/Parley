@@ -63,6 +63,11 @@ final class LoopbackOnlyStack implements NetworkStack {
         return new LoopbackOnlyStack(NetworkStack.system(Thread.ofVirtual().name("it-net-", 0).factory()));
     }
 
+    /// {@return a loopback stack over the JDK's whose readers `threads` creates}
+    static LoopbackOnlyStack create(ThreadFactory threads) {
+        return new LoopbackOnlyStack(NetworkStack.system(threads));
+    }
+
     /// {@return a loopback stack whose TLS connections trust `context`}
     static LoopbackOnlyStack create(SSLContext context) {
         return new LoopbackOnlyStack(NetworkStack.system(Thread.ofVirtual().name("it-net-", 0).factory(), context));
