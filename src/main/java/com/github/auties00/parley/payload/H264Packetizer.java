@@ -61,19 +61,16 @@ final class H264Packetizer extends NalPacketizer {
     }
 
     @Override
-    List<ByteBuffer> fragment(ByteBuffer nal) {
+    void fragment(ByteBuffer nal, List<ByteBuffer> headers, List<ByteBuffer> bodies) {
         var header = nal.get(nal.position()) & 0xFF;
         var body = nal.slice(nal.position() + 1, nal.remaining() - 1);
         var fragments = Payloads.split(body, maxPayloadSize - 2);
-        var result = new ArrayList<ByteBuffer>(fragments.size());
         for (var k = 0; k < fragments.size(); k++) {
-            var fragment = fragments.get(k);
-            var out = ByteBuffer.allocate(2 + fragment.remaining());
-            out.put((byte) ((header & 0xE0) | FU_A));
-            out.put((byte) ((k == 0 ? 0x80 : 0) | (k == fragments.size() - 1 ? 0x40 : 0) | (header & 0x1F)));
-            out.put(fragment);
-            result.add(out.flip());
+            var unit = ByteBuffer.allocate(2);
+            unit.put((byte) ((header & 0xE0) | FU_A));
+            unit.put((byte) ((k == 0 ? 0x80 : 0) | (k == fragments.size() - 1 ? 0x40 : 0) | (header & 0x1F)));
+            headers.add(unit.flip());
+            bodies.add(fragments.get(k));
         }
-        return result;
     }
 }

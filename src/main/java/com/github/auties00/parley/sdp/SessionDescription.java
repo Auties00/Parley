@@ -59,7 +59,7 @@ public record SessionDescription(List<SdpLine> lines, List<MediaDescription> med
         var sections = new ArrayList<MediaDescription>();
         String mediaValue = null;
         var mediaLines = new ArrayList<SdpLine>();
-        for (var raw : text.split("\r?\n")) {
+        for (var raw : SdpPatterns.LINE_BREAK.split(text)) {
             var line = raw.strip();
             if (line.isEmpty()) {
                 continue;
@@ -263,7 +263,7 @@ public record SessionDescription(List<SdpLine> lines, List<MediaDescription> med
     /// {@return the address token of a `c=` value such as `IN IP4 203.0.113.7`: its third token without a multicast
     /// `/ttl` suffix, or an empty optional when the value has fewer than three tokens}
     static Optional<String> connectionAddressOf(String value) {
-        var tokens = value.trim().split(" +");
+        var tokens = SdpPatterns.SPACES.split(value.trim());
         if (tokens.length < 3) {
             return Optional.empty();
         }

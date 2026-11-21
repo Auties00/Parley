@@ -56,8 +56,12 @@ abstract sealed class NalPacketizer implements Packetizer permits H264Packetizer
     /// {@return an aggregation packet holding several NAL units}
     abstract ByteBuffer aggregate(List<ByteBuffer> nals);
 
-    /// {@return the fragmentation unit payloads of one NAL unit too large for a packet}
-    abstract List<ByteBuffer> fragment(ByteBuffer nal);
+    /// Splits one NAL unit too large for a packet into fragmentation units, each a header the packetizer writes and
+    /// a body that is a slice of the NAL unit.
+    ///
+    /// @param headers receives the fragmentation unit headers
+    /// @param bodies  receives the bodies, in step with `headers`
+    abstract void fragment(ByteBuffer nal, List<ByteBuffer> headers, List<ByteBuffer> bodies);
 
     @Override
     public final List<PacketizedPayload> packetize(EncodedFrame frame) {
@@ -70,6 +74,8 @@ abstract sealed class NalPacketizer implements Packetizer permits H264Packetizer
         }
         insertParameterSets(nals);
         var payloads = new ArrayList<ByteBuffer>();
+        // In step with `payloads`: the fragmentation unit header of a fragment, `null` for a whole payload
+        var headers = new ArrayList<ByteBuffer>();
         var i = 0;
         while (i < nals.size()) {
             var nal = nals.get(i);
@@ -78,7 +84,7 @@ abstract sealed class NalPacketizer implements Packetizer permits H264Packetizer
                     throw new IllegalArgumentException("NAL unit of " + nal.remaining()
                             + " bytes exceeds the payload size in single NAL unit mode");
                 }
-                payloads.addAll(fragment(nal));
+                fragment(nal, headers, payloads);
                 i++;
                 continue;
             }
@@ -95,10 +101,14 @@ abstract sealed class NalPacketizer implements Packetizer permits H264Packetizer
                 payloads.add(nal);
                 i++;
             }
+            headers.add(null);
         }
         var result = new ArrayList<PacketizedPayload>(payloads.size());
         for (var k = 0; k < payloads.size(); k++) {
-            result.add(PacketizedPayload.of(payloads.get(k), k == payloads.size() - 1));
+            var header = headers.get(k);
+            var marker = k == payloads.size() - 1;
+            result.add(header == null ? PacketizedPayload.of(payloads.get(k), marker)
+                    : PacketizedPayload.of(header, payloads.get(k), marker));
         }
         return List.copyOf(result);
     }

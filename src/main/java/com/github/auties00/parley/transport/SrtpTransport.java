@@ -97,6 +97,13 @@ public final class SrtpTransport implements RtpTransport {
     /// The lock held from protecting an outgoing packet until the path accepted it.
     private final ReentrantLock protectLock = new ReentrantLock();
 
+    /// The array a packet without tailroom is copied into and protected in, grown on demand and reused; guarded by
+    /// [#protectLock].
+    private byte[] protectScratch = new byte[0];
+
+    /// The buffer over [#protectScratch] handed to the path; guarded by [#protectLock].
+    private ByteBuffer protectScratchBuffer = ByteBuffer.wrap(protectScratch);
+
     /// The locks that serialize unprotection, indexed by `ssrc & 15`.
     private final ReentrantLock[] unprotectLocks = new ReentrantLock[UNPROTECT_STRIPES];
 
@@ -368,8 +375,8 @@ public final class SrtpTransport implements RtpTransport {
         return outbound;
     }
 
-    /// Protects a packet, in place when the buffer allows it, and sends it, under [#protectLock] so the wire order is
-    /// the index order.
+    /// Protects a packet, in place when the buffer allows it and otherwise in a reused array, and sends it, under
+    /// [#protectLock] so the wire order is the index order.
     private void protectAndSend(ByteBuffer packet, boolean rtcp) throws IOException {
         var length = packet.remaining();
         if (length < (rtcp ? MIN_RTCP_LENGTH : MIN_RTP_LENGTH)) {
@@ -380,21 +387,29 @@ public final class SrtpTransport implements RtpTransport {
             var transformer = requireOutbound();
             byte[] array;
             int offset;
+            ByteBuffer datagram;
             if (packet.hasArray() && !packet.isReadOnly()
                     && packet.capacity() - packet.limit() >= overhead) {
                 array = packet.array();
                 offset = packet.arrayOffset() + packet.position();
+                datagram = null;
             } else {
-                array = new byte[length + overhead];
-                packet.duplicate().get(array, 0, length);
+                if (protectScratch.length < length + overhead) {
+                    protectScratch = new byte[Math.max(length + overhead, 1500)];
+                    protectScratchBuffer = ByteBuffer.wrap(protectScratch);
+                }
+                array = protectScratch;
+                packet.get(packet.position(), array, 0, length);
                 offset = 0;
+                datagram = protectScratchBuffer;
             }
             var srtp = new SrtpPacket(array, offset, length);
             var status = rtcp ? transformer.protectRtcp(srtp) : transformer.protectRtp(srtp);
             if (status != SrtpErrorStatus.OK) {
                 throw new IOException((rtcp ? "SRTCP" : "SRTP") + " protection failed: " + status);
             }
-            sendPath.send(ByteBuffer.wrap(array, offset, srtp.length()));
+            sendPath.send(datagram == null ? ByteBuffer.wrap(array, offset, srtp.length())
+                    : datagram.limit(srtp.length()).position(0));
             if (rtcp) {
                 rtcpPacketsSent.increment();
                 rtcpBytesSent.add(srtp.length());
@@ -461,7 +476,9 @@ public final class SrtpTransport implements RtpTransport {
                 }
                 var receiver = rtcp ? rtcpReceiver : rtpReceiver;
                 try {
-                    receiver.receive(ByteBuffer.wrap(array, offset, srtp.length()).slice(), arrivalNanos);
+                    // A packet at the start of its array needs no slice to start at index 0
+                    var plain = ByteBuffer.wrap(array, offset, srtp.length());
+                    receiver.receive(offset == 0 ? plain : plain.slice(), arrivalNanos);
                 } catch (RuntimeException exception) {
                     if (LOGGER.isLoggable(Level.WARNING)) {
                         LOGGER.log(Level.WARNING, "an RTP receiver failed", exception);

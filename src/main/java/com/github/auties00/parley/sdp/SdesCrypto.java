@@ -93,7 +93,7 @@ public record SdesCrypto(int tag, SrtpCryptoSuite suite, byte[] keySalt, List<St
     ///                                  is not base64 of the suite's length
     public static SdesCrypto parse(String value) {
         Objects.requireNonNull(value, "value cannot be null");
-        var tokens = value.trim().split("\\s+");
+        var tokens = SdpPatterns.WHITESPACE.split(value.trim());
         if (tokens.length < 3 || !tokens[2].startsWith("inline:")) {
             throw new IllegalArgumentException("malformed crypto attribute: " + value);
         }

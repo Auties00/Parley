@@ -58,6 +58,23 @@ final class Payloads {
         return buffer.get(index) & 0xFF;
     }
 
+    /// {@return a frame of `total` bytes: each payload's bytes after its first `skips[i]`, in order}
+    ///
+    /// @param payloads the payloads, from position to limit
+    /// @param skips    the descriptor bytes to leave out at the start of each payload
+    /// @param total    the frame size, the sum of what each payload contributes
+    static byte[] join(ByteBuffer[] payloads, int[] skips, int total) {
+        var data = new byte[total];
+        var at = 0;
+        for (var index = 0; index < payloads.length; index++) {
+            var payload = payloads[index];
+            var length = payload.remaining() - skips[index];
+            payload.get(payload.position() + skips[index], data, at, length);
+            at += length;
+        }
+        return data;
+    }
+
     /// {@return the fragments of a body (a NAL unit without its header, a frame), as slices balanced so they differ
     /// in size by at most one byte}
     ///

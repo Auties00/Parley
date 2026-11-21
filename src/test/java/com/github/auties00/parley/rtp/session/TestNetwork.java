@@ -79,7 +79,11 @@ final class TestNetwork {
             assertTrue(plainRtp.capacity() - plainRtp.limit() >= OVERHEAD, "missing SRTP tailroom");
             var bytes = new byte[plainRtp.remaining()];
             plainRtp.duplicate().get(bytes);
-            Arrays.fill(plainRtp.array(), plainRtp.position(), plainRtp.limit(), (byte) 0x5A);
+            // Clobbers the packet as in-place protection would, which the transport contract allows only for a
+            // writable buffer
+            if (!plainRtp.isReadOnly()) {
+                Arrays.fill(plainRtp.array(), plainRtp.position(), plainRtp.limit(), (byte) 0x5A);
+            }
             try {
                 var packet = RtpPacket.parse(ByteBuffer.wrap(bytes));
                 sentRtp.add(packet);

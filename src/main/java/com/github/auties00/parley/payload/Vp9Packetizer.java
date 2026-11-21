@@ -95,10 +95,10 @@ final class Vp9Packetizer implements Packetizer {
             var fragment = fragments.get(k);
             var begin = k == 0;
             var end = k == fragments.size() - 1;
-            var out = ByteBuffer.allocate(baseSize + (begin ? structureSize : 0) + fragment.remaining());
-            writeDescriptor(out, metadata, begin, end, layered, tl0, begin && structureSize > 0);
-            out.put(fragment);
-            result.add(PacketizedPayload.of(out.flip(), end && metadata.endOfPicture()));
+            // The descriptor is the header; the fragment, a slice of the frame, is the body
+            var descriptor = ByteBuffer.allocate(baseSize + (begin ? structureSize : 0));
+            writeDescriptor(descriptor, metadata, begin, end, layered, tl0, begin && structureSize > 0);
+            result.add(PacketizedPayload.of(descriptor.flip(), fragment, end && metadata.endOfPicture()));
         }
         return List.copyOf(result);
     }

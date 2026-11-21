@@ -48,7 +48,7 @@ public record Origin(String username, String sessionId, long sessionVersion, Str
     /// @param value the text after `o=`
     public static Optional<Origin> parse(String value) {
         Objects.requireNonNull(value, "value cannot be null");
-        var tokens = value.trim().split(" +");
+        var tokens = SdpPatterns.SPACES.split(value.trim());
         if (tokens.length != 6) {
             return Optional.empty();
         }

@@ -50,7 +50,7 @@ public record MediaDescription(String media, int port, String protocol, List<Str
     /// @return the media section
     /// @throws IllegalArgumentException if the `m=` value has fewer than three tokens or a malformed port
     static MediaDescription parse(String value, List<SdpLine> lines) {
-        var tokens = value.trim().split(" +");
+        var tokens = SdpPatterns.SPACES.split(value.trim());
         if (tokens.length < 3) {
             throw new IllegalArgumentException("malformed m= line: " + value);
         }

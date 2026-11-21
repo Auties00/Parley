@@ -112,6 +112,13 @@
                 <groupId>org.apache.maven.plugins</groupId>
                 <artifactId>maven-surefire-plugin</artifactId>
                 <version>${maven.surefire.plugin.version}</version>
+                <configuration>
+                    <!--
+                        Resolves the optional Vector API module, so the vectorized byte kernels run; -Dparley.vector=false
+                        runs the same tests on the scalar kernels.
+                    -->
+                    <argLine>--add-modules jdk.incubator.vector</argLine>
+                </configuration>
             </plugin>
             <!--
                 Configured outside the release profile so a plain javadoc:javadoc run lints the comments the same way:

@@ -94,7 +94,21 @@ public final class Red {
     /// @return the payload, positioned at zero
     /// @throws IllegalArgumentException if a redundant block's offset or length does not fit its header
     public static ByteBuffer encode(List<Redundant> redundant, int primaryPayloadType, ByteBuffer primary) {
-        var length = 1 + primary.remaining();
+        var header = encodeHeader(redundant, primaryPayloadType);
+        return ByteBuffer.allocate(header.remaining() + primary.remaining()).put(header).put(primary.duplicate())
+                .flip();
+    }
+
+    /// Writes everything of a RED payload that precedes the primary block's data: the block headers and the
+    /// redundant data. A sender writes it and then the primary data into the packet, so the primary block, the bulk
+    /// of the payload, is copied once.
+    ///
+    /// @param redundant          the redundant blocks, oldest first; their data are copied
+    /// @param primaryPayloadType the payload type of the primary encoding
+    /// @return a new buffer, from position zero to its limit
+    /// @throws IllegalArgumentException if a block's timestamp offset or length does not fit its field
+    public static ByteBuffer encodeHeader(List<Redundant> redundant, int primaryPayloadType) {
+        var length = 1;
         for (var block : redundant) {
             if (block.timestampOffset() < 0 || block.timestampOffset() > MAX_TIMESTAMP_OFFSET) {
                 throw new IllegalArgumentException("timestamp offset does not fit 14 bits: "
@@ -115,7 +129,6 @@ public final class Red {
         for (var block : redundant) {
             out.put(block.data().duplicate());
         }
-        out.put(primary.duplicate());
         return out.flip();
     }
 }

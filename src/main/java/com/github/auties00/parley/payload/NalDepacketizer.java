@@ -6,7 +6,6 @@ import com.github.auties00.parley.media.MediaKind;
 import com.github.auties00.parley.media.Resolution;
 import com.github.auties00.parley.rtp.RtpPacket;
 
-import java.io.ByteArrayOutputStream;
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.HashSet;
@@ -144,9 +143,13 @@ abstract sealed class NalDepacketizer implements Depacketizer permits H264Depack
     @Override
     public final EncodedFrame assemble(List<RtpPacket> packetsOfOneFrame) throws PayloadFormatException {
         Payloads.checkRun(packetsOfOneFrame);
+        // Whole NAL units stay views of the packets, which outlive this call; a fragmented one is joined once, into
+        // an array of its exact size, from the fragments collected until its end
         var nals = new ArrayList<ByteBuffer>();
         var dons = new ArrayList<Integer>();
-        ByteArrayOutputStream pending = null;
+        List<ByteBuffer> pending = null;
+        byte[] pendingHeader = null;
+        var pendingSize = 0;
         var pendingDon = -1;
         for (var packet : packetsOfOneFrame) {
             for (var unit : units(packet.payload())) {
@@ -155,7 +158,7 @@ abstract sealed class NalDepacketizer implements Depacketizer permits H264Depack
                         if (pending != null) {
                             throw new PayloadFormatException("NAL unit inside an unfinished fragmented NAL unit");
                         }
-                        nals.add(NalUnits.copy(whole.nal()));
+                        nals.add(whole.nal());
                         dons.add(whole.don().orElse(-1));
                     }
                     case Unit.Fragment fragment -> {
@@ -163,17 +166,25 @@ abstract sealed class NalDepacketizer implements Depacketizer permits H264Depack
                             if (pending != null) {
                                 throw new PayloadFormatException("fragmentation unit restarted before its end");
                             }
-                            pending = new ByteArrayOutputStream();
-                            pending.writeBytes(fragment.header());
+                            pending = new ArrayList<>();
+                            pendingHeader = fragment.header();
+                            pendingSize = pendingHeader.length;
                             pendingDon = fragment.don().orElse(-1);
                         } else if (pending == null) {
                             throw new PayloadFormatException("fragmentation unit without its start");
                         }
-                        var bytes = new byte[fragment.data().remaining()];
-                        fragment.data().get(fragment.data().position(), bytes);
-                        pending.writeBytes(bytes);
+                        pending.add(fragment.data());
+                        pendingSize += fragment.data().remaining();
                         if (fragment.end()) {
-                            nals.add(ByteBuffer.wrap(pending.toByteArray()).asReadOnlyBuffer());
+                            var nal = new byte[pendingSize];
+                            System.arraycopy(pendingHeader, 0, nal, 0, pendingHeader.length);
+                            var at = pendingHeader.length;
+                            for (var index = 0; index < pending.size(); index++) {
+                                var data = pending.get(index);
+                                data.get(data.position(), nal, at, data.remaining());
+                                at += data.remaining();
+                            }
+                            nals.add(ByteBuffer.wrap(nal).asReadOnlyBuffer());
                             dons.add(pendingDon);
                             pending = null;
                         }
@@ -226,14 +237,23 @@ abstract sealed class NalDepacketizer implements Depacketizer permits H264Depack
             }
             nals.addAll(firstRandomAccess, missing);
         }
-        var out = new ByteArrayOutputStream();
         var types = new ArrayList<Integer>(nals.size());
-        for (var nal : nals) {
-            NalUnits.appendAnnexB(out, nal);
+        var total = 0;
+        for (var index = 0; index < nals.size(); index++) {
+            total += NalUnits.START_CODE.length + nals.get(index).remaining();
+        }
+        var out = new byte[total];
+        var at = 0;
+        for (var index = 0; index < nals.size(); index++) {
+            var nal = nals.get(index);
+            System.arraycopy(NalUnits.START_CODE, 0, out, at, NalUnits.START_CODE.length);
+            at += NalUnits.START_CODE.length;
+            nal.get(nal.position(), out, at, nal.remaining());
+            at += nal.remaining();
             types.add(type(nal));
         }
         var first = packetsOfOneFrame.getFirst();
-        return new EncodedFrame(MediaKind.VIDEO, ByteBuffer.wrap(out.toByteArray()), first.timestamp(), keyframe,
+        return new EncodedFrame(MediaKind.VIDEO, ByteBuffer.wrap(out), first.timestamp(), keyframe,
                 Optional.empty(), metadata(firstRandomAccess >= 0, temporal, types,
                 resolution.isPresent() ? resolution : lastResolution));
     }

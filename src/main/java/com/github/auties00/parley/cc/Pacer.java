@@ -95,6 +95,13 @@ public final class Pacer implements OutgoingPacketScheduler, AutoCloseable {
     /// The queues the time bound drops from: every one but audio.
     private static final Priority[] DROPPABLE = {Priority.RETRANSMISSION, Priority.VIDEO, Priority.PADDING};
 
+    /// Every priority, highest first; [Priority#values()] would clone the array on every call.
+    private static final Priority[] PRIORITIES = Priority.values();
+
+    /// What [#nextAction(long)] returns when it chose an action, which it leaves in the `action` fields, rather
+    /// than a wake-up time.
+    private static final long ACTION_READY = Long.MIN_VALUE;
+
     private record Queued(ByteBuffer packet, Priority priority, long ssrc, PacketSink sink, long enqueuedNanos,
                           int size) {
     }
@@ -114,20 +121,20 @@ public final class Pacer implements OutgoingPacketScheduler, AutoCloseable {
         }
     }
 
-    private sealed interface Action {
-        record Media(Queued packet, ProbeState probe) implements Action {
-        }
-
-        record Padding(int bytes, ProbeState probe) implements Action {
-        }
-    }
-
     private final MonotonicClock clock;
     private final boolean paceAudio;
     private final long maxQueueTimeNanos;
     private final Consumer<? super Throwable> failureListener;
     private final ReentrantLock lock;
     private final Condition wake;
+
+    /// The packet of the action [#nextAction(long)] chose, or `null` for padding; guarded by [#lock] and read by
+    /// [#process(long)] before it releases the lock.
+    private Queued actionPacket;
+    /// The probe cluster of the chosen action, or `null`.
+    private ProbeState actionProbe;
+    /// The padding bytes of a chosen padding action.
+    private int actionPaddingBytes;
     private final EnumMap<Priority, ArrayDeque<Queued>> queues;
     private final ArrayDeque<ProbeState> probes;
     private final AlrDetector alr;
@@ -197,13 +204,18 @@ public final class Pacer implements OutgoingPacketScheduler, AutoCloseable {
             if (closed) {
                 return;
             }
+            var wasEmpty = queuedPackets == 0;
             var queued = new Queued(plainRtp, priority, ssrc, sink, now, plainRtp.remaining());
             queues.get(level(priority)).addLast(queued);
             queuedBytes += queued.size();
             queuedPackets++;
             enforceQueueBound(now);
-            signalled = true;
-            wake.signalAll();
+            // A packet behind others leaves the pacer's wake-up, set by the budget, where it is; waking it is only
+            // needed when it idles with nothing queued, or for audio, which may leave without waiting for the budget
+            if (wasEmpty || priority == Priority.AUDIO) {
+                signalled = true;
+                wake.signalAll();
+            }
         } finally {
             lock.unlock();
         }
@@ -311,7 +323,7 @@ public final class Pacer implements OutgoingPacketScheduler, AutoCloseable {
         lock.lock();
         try {
             var oldest = oldestEnqueueNanos();
-            return oldest.isPresent() ? Duration.ofNanos(Math.max(0, now - oldest.getAsLong())) : Duration.ZERO;
+            return oldest != Long.MAX_VALUE ? Duration.ofNanos(Math.max(0, now - oldest)) : Duration.ZERO;
         } finally {
             lock.unlock();
         }
@@ -457,7 +469,9 @@ public final class Pacer implements OutgoingPacketScheduler, AutoCloseable {
     /// @return when the pacer next has something to do
     long process(long nowNanos) {
         while (true) {
-            Action action;
+            Queued packet;
+            ProbeState probe;
+            int paddingBytes;
             lock.lock();
             try {
                 if (closed) {
@@ -466,36 +480,32 @@ public final class Pacer implements OutgoingPacketScheduler, AutoCloseable {
                 advance(nowNanos);
                 enforceQueueBound(nowNanos);
                 var next = nextAction(nowNanos);
-                if (next instanceof NextWake(var wakeNanos)) {
-                    return wakeNanos;
+                if (next != ACTION_READY) {
+                    return next;
                 }
-                action = ((Next) next).action();
+                packet = actionPacket;
+                probe = actionProbe;
+                paddingBytes = actionPaddingBytes;
+                actionPacket = null;
+                actionProbe = null;
             } finally {
                 lock.unlock();
             }
-            perform(action, nowNanos);
+            perform(packet, probe, paddingBytes, nowNanos);
         }
     }
 
-    private sealed interface Step {
-    }
-
-    private record NextWake(long nanos) implements Step {
-    }
-
-    private record Next(Action action) implements Step {
-    }
-
-    private Step nextAction(long nowNanos) {
+    /// {@return the time to wake up at, or [#ACTION_READY] with the chosen action in the `action` fields}
+    private long nextAction(long nowNanos) {
         if (congested) {
             var audio = queues.get(Priority.AUDIO).peekFirst();
             if (audio != null && (!paceAudio || mediaDebtBytes <= 0)) {
-                return new Next(new Action.Media(poll(Priority.AUDIO), null));
+                return media(poll(Priority.AUDIO), null);
             }
             if (audio != null) {
-                return new NextWake(nowNanos + Math.max(1, (long) (mediaDebtBytes * 8e9 / effectiveRate(nowNanos))));
+                return nowNanos + Math.max(1, (long) (mediaDebtBytes * 8e9 / effectiveRate(nowNanos)));
             }
-            return new NextWake(nowNanos + IDLE_NANOS);
+            return nowNanos + IDLE_NANOS;
         }
         while (!probes.isEmpty()) {
             var probe = probes.peekFirst();
@@ -510,56 +520,74 @@ public final class Pacer implements OutgoingPacketScheduler, AutoCloseable {
             if (dueNanos > nowNanos) {
                 var audio = queues.get(Priority.AUDIO).peekFirst();
                 if (audio != null && !paceAudio) {
-                    return new Next(new Action.Media(poll(Priority.AUDIO), null));
+                    return media(poll(Priority.AUDIO), null);
                 }
-                return new NextWake(dueNanos);
+                return dueNanos;
             }
             var packet = pollHighest();
             if (packet != null) {
-                return new Next(new Action.Media(packet, probe));
+                return media(packet, probe);
             }
             if (paddingSource == null) {
                 probes.removeFirst();
                 continue;
             }
             var bytes = Math.clamp(probe.cluster.minBytes() - probe.bytesSent, MIN_PADDING_BYTES, MAX_PADDING_BYTES);
-            return new Next(new Action.Padding(bytes, probe));
+            return padding(bytes, probe);
         }
         var highest = peekHighest();
         if (highest != null) {
             if ((highest.priority() == Priority.AUDIO && !paceAudio) || mediaDebtBytes <= 0) {
-                return new Next(new Action.Media(poll(highest.priority()), null));
+                return media(poll(highest.priority()), null);
             }
-            return new NextWake(nowNanos + Math.max(1, (long) (mediaDebtBytes * 8e9 / effectiveRate(nowNanos))));
+            return nowNanos + Math.max(1, (long) (mediaDebtBytes * 8e9 / effectiveRate(nowNanos)));
         }
         if (paddingRateBps > 0 && mediaSent && paddingSource != null) {
             if (paddingDebtBytes <= 0) {
                 var bytes = Math.clamp(paddingRateBps * PADDING_STEP_NANOS / 8 / 1_000_000_000L,
                         MIN_PADDING_BYTES, MAX_PADDING_BYTES);
-                return new Next(new Action.Padding(bytes, null));
+                return padding(bytes, null);
             }
-            return new NextWake(nowNanos + Math.max(1, (long) (paddingDebtBytes * 8e9 / paddingRateBps)));
+            return nowNanos + Math.max(1, (long) (paddingDebtBytes * 8e9 / paddingRateBps));
         }
-        return new NextWake(nowNanos + IDLE_NANOS);
+        return nowNanos + IDLE_NANOS;
     }
 
-    private void perform(Action action, long nowNanos) {
-        switch (action) {
-            case Action.Media(var packet, var probe) -> {
-                var sent = send(packet.packet(), packet.sink(), probe);
-                account(packet.size(), probe, sent, nowNanos);
-            }
-            case Action.Padding(var bytes, var probe) -> {
-                OutgoingPacketScheduler.PaddingSource source;
-                lock.lock();
-                try {
-                    source = paddingSource;
-                } finally {
-                    lock.unlock();
-                }
-                sendPadding(source, bytes, probe, nowNanos);
-            }
+    /// Chooses sending `packet` as the next action.
+    ///
+    /// @return [#ACTION_READY]
+    private long media(Queued packet, ProbeState probe) {
+        actionPacket = packet;
+        actionProbe = probe;
+        return ACTION_READY;
+    }
+
+    /// Chooses sending `bytes` of padding as the next action.
+    ///
+    /// @return [#ACTION_READY]
+    private long padding(int bytes, ProbeState probe) {
+        actionPacket = null;
+        actionProbe = probe;
+        actionPaddingBytes = bytes;
+        return ACTION_READY;
+    }
+
+    /// Performs the action [#nextAction(long)] chose: sends `packet`, or asks for `paddingBytes` of padding when it
+    /// is `null`.
+    private void perform(Queued packet, ProbeState probe, int paddingBytes, long nowNanos) {
+        if (packet != null) {
+            var sent = send(packet.packet(), packet.sink(), probe);
+            account(packet.size(), probe, sent, nowNanos);
+            return;
         }
+        OutgoingPacketScheduler.PaddingSource source;
+        lock.lock();
+        try {
+            source = paddingSource;
+        } finally {
+            lock.unlock();
+        }
+        sendPadding(source, paddingBytes, probe, nowNanos);
     }
 
     /// Asks the session's padding source for `bytes` of padding inside the probe binding, and accounts what it sent.
@@ -682,27 +710,28 @@ public final class Pacer implements OutgoingPacketScheduler, AutoCloseable {
         double rate = pacingRateBps;
         if (queuedBytes > 0) {
             var oldest = oldestEnqueueNanos();
-            if (oldest.isPresent()) {
-                var timeLeft = Math.max(1_000_000L, maxQueueTimeNanos - (nowNanos - oldest.getAsLong()));
+            if (oldest != Long.MAX_VALUE) {
+                var timeLeft = Math.max(1_000_000L, maxQueueTimeNanos - (nowNanos - oldest));
                 rate = Math.max(rate, queuedBytes * 8e9 / timeLeft);
             }
         }
         return rate;
     }
 
-    private OptionalLong oldestEnqueueNanos() {
+    private long oldestEnqueueNanos() {
         var oldest = Long.MAX_VALUE;
-        for (var queue : queues.values()) {
-            var first = queue.peekFirst();
+        for (var priority : PRIORITIES) {
+            var queue = queues.get(priority);
+            var first = queue == null ? null : queue.peekFirst();
             if (first != null && first.enqueuedNanos() < oldest) {
                 oldest = first.enqueuedNanos();
             }
         }
-        return oldest == Long.MAX_VALUE ? OptionalLong.empty() : OptionalLong.of(oldest);
+        return oldest;
     }
 
     private Queued peekHighest() {
-        for (var priority : Priority.values()) {
+        for (var priority : PRIORITIES) {
             var first = queues.get(priority).peekFirst();
             if (first != null) {
                 return first;

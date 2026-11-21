@@ -143,7 +143,10 @@ class VideoRoundTripTest {
         var out = new ByteArrayOutputStream();
         var units = new ArrayList<>(NalUnits.splitAnnexB(ByteBuffer.wrap(stream)));
         for (var unit : units) {
-            NalUnits.appendAnnexB(out, unit);
+            out.writeBytes(NalUnits.START_CODE);
+            var bytes = new byte[unit.remaining()];
+            unit.get(unit.position(), bytes);
+            out.writeBytes(bytes);
         }
         return out.toByteArray();
     }

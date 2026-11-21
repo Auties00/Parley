@@ -157,7 +157,7 @@ public sealed interface SdpAttribute {
     /// {@return the whitespace-separated tokens of `value`, without empty ones}
     private static String[] tokens(String value) {
         var trimmed = value.trim();
-        return trimmed.isEmpty() ? new String[0] : trimmed.split("[ \t]+");
+        return trimmed.isEmpty() ? new String[0] : SdpPatterns.BLANKS.split(trimmed);
     }
 
     /// {@return `value` parsed as a decimal `int`}
@@ -378,7 +378,7 @@ public sealed interface SdpAttribute {
 
         /// Parses the value after `a=rtcp-fb:`.
         private static RtcpFb parseValue(String value) {
-            var parts = value.strip().split("[ \t]+", 3);
+            var parts = SdpPatterns.BLANKS.split(value.strip(), 3);
             if (parts.length < 2) {
                 throw new IllegalArgumentException("malformed rtcp-fb");
             }
@@ -430,7 +430,7 @@ public sealed interface SdpAttribute {
 
         /// Parses the value after `a=extmap:`.
         private static Extmap parseValue(String value) {
-            var parts = value.strip().split("[ \t]+", 3);
+            var parts = SdpPatterns.BLANKS.split(value.strip(), 3);
             if (parts.length < 2) {
                 throw new IllegalArgumentException("malformed extmap");
             }
@@ -496,7 +496,7 @@ public sealed interface SdpAttribute {
 
         /// Parses the value after `a=ssrc:`.
         private static Ssrc parseValue(String value) {
-            var parts = value.strip().split("[ \t]+", 2);
+            var parts = SdpPatterns.BLANKS.split(value.strip(), 2);
             if (parts.length < 2) {
                 throw new IllegalArgumentException("malformed ssrc");
             }
@@ -772,7 +772,7 @@ public sealed interface SdpAttribute {
 
         /// Parses the value after `a=rid:`.
         private static Rid parseValue(String value) {
-            var parts = value.strip().split("[ \t]+", 3);
+            var parts = SdpPatterns.BLANKS.split(value.strip(), 3);
             if (parts.length < 2) {
                 throw new IllegalArgumentException("malformed rid");
             }
@@ -1119,7 +1119,7 @@ public sealed interface SdpAttribute {
         public Fingerprint {
             hashFunction = token(hashFunction, "hash function").toLowerCase(Locale.ROOT);
             fingerprint = token(fingerprint, "fingerprint").toUpperCase(Locale.ROOT);
-            if (!fingerprint.matches("[0-9A-F]{2}(:[0-9A-F]{2})*")) {
+            if (!SdpPatterns.FINGERPRINT.matcher(fingerprint).matches()) {
                 throw new IllegalArgumentException("malformed fingerprint");
             }
         }
@@ -1274,7 +1274,7 @@ public sealed interface SdpAttribute {
 
         /// Parses the value after `a=rtcp:`.
         private static Rtcp parseValue(String value) {
-            var parts = value.strip().split("[ \t]+", 2);
+            var parts = SdpPatterns.BLANKS.split(value.strip(), 2);
             return new Rtcp(integer(parts[0]), parts.length == 2 ? Optional.of(parts[1]) : Optional.empty());
         }
 

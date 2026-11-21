@@ -142,6 +142,21 @@ public final class FecEncoder {
         return format;
     }
 
+    /// Adds a media packet to the current batch, keeping the packet itself rather than a copy.
+    ///
+    /// The encoder reads the packet's bytes until the next [#flush()] returns (the row and column scheme only while
+    /// this method runs), so the caller must not change them before then: a sender that builds a frame's repair
+    /// packets before sending any of the frame's packets passes them here and saves a copy per packet.
+    ///
+    /// @param media the packet, as sent (before RED encapsulation for ULPFEC)
+    public void addOwned(RtpPacket media) {
+        if (scheme == Scheme.ROW_COLUMN) {
+            addToBlock(media);
+        } else {
+            batch.add(media);
+        }
+    }
+
     /// Adds a media packet to the current batch.
     ///
     /// @param media the packet, as sent (before RED encapsulation for ULPFEC); its bytes are copied

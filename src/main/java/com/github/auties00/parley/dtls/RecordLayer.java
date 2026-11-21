@@ -206,12 +206,25 @@ final class RecordLayer {
         if (state.cipher13 != null) {
             return new EncodedRecord(encode13(state.cipher13, type, epoch, sequence, payload), epoch, sequence);
         }
-        var fragment = state.cipher12 == null
-                ? payload
-                : state.cipher12.seal(epoch << 48 | sequence, type, recordVersion, payload);
-        var record = new TlsWriter(PLAINTEXT_HEADER_LENGTH + fragment.length)
-                .u8(type).u16(recordVersion).u16((int) epoch).u48(sequence).u16(fragment.length).bytes(fragment)
-                .toByteArray();
+        // The header and the protected fragment are written into one array of the record's size
+        var fragmentLength = state.cipher12 == null ? payload.length : state.cipher12.overhead() + payload.length;
+        var record = new byte[PLAINTEXT_HEADER_LENGTH + fragmentLength];
+        record[0] = (byte) type;
+        record[1] = (byte) (recordVersion >>> 8);
+        record[2] = (byte) recordVersion;
+        record[3] = (byte) (epoch >>> 8);
+        record[4] = (byte) epoch;
+        for (var index = 0; index < 6; index++) {
+            record[5 + index] = (byte) (sequence >>> (40 - 8 * index));
+        }
+        record[11] = (byte) (fragmentLength >>> 8);
+        record[12] = (byte) fragmentLength;
+        if (state.cipher12 == null) {
+            System.arraycopy(payload, 0, record, PLAINTEXT_HEADER_LENGTH, payload.length);
+        } else {
+            state.cipher12.sealInto(epoch << 48 | sequence, type, recordVersion, payload, record,
+                    PLAINTEXT_HEADER_LENGTH);
+        }
         return new EncodedRecord(record, epoch, sequence);
     }
 

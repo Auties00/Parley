@@ -6,11 +6,7 @@ import com.github.auties00.parley.stun.StunAttribute.MessageIntegrity;
 import com.github.auties00.parley.stun.StunAttribute.MessageIntegritySha256;
 import com.github.auties00.parley.stun.StunAttribute.Unknown;
 
-import javax.crypto.Mac;
-import javax.crypto.spec.SecretKeySpec;
 import java.nio.ByteBuffer;
-import java.security.GeneralSecurityException;
-import java.security.MessageDigest;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Objects;
@@ -528,19 +524,14 @@ public final class StunMessage {
     /// {@return the HMAC of the first `coveredLength` bytes of `message` (its offset `0`), with the header length
     /// field replaced by `lengthInHeader`}
     private static byte[] hmac(String algorithm, StunKey key, ByteBuffer message, int coveredLength, int lengthInHeader) {
-        try {
-            var mac = Mac.getInstance(algorithm);
-            mac.init(new SecretKeySpec(key.bytes(), algorithm));
-            var header = new byte[HEADER_LENGTH];
-            message.get(0, header);
-            header[2] = (byte) (lengthInHeader >>> 8);
-            header[3] = (byte) lengthInHeader;
-            mac.update(header);
-            mac.update(message.slice(HEADER_LENGTH, coveredLength - HEADER_LENGTH));
-            return mac.doFinal();
-        } catch (GeneralSecurityException exception) {
-            throw new IllegalStateException(algorithm + " unavailable", exception);
-        }
+        var mac = StunMacs.get(algorithm, key.bytes());
+        var header = new byte[HEADER_LENGTH];
+        message.get(0, header);
+        header[2] = (byte) (lengthInHeader >>> 8);
+        header[3] = (byte) lengthInHeader;
+        mac.update(header);
+        mac.update(message.slice(HEADER_LENGTH, coveredLength - HEADER_LENGTH));
+        return mac.doFinal();
     }
 
     /// {@return the `FINGERPRINT` value of the first `coveredLength` bytes of `message`, with the header length
@@ -563,11 +554,12 @@ public final class StunMessage {
         if (length > expected.length) {
             return false;
         }
-        var actual = new byte[length];
-        message.get(offset, actual);
-        var truncated = new byte[length];
-        System.arraycopy(expected, 0, truncated, 0, length);
-        return MessageDigest.isEqual(truncated, actual);
+        // Constant time: every byte is compared whatever the earlier ones were
+        var difference = 0;
+        for (var i = 0; i < length; i++) {
+            difference |= expected[i] ^ message.get(offset + i);
+        }
+        return difference == 0;
     }
 
     /// {@return whether `other` is a message with the same class, method, transaction id and attributes}

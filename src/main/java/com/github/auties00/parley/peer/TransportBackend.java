@@ -1088,7 +1088,7 @@ final class TransportBackend implements PeerBackend {
                 var payloads = new ArrayList<RtpSendStream.Payload>();
                 synchronized (packetizer) {
                     for (var payload : packetizer.packetize(frame)) {
-                        payloads.add(new RtpSendStream.Payload(payload.payload(), payload.marker(),
+                        payloads.add(new RtpSendStream.Payload(payload.header(), payload.body(), payload.marker(),
                                 payload.extensions()));
                     }
                 }

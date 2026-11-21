@@ -40,6 +40,10 @@ final class Dtls12RecordCipher {
     /// The cipher, re-initialized per record.
     private final Cipher cipher;
 
+    /// The additional data of the record being protected or opened, rewritten for each; the cipher, which the record
+    /// layer uses from one thread at a time, consumes it before the next record.
+    private final byte[] aad = new byte[13];
+
     /// Creates the protection of one direction.
     ///
     /// @param aead the algorithm
@@ -78,16 +82,31 @@ final class Dtls12RecordCipher {
     /// @return the protected fragment
     /// @throws DtlsException if the cipher fails
     byte[] seal(long epochAndSequence, int type, int version, byte[] plaintext) throws DtlsException {
+        var output = new byte[overhead() + plaintext.length];
+        sealInto(epochAndSequence, type, version, plaintext, output, 0);
+        return output;
+    }
+
+    /// Protects one record's plaintext into `output` at `offset`, where the caller reserved [#overhead()] bytes
+    /// more than the plaintext: the explicit nonce, if any, then the ciphertext and the tag.
+    ///
+    /// @param epochAndSequence the epoch in the top 16 bits and the sequence number in the low 48
+    /// @param type             the content type
+    /// @param version          the record version
+    /// @param plaintext        the plaintext
+    /// @param output           the array the protected fragment is written into
+    /// @param offset           the index of its first byte
+    /// @throws DtlsException if the cipher fails
+    void sealInto(long epochAndSequence, int type, int version, byte[] plaintext, byte[] output, int offset)
+            throws DtlsException {
         var explicit = explicitNonceLength();
-        var output = new byte[explicit + plaintext.length + Aead.TAG_LENGTH];
         if (explicit > 0) {
-            writeLong(output, 0, epochAndSequence);
+            writeLong(output, offset, epochAndSequence);
         }
         try {
             cipher.init(Cipher.ENCRYPT_MODE, key, parameters(epochAndSequence));
             cipher.updateAAD(aad(epochAndSequence, type, version, plaintext.length));
-            cipher.doFinal(plaintext, 0, plaintext.length, output, explicit);
-            return output;
+            cipher.doFinal(plaintext, 0, plaintext.length, output, offset + explicit);
         } catch (GeneralSecurityException exception) {
             throw new DtlsException(DtlsAlert.INTERNAL_ERROR, false, "record encryption failed", exception);
         }
@@ -141,8 +160,15 @@ final class Dtls12RecordCipher {
     }
 
     /// {@return the 13-byte additional data of a record}
-    private static byte[] aad(long epochAndSequence, int type, int version, int length) {
-        return new TlsWriter(13).u64(epochAndSequence).u8(type).u16(version).u16(length).toByteArray();
+    private byte[] aad(long epochAndSequence, int type, int version, int length) {
+        var aad = this.aad;
+        writeLong(aad, 0, epochAndSequence);
+        aad[8] = (byte) type;
+        aad[9] = (byte) (version >>> 8);
+        aad[10] = (byte) version;
+        aad[11] = (byte) (length >>> 8);
+        aad[12] = (byte) length;
+        return aad;
     }
 
     /// Writes a big-endian 64-bit value.

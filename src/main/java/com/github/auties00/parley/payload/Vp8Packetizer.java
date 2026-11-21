@@ -60,12 +60,11 @@ final class Vp8Packetizer implements Packetizer {
         var fragments = Payloads.split(data, maxPayloadSize - descriptorSize);
         var result = new ArrayList<PacketizedPayload>(fragments.size());
         for (var k = 0; k < fragments.size(); k++) {
-            var fragment = fragments.get(k);
-            var out = ByteBuffer.allocate(descriptorSize + fragment.remaining());
-            Vp8Descriptor.write(out, metadata.nonReference(), k == 0, OptionalInt.of(pictureId), shortPictureId, tl0,
-                    metadata.temporalId(), metadata.layerSync(), metadata.keyIndex());
-            out.put(fragment);
-            result.add(PacketizedPayload.of(out.flip(), k == fragments.size() - 1));
+            // The descriptor is the header; the fragment, a slice of the frame, is the body
+            var descriptor = ByteBuffer.allocate(descriptorSize);
+            Vp8Descriptor.write(descriptor, metadata.nonReference(), k == 0, OptionalInt.of(pictureId),
+                    shortPictureId, tl0, metadata.temporalId(), metadata.layerSync(), metadata.keyIndex());
+            result.add(PacketizedPayload.of(descriptor.flip(), fragments.get(k), k == fragments.size() - 1));
         }
         return List.copyOf(result);
     }

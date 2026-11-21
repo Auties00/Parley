@@ -260,11 +260,57 @@ public final class RtpReceiveStream {
         });
     }
 
-    /// The packets released for the receiver and the feedback to send, collected under the session lock and acted
-    /// on after it is released.
-    record Work(List<RtpPacket> deliveries, List<RtcpPacket> feedback) {
-        Work() {
-            this(new ArrayList<>(2), new ArrayList<>(1));
+    /// What receiving one packet, or one timer tick, produced: packets to deliver in order and feedback to send,
+    /// both handled after the session lock is released.
+    ///
+    /// The common outcome, one in-order packet and no feedback, allocates no list: the first delivery is held in a
+    /// field and the lists are created only when needed.
+    static final class Work {
+        /// The first packet to deliver, or `null`.
+        private RtpPacket first;
+        /// The packets to deliver after `first`, or `null` before a second one.
+        private List<RtpPacket> rest;
+        /// The feedback to send, or `null` before the first.
+        private List<RtcpPacket> feedback;
+
+        /// Adds a packet to deliver.
+        void addDelivery(RtpPacket packet) {
+            if (first == null) {
+                first = packet;
+            } else {
+                if (rest == null) {
+                    rest = new ArrayList<>(4);
+                }
+                rest.add(packet);
+            }
+        }
+
+        /// Adds feedback to send.
+        void addFeedback(RtcpPacket packet) {
+            if (feedback == null) {
+                feedback = new ArrayList<>(2);
+            }
+            feedback.add(packet);
+        }
+
+        /// {@return whether there is nothing to deliver and nothing to send}
+        boolean isEmpty() {
+            return first == null && feedback == null;
+        }
+
+        /// {@return the feedback to send, possibly empty}
+        List<RtcpPacket> feedback() {
+            return feedback == null ? List.of() : feedback;
+        }
+
+        /// {@return the number of packets to deliver}
+        int deliveryCount() {
+            return first == null ? 0 : 1 + (rest == null ? 0 : rest.size());
+        }
+
+        /// {@return the packet to deliver at `index`, in order}
+        RtpPacket delivery(int index) {
+            return index == 0 ? first : rest.get(index - 1);
         }
     }
 
@@ -509,7 +555,7 @@ public final class RtpReceiveStream {
 
     private void deliver(long sequence, RtpPacket packet, Work work) {
         markDelivered(sequence);
-        work.deliveries().add(packet);
+        work.addDelivery(packet);
     }
 
     private void markDelivered(long sequence) {
@@ -566,7 +612,7 @@ public final class RtpReceiveStream {
             for (var sequence : due) {
                 sequences.add((int) (sequence & 0xFFFF));
             }
-            work.feedback().add(new Nack(session.feedbackSsrc(), mediaSsrc, sequences));
+            work.addFeedback(new Nack(session.feedbackSsrc(), mediaSsrc, sequences));
             nackCount++;
         }
         if (nack.takeKeyframeNeeded()) {
@@ -583,7 +629,7 @@ public final class RtpReceiveStream {
         var method = config.feedback().contains(FeedbackMechanism.PLI) ? Optional.of(KeyframeMethod.PLI)
                 : config.feedback().contains(FeedbackMechanism.FIR) ? Optional.of(KeyframeMethod.FIR)
                 : Optional.<KeyframeMethod>empty();
-        method.flatMap(value -> keyframeRequest(value, nowNanos)).ifPresent(work.feedback()::add);
+        method.flatMap(value -> keyframeRequest(value, nowNanos)).ifPresent(work::addFeedback);
     }
 
     private Optional<RtcpPacket> keyframeRequest(KeyframeMethod method, long nowNanos) {
@@ -624,15 +670,16 @@ public final class RtpReceiveStream {
     }
 
     /// Hands released packets to the receiver, outside the session lock, one call at a time.
-    void deliver(List<RtpPacket> packets) {
-        if (packets.isEmpty()) {
+    void deliver(Work work) {
+        var count = work.deliveryCount();
+        if (count == 0) {
             return;
         }
         deliveryLock.lock();
         try {
             var current = receiver;
-            for (var packet : packets) {
-                current.accept(packet);
+            for (var index = 0; index < count; index++) {
+                current.accept(work.delivery(index));
             }
         } finally {
             deliveryLock.unlock();

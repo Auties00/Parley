@@ -2,7 +2,6 @@ package com.github.auties00.parley.rtp;
 
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
-import java.util.Arrays;
 import java.util.List;
 import java.util.Objects;
 import java.util.Optional;
@@ -99,7 +98,8 @@ public final class RtpPacket {
     ///                            extension
     public static RtpPacket parse(ByteBuffer packet) throws RtpFormatException {
         Objects.requireNonNull(packet, "packet cannot be null");
-        var source = packet.duplicate();
+        // Read-only, so the slices the accessors hand out are read-only without a second view each
+        var source = packet.asReadOnlyBuffer();
         var start = source.position();
         var end = source.limit();
         var length = end - start;
@@ -153,7 +153,20 @@ public final class RtpPacket {
     }
 
     private static int[] parseOneByteElements(ByteBuffer source, int from, int to) throws RtpFormatException {
-        var out = new int[12];
+        var count = scanOneByteElements(source, from, to, null);
+        if (count == 0) {
+            return NO_ELEMENTS;
+        }
+        var out = new int[count * 3];
+        scanOneByteElements(source, from, to, out);
+        return out;
+    }
+
+    /// Walks the one-byte elements, validating them and, when `out` is not `null`, recording each as id, value
+    /// offset and length; one pass counts, so the array is allocated at its size.
+    ///
+    /// @return the number of elements
+    private static int scanOneByteElements(ByteBuffer source, int from, int to, int[] out) throws RtpFormatException {
         var count = 0;
         var cursor = from;
         while (cursor < to) {
@@ -170,20 +183,31 @@ public final class RtpPacket {
             if (cursor + 1 + length > to) {
                 throw new RtpFormatException("one-byte extension element " + id + " overruns the extension");
             }
-            if (count * 3 + 3 > out.length) {
-                out = Arrays.copyOf(out, out.length * 2);
+            if (out != null) {
+                out[count * 3] = id;
+                out[count * 3 + 1] = cursor + 1;
+                out[count * 3 + 2] = length;
             }
-            out[count * 3] = id;
-            out[count * 3 + 1] = cursor + 1;
-            out[count * 3 + 2] = length;
             count++;
             cursor += 1 + length;
         }
-        return Arrays.copyOf(out, count * 3);
+        return count;
     }
 
     private static int[] parseTwoByteElements(ByteBuffer source, int from, int to) throws RtpFormatException {
-        var out = new int[12];
+        var count = scanTwoByteElements(source, from, to, null);
+        if (count == 0) {
+            return NO_ELEMENTS;
+        }
+        var out = new int[count * 3];
+        scanTwoByteElements(source, from, to, out);
+        return out;
+    }
+
+    /// Walks the two-byte elements like [#scanOneByteElements(ByteBuffer,int,int,int\[\])].
+    ///
+    /// @return the number of elements
+    private static int scanTwoByteElements(ByteBuffer source, int from, int to, int[] out) throws RtpFormatException {
         var count = 0;
         var cursor = from;
         while (cursor < to) {
@@ -199,16 +223,15 @@ public final class RtpPacket {
             if (cursor + 2 + length > to) {
                 throw new RtpFormatException("two-byte extension element " + id + " overruns the extension");
             }
-            if (count * 3 + 3 > out.length) {
-                out = Arrays.copyOf(out, out.length * 2);
+            if (out != null) {
+                out[count * 3] = id;
+                out[count * 3 + 1] = cursor + 2;
+                out[count * 3 + 2] = length;
             }
-            out[count * 3] = id;
-            out[count * 3 + 1] = cursor + 2;
-            out[count * 3 + 2] = length;
             count++;
             cursor += 2 + length;
         }
-        return Arrays.copyOf(out, count * 3);
+        return count;
     }
 
     /// {@return whether a datagram on a port shared by RTP and RTCP is RTCP: its second byte, the RTCP packet type,
@@ -365,7 +388,7 @@ public final class RtpPacket {
         for (var i = 1; i < shifted.length; i += 3) {
             shifted[i] += delta;
         }
-        return new RtpPacket(ByteBuffer.wrap(bytes), 0, bytes.length, csrcCount, extensionProfile,
+        return new RtpPacket(ByteBuffer.wrap(bytes).asReadOnlyBuffer(), 0, bytes.length, csrcCount, extensionProfile,
                 extensionDataStart < 0 ? -1 : extensionDataStart + delta,
                 extensionDataEnd < 0 ? -1 : extensionDataEnd + delta,
                 payloadStart + delta, payloadEnd + delta, shifted);
@@ -381,7 +404,7 @@ public final class RtpPacket {
     }
 
     private ByteBuffer slice(int from, int to) {
-        return source.slice(from, to - from).asReadOnlyBuffer();
+        return source.slice(from, to - from);
     }
 
     static void checkUint32(long value, String name) {

@@ -7,7 +7,6 @@ import com.github.auties00.parley.media.Vp9FrameMetadata;
 import com.github.auties00.parley.media.Vp9ScalabilityStructure;
 import com.github.auties00.parley.rtp.RtpPacket;
 
-import java.io.ByteArrayOutputStream;
 import java.nio.ByteBuffer;
 import java.util.List;
 import java.util.Optional;
@@ -43,11 +42,15 @@ final class Vp9Depacketizer implements Depacketizer {
     @Override
     public EncodedFrame assemble(List<RtpPacket> packetsOfOneFrame) throws PayloadFormatException {
         Payloads.checkRun(packetsOfOneFrame);
-        var out = new ByteArrayOutputStream();
+        // One pass finds the descriptors and the frame size, the second copies each payload once into the frame
+        var count = packetsOfOneFrame.size();
+        var payloads = new ByteBuffer[count];
+        var skips = new int[count];
+        var total = 0;
         Vp9Descriptor first = null;
         Vp9Descriptor last = null;
-        for (var packet : packetsOfOneFrame) {
-            var payload = packet.payload();
+        for (var index = 0; index < count; index++) {
+            var payload = packetsOfOneFrame.get(index).payload();
             var descriptor = Vp9Descriptor.parse(payload);
             if (first == null) {
                 if (!descriptor.begin()) {
@@ -56,9 +59,9 @@ final class Vp9Depacketizer implements Depacketizer {
                 first = descriptor;
             }
             last = descriptor;
-            var bytes = new byte[payload.remaining() - descriptor.size()];
-            payload.get(payload.position() + descriptor.size(), bytes);
-            out.writeBytes(bytes);
+            payloads[index] = payload;
+            skips[index] = descriptor.size();
+            total += payload.remaining() - descriptor.size();
         }
         if (!last.end()) {
             throw new PayloadFormatException("VP9 layer frame without its end");
@@ -66,7 +69,7 @@ final class Vp9Depacketizer implements Depacketizer {
         if (first.structure().isPresent()) {
             structure = first.structure();
         }
-        var data = out.toByteArray();
+        var data = Payloads.join(payloads, skips, total);
         var keyframe = !first.interPicturePredicted() && !first.interLayerPredicted();
         var spatialId = first.spatialId();
         var resolution = structure

@@ -6,7 +6,6 @@ import com.github.auties00.parley.media.Resolution;
 import com.github.auties00.parley.media.Vp8FrameMetadata;
 import com.github.auties00.parley.rtp.RtpPacket;
 
-import java.io.ByteArrayOutputStream;
 import java.nio.ByteBuffer;
 import java.util.List;
 import java.util.Optional;
@@ -38,10 +37,14 @@ final class Vp8Depacketizer implements Depacketizer {
     @Override
     public EncodedFrame assemble(List<RtpPacket> packetsOfOneFrame) throws PayloadFormatException {
         Payloads.checkRun(packetsOfOneFrame);
-        var out = new ByteArrayOutputStream();
+        // One pass finds the descriptors and the frame size, the second copies each payload once into the frame
+        var count = packetsOfOneFrame.size();
+        var payloads = new ByteBuffer[count];
+        var skips = new int[count];
+        var total = 0;
         Vp8Descriptor first = null;
-        for (var packet : packetsOfOneFrame) {
-            var payload = packet.payload();
+        for (var index = 0; index < count; index++) {
+            var payload = packetsOfOneFrame.get(index).payload();
             var descriptor = Vp8Descriptor.parse(payload);
             if (first == null) {
                 if (!descriptor.startOfPartition() || descriptor.partitionIndex() != 0) {
@@ -49,11 +52,11 @@ final class Vp8Depacketizer implements Depacketizer {
                 }
                 first = descriptor;
             }
-            var bytes = new byte[payload.remaining() - descriptor.size()];
-            payload.get(payload.position() + descriptor.size(), bytes);
-            out.writeBytes(bytes);
+            payloads[index] = payload;
+            skips[index] = descriptor.size();
+            total += payload.remaining() - descriptor.size();
         }
-        var data = out.toByteArray();
+        var data = Payloads.join(payloads, skips, total);
         var keyframe = (data[0] & 0x01) == 0;
         var resolution = keyframe ? keyframeResolution(data) : Optional.<Resolution>empty();
         var metadata = new Vp8FrameMetadata(first.pictureId(), first.longPictureId() ? 15 : 7, first.tl0PicIndex(),

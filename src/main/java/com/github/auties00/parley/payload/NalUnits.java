@@ -1,8 +1,8 @@
 package com.github.auties00.parley.payload;
 
+import com.github.auties00.parley.bytes.ByteKernels;
 import com.github.auties00.parley.media.Resolution;
 
-import java.io.ByteArrayOutputStream;
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -66,16 +66,7 @@ final class NalUnits {
 
     /// {@return the absolute index of the next `00 00 01` at or after `from`, or `-1`}
     private static int nextStartCode(ByteBuffer stream, int from, int limit) {
-        for (var i = from; i + 2 < limit; i++) {
-            if ((stream.get(i + 2) & 0xFF) > 1) {
-                i += 2;
-                continue;
-            }
-            if (stream.get(i) == 0 && stream.get(i + 1) == 0 && stream.get(i + 2) == 1) {
-                return i;
-            }
-        }
-        return -1;
+        return ByteKernels.get().indexOfStartCode(stream, from, limit);
     }
 
     /// Removes the emulation prevention bytes (the `03` of `00 00 03`) from the first `maxLength` bytes of a NAL unit.
@@ -96,14 +87,6 @@ final class NalUnits {
             zeros = b == 0 ? zeros + 1 : 0;
         }
         return count == length ? out : Arrays.copyOf(out, count);
-    }
-
-    /// Appends a NAL unit with a four-byte start code.
-    static void appendAnnexB(ByteArrayOutputStream out, ByteBuffer nal) {
-        out.writeBytes(START_CODE);
-        var bytes = new byte[nal.remaining()];
-        nal.get(nal.position(), bytes);
-        out.writeBytes(bytes);
     }
 
     /// {@return a copy of a NAL unit as its own buffer}

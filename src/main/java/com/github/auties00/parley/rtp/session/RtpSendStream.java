@@ -24,6 +24,7 @@ import java.nio.ByteBuffer;
 import java.time.Duration;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -72,6 +73,9 @@ public final class RtpSendStream {
     /// The most padding bytes one padding-only packet carries.
     static final int MAX_PADDING = 255;
 
+    /// The empty payload of padding-only packets.
+    private static final ByteBuffer EMPTY = ByteBuffer.allocate(0);
+
     /// The window the frame rate is measured over.
     static final long FRAME_RATE_WINDOW_NANOS = 1_000_000_000L;
 
@@ -92,6 +96,31 @@ public final class RtpSendStream {
     private final OptionalInt transportSequenceId;
     private final OptionalInt absSendTimeId;
     private final PacketHistory history;
+    /// The `MID` value, encoded once; `null` without the extension. Guarded by the session lock, like every field
+    /// below that is not final.
+    private byte[] midValue;
+    /// The `RtpStreamId` value, encoded once; `null` without a RID or the extension.
+    private byte[] ridValue;
+    /// The `RepairedRtpStreamId` value, encoded once; `null` without a RID or the extension.
+    private byte[] repairedRidValue;
+    /// The header extensions of the packet being written: ids, lengths, and the value as constant bytes, a buffer,
+    /// or neither for a zeroed placeholder the sender stamps later.
+    private int[] extensionIds = new int[8];
+    /// The value lengths of the packet being written.
+    private int[] extensionLengths = new int[8];
+    /// The constant values of the packet being written.
+    private byte[][] extensionConstants = new byte[8][];
+    /// The buffer values of the packet being written.
+    private ByteBuffer[] extensionBuffers = new ByteBuffer[8];
+    /// The offsets, from the packet's first byte, of the transport-wide sequence number and abs-send-time values of
+    /// the packet last written, or `-1` without them.
+    private int writtenTransportSequenceOffset;
+    /// The offset of the abs-send-time value of the packet last written, or `-1`.
+    private int writtenAbsSendTimeOffset;
+    /// The header length of the packet last written.
+    private int writtenHeaderLength;
+    /// The payload length of the packet last written.
+    private int writtenPayloadLength;
     private final RedEncoder redEncoder;
     private FecEncoder fecEncoder;
     private int sequence;
@@ -152,9 +181,25 @@ public final class RtpSendStream {
                 ? new PacketHistory(config.historyLength().toNanos()) : null;
         this.redEncoder = config.red().map(red -> new RedEncoder(red.distance())).orElse(null);
         this.fecEncoder = createFecEncoder(config);
+        encodeConstants(config);
         this.sequence = initialSequence & 0xFFFF;
         this.rtxSequence = (initialSequence * 7 + 1) & 0xFFFF;
         this.flexfecSequence = (initialSequence * 13 + 3) & 0xFFFF;
+    }
+
+    /// Encodes the extension values that are the same in every packet of the stream.
+    private void encodeConstants(SendStreamConfig config) {
+        midValue = midId.isPresent() ? bytesOf(new Mid(config.mid()).encode()) : null;
+        ridValue = ridId.isPresent() ? bytesOf(new RtpStreamId(config.rid().orElseThrow()).encode()) : null;
+        repairedRidValue = repairedRidId.isPresent()
+                ? bytesOf(new RepairedRtpStreamId(config.rid().orElseThrow()).encode()) : null;
+    }
+
+    /// {@return the remaining bytes of `buffer`}
+    private static byte[] bytesOf(ByteBuffer buffer) {
+        var bytes = new byte[buffer.remaining()];
+        buffer.get(buffer.position(), bytes);
+        return bytes;
     }
 
     private static FecEncoder createFecEncoder(SendStreamConfig config) {
@@ -174,14 +219,29 @@ public final class RtpSendStream {
 
     /// One payload to send, with its own marker bit and header extension values.
     ///
-    /// @param payload    the payload; its bytes are copied
+    /// The packet's payload is `header` followed by `payload`, so a payload descriptor and a slice of a frame go
+    /// into the packet without being joined first. Both are read when the packet is written, during the send call;
+    /// their bytes are copied into the packet then.
+    ///
+    /// @param header     the bytes before `payload`, such as a payload descriptor; empty for none
+    /// @param payload    the payload, or the part of it after `header`
     /// @param marker     the marker bit
     /// @param extensions header extension values by URI; values whose URI was not negotiated are not written
-    public record Payload(ByteBuffer payload, boolean marker, Map<URI, ByteBuffer> extensions) {
+    public record Payload(ByteBuffer header, ByteBuffer payload, boolean marker, Map<URI, ByteBuffer> extensions) {
         /// Checks the fields and copies `extensions`.
         public Payload {
+            Objects.requireNonNull(header, "header cannot be null");
             Objects.requireNonNull(payload, "payload cannot be null");
             extensions = Map.copyOf(extensions);
+        }
+
+        /// Creates a payload without a header.
+        ///
+        /// @param payload    the payload
+        /// @param marker     the marker bit
+        /// @param extensions header extension values by URI
+        public Payload(ByteBuffer payload, boolean marker, Map<URI, ByteBuffer> extensions) {
+            this(EMPTY, payload, marker, extensions);
         }
     }
 
@@ -270,8 +330,10 @@ public final class RtpSendStream {
             var now = session.now();
             lastRtpTimestamp = rtpTimestamp;
             lastCaptureNanos = now;
-            for (var payload : payloads) {
-                buildMedia(payload, rtpTimestamp, priority, now, outgoing);
+            var flushes = payloads.getLast().marker();
+            for (var index = 0; index < payloads.size(); index++) {
+                var payload = payloads.get(index);
+                buildMedia(payload, rtpTimestamp, priority, now, flushes, outgoing);
                 if (payload.marker() && fecEncoder != null) {
                     buildFec(rtpTimestamp, now, outgoing);
                 }
@@ -320,11 +382,12 @@ public final class RtpSendStream {
                 var seq = sequence;
                 sequence = (sequence + 1) & 0xFFFF;
                 var packet = writePacket(ssrc, payloadType, seq, rtpTimestamp, payload.marker(),
-                        payload.extensions(), List.of(), payload.payload(), ridId);
+                        payload.extensions(), List.of(), payload.header(), payload.payload(), ridId,
+                        session.tailroom());
                 if (history != null) {
-                    history.store(view(packet).copy(), now, priority);
+                    history.store(view(packet), now, priority);
                 }
-                outgoing.add(new RtpSession.Outgoing(packet, priority, ssrc, RtpSession.PacketKind.MEDIA, this, now));
+                outgoing.add(outgoing(packet, priority, ssrc, RtpSession.PacketKind.MEDIA, now, history != null));
             }
         } finally {
             lock.unlock();
@@ -395,11 +458,11 @@ public final class RtpSendStream {
                     : OutgoingPacketScheduler.Priority.AUDIO;
             var ssrc = config.ssrc();
             var built = writePacket(ssrc, payloadType, seq, timestamp, packet.marker(), extensions, packet.csrcs(),
-                    packet.payload(), ridId);
+                    EMPTY, packet.payload(), ridId, session.tailroom());
             if (history != null) {
-                history.store(view(built).copy(), now, priority);
+                history.store(view(built), now, priority);
             }
-            outgoing.add(new RtpSession.Outgoing(built, priority, ssrc, RtpSession.PacketKind.MEDIA, this, now));
+            outgoing.add(outgoing(built, priority, ssrc, RtpSession.PacketKind.MEDIA, now, history != null));
             if (switchPoint) {
                 forwardingKeyFrame = true;
             }
@@ -432,6 +495,7 @@ public final class RtpSendStream {
     void replaceSsrc(long oldSsrc, long newSsrc) {
         var previous = config;
         config = previous.withReplacedSsrc(oldSsrc, newSsrc);
+        encodeConstants(config);
         if (previous.ssrc() == oldSsrc) {
             packetsSent = 0;
             bytesSent = 0;
@@ -472,45 +536,82 @@ public final class RtpSendStream {
         }
     }
 
+    /// Writes the packet of one payload, feeds the FEC encoder and the history, and queues it.
+    ///
+    /// @param flushes whether FEC is flushed before the packets are dispatched, so the FEC encoder may keep the
+    ///                packet itself until then instead of a copy
     private void buildMedia(Payload payload, long timestamp, OutgoingPacketScheduler.Priority priority, long now,
-                            List<RtpSession.Outgoing> out) {
+                            boolean flushes, List<RtpSession.Outgoing> out) {
+        var mediaHeader = payload.header();
         var mediaPayload = payload.payload();
         var payloadType = config.payloadType();
         var ssrc = config.ssrc();
+        var ulpfec = fecEncoder != null && config.fec().orElseThrow() instanceof FecConfig.Ulpfec;
         if (redEncoder != null) {
-            mediaPayload = redEncoder.encode(payloadType, timestamp, mediaPayload);
+            // The RED block headers and redundant data are the header; the frame, written once, follows
+            if (mediaHeader.hasRemaining()) {
+                mediaPayload = joined(mediaHeader, mediaPayload);
+            }
+            mediaHeader = redEncoder.encodeHeader(payloadType, timestamp, mediaPayload);
             payloadType = config.red().orElseThrow().payloadType();
+        }
+        if (ulpfec && mediaHeader.hasRemaining()) {
+            // The RED wrapping of ULPFEC needs the media payload whole
+            mediaPayload = joined(mediaHeader, mediaPayload);
+            mediaHeader = EMPTY;
         }
         var seq = sequence;
         sequence = (sequence + 1) & 0xFFFF;
+        // With ULPFEC the plain packet only feeds the encoder and is never sent, so it needs no SRTP tailroom
         var media = writePacket(ssrc, payloadType, seq, timestamp, payload.marker(), payload.extensions(), List.of(),
-                mediaPayload, ridId);
+                mediaHeader, mediaPayload, ridId, ulpfec ? 0 : session.tailroom());
         var sent = media;
         if (fecEncoder != null) {
-            fecEncoder.add(view(media));
-            if (config.fec().orElseThrow() instanceof FecConfig.Ulpfec ulpfec) {
-                var red = Red.encode(List.of(), payloadType, mediaPayload);
-                sent = writePacket(ssrc, ulpfec.redPayloadType(), seq, timestamp, payload.marker(),
-                        payload.extensions(), List.of(), red, ridId);
+            // Every repair packet of the frame is built before the frame is dispatched and protected, so the encoder
+            // can read the packet itself rather than a copy
+            if (flushes) {
+                fecEncoder.addOwned(view(media));
+            } else {
+                fecEncoder.add(view(media));
+            }
+            if (ulpfec) {
+                sent = writePacket(ssrc, ((FecConfig.Ulpfec) config.fec().orElseThrow()).redPayloadType(), seq,
+                        timestamp, payload.marker(), payload.extensions(), List.of(),
+                        Red.encodeHeader(List.of(), payloadType), mediaPayload, ridId, session.tailroom());
             }
         }
         if (history != null) {
-            history.store(view(sent).copy(), now, priority);
+            history.store(view(sent), now, priority);
         }
-        out.add(new RtpSession.Outgoing(sent, priority, ssrc, RtpSession.PacketKind.MEDIA, this, now));
+        out.add(outgoing(sent, priority, ssrc, RtpSession.PacketKind.MEDIA, now, history != null));
+    }
+
+    /// {@return `header` followed by `payload` in one new buffer}
+    private static ByteBuffer joined(ByteBuffer header, ByteBuffer payload) {
+        return ByteBuffer.allocate(header.remaining() + payload.remaining()).put(header.duplicate())
+                .put(payload.duplicate()).flip();
+    }
+
+    /// {@return the queue entry of `packet`, the packet [#write] last wrote, with the layout it recorded}
+    ///
+    /// @param retained whether the history keeps the packet, which the transport must then leave unprotected
+    private RtpSession.Outgoing outgoing(ByteBuffer packet, OutgoingPacketScheduler.Priority priority, long ssrc,
+                                         RtpSession.PacketKind kind, long now, boolean retained) {
+        return new RtpSession.Outgoing(packet, priority, ssrc, kind, this, now, writtenHeaderLength,
+                writtenPayloadLength, writtenTransportSequenceOffset, writtenAbsSendTimeOffset, retained);
     }
 
     private void buildFec(long timestamp, long now, List<RtpSession.Outgoing> out) {
         for (var fecPayload : fecEncoder.flush()) {
             switch (config.fec().orElseThrow()) {
                 case FecConfig.Ulpfec ulpfec -> {
-                    var red = Red.encode(List.of(), ulpfec.ulpfecPayloadType(), fecPayload);
                     var seq = sequence;
                     sequence = (sequence + 1) & 0xFFFF;
                     var packet = writePacket(config.ssrc(), ulpfec.redPayloadType(), seq, timestamp, false, Map.of(),
-                            List.of(), red, ridId);
-                    out.add(new RtpSession.Outgoing(packet, OutgoingPacketScheduler.Priority.FEC, config.ssrc(),
-                            RtpSession.PacketKind.FEC, this, now));
+                            List.of(), Red.encodeHeader(List.of(), ulpfec.ulpfecPayloadType()), fecPayload, ridId,
+                            session.tailroom());
+                    out.add(outgoing(packet, OutgoingPacketScheduler.Priority.FEC, config.ssrc(),
+                            RtpSession.PacketKind.FEC, now, false));
                 }
                 case FecConfig.Flexfec flexfec -> out.add(flexfecPacket(flexfec, fecPayload, timestamp,
                         OutgoingPacketScheduler.Priority.FEC, RtpSession.PacketKind.FEC, now));
@@ -527,47 +628,178 @@ public final class RtpSendStream {
         flexfecSequence = (flexfecSequence + 1) & 0xFFFF;
         var csrcs = flexfec.draft03() ? List.<Long>of() : List.of(config.ssrc());
         var packet = writePacket(flexfec.ssrc(), flexfec.payloadType(), seq, timestamp, false, Map.of(), csrcs,
-                payload, OptionalInt.empty());
-        return new RtpSession.Outgoing(packet, priority, flexfec.ssrc(), kind, this, now);
+                EMPTY, payload, OptionalInt.empty(), session.tailroom());
+        return outgoing(packet, priority, flexfec.ssrc(), kind, now, false);
     }
 
-    /// Writes a packet with the session's reserved extensions into a new buffer with SRTP tailroom.
+    /// Writes a packet with the session's reserved extensions (MID, RID or repaired RID, and the zeroed
+    /// transport-wide sequence number and abs-send-time the sender stamps) and the payload's own into a new buffer.
+    ///
+    /// @param header   the first bytes of the payload, written before `payload`
+    /// @param tailroom the spare bytes after the packet, for SRTP to protect it in place
     private ByteBuffer writePacket(long ssrc, int payloadType, int seq, long timestamp, boolean marker,
-                                   Map<URI, ByteBuffer> values, List<Long> csrcs, ByteBuffer payload,
-                                   OptionalInt ridSlot) {
-        var extensions = new ArrayList<Map.Entry<Integer, ByteBuffer>>(6);
-        var current = config;
-        midId.ifPresent(id -> extensions.add(Map.entry(id, new Mid(current.mid()).encode())));
-        if (ridSlot.isPresent()) {
-            extensions.add(Map.entry(ridSlot.getAsInt(), (ridSlot.equals(ridId)
-                    ? new RtpStreamId(current.rid().orElseThrow()).encode()
-                    : new RepairedRtpStreamId(current.rid().orElseThrow()).encode())));
+                                   Map<URI, ByteBuffer> values, List<Long> csrcs, ByteBuffer header,
+                                   ByteBuffer payload, OptionalInt ridSlot, int tailroom) {
+        var count = 0;
+        if (midValue != null) {
+            count = addExtension(count, midId.getAsInt(), midValue, null, midValue.length);
         }
-        transportSequenceId.ifPresent(id -> extensions.add(Map.entry(id, ByteBuffer.allocate(2))));
-        absSendTimeId.ifPresent(id -> extensions.add(Map.entry(id, ByteBuffer.allocate(3))));
-        for (var entry : values.entrySet()) {
-            var id = current.extensions().idOf(entry.getKey());
-            if (id.isPresent() && extensions.stream().noneMatch(e -> e.getKey() == id.getAsInt())) {
-                extensions.add(Map.entry(id.getAsInt(), entry.getValue()));
+        if (ridSlot.isPresent()) {
+            var value = ridSlot.equals(ridId) ? ridValue : repairedRidValue;
+            if (value != null) {
+                count = addExtension(count, ridSlot.getAsInt(), value, null, value.length);
             }
         }
-        return write(ssrc, payloadType, seq, timestamp, marker, csrcs, extensions, payload, 0);
+        var transportSequenceIndex = -1;
+        if (transportSequenceId.isPresent()) {
+            transportSequenceIndex = count;
+            count = addExtension(count, transportSequenceId.getAsInt(), null, null, 2);
+        }
+        var absSendTimeIndex = -1;
+        if (absSendTimeId.isPresent()) {
+            absSendTimeIndex = count;
+            count = addExtension(count, absSendTimeId.getAsInt(), null, null, 3);
+        }
+        if (!values.isEmpty()) {
+            var map = config.extensions();
+            for (var entry : values.entrySet()) {
+                var id = map.idOf(entry.getKey());
+                if (id.isPresent() && !hasExtension(count, id.getAsInt())) {
+                    var value = entry.getValue();
+                    count = addExtension(count, id.getAsInt(), null, value, value.remaining());
+                }
+            }
+        }
+        return write(ssrc, payloadType, seq, timestamp, marker, csrcs, count, transportSequenceIndex,
+                absSendTimeIndex, header, payload, 0, tailroom);
     }
 
+    /// Appends an extension to the packet being written.
+    ///
+    /// @param constant the value as bytes, or `null`
+    /// @param buffer   the value between its position and limit, or `null`; with `constant` also `null`, a zeroed
+    ///                 placeholder
+    /// @return the new extension count
+    /// @throws IllegalArgumentException if the value is longer than 255 bytes
+    private int addExtension(int count, int id, byte[] constant, ByteBuffer buffer, int length) {
+        if (length > 255) {
+            throw new IllegalArgumentException("extension value longer than 255 bytes: " + length);
+        }
+        if (count == extensionIds.length) {
+            var grown = count * 2;
+            extensionIds = Arrays.copyOf(extensionIds, grown);
+            extensionLengths = Arrays.copyOf(extensionLengths, grown);
+            extensionConstants = Arrays.copyOf(extensionConstants, grown);
+            extensionBuffers = Arrays.copyOf(extensionBuffers, grown);
+        }
+        extensionIds[count] = id;
+        extensionLengths[count] = length;
+        extensionConstants[count] = constant;
+        extensionBuffers[count] = buffer;
+        return count + 1;
+    }
+
+    /// {@return whether the packet being written already has an extension of `id`}
+    private boolean hasExtension(int count, int id) {
+        for (var index = 0; index < count; index++) {
+            if (extensionIds[index] == id) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /// Writes a packet with the first `count` extensions of the scratch arrays straight into one new array, in the
+    /// layout [RtpPacketWriter] produces (the one-byte form unless an id is above 14 or a value is empty or longer
+    /// than 16 bytes, values in the order added), and records the layout in the `written` fields.
+    ///
+    /// @param transportSequenceIndex the index of the transport-wide sequence number placeholder, or `-1`
+    /// @param absSendTimeIndex       the index of the abs-send-time placeholder, or `-1`
+    /// @param header                 the first bytes of the payload, before `payload`
+    /// @param tailroom               the spare bytes after the packet
     private ByteBuffer write(long ssrc, int payloadType, int seq, long timestamp, boolean marker, List<Long> csrcs,
-                             List<Map.Entry<Integer, ByteBuffer>> extensions, ByteBuffer payload, int padding) {
-        var extensionBytes = 0;
-        for (var entry : extensions) {
-            extensionBytes += 2 + entry.getValue().remaining();
+                             int count, int transportSequenceIndex, int absSendTimeIndex, ByteBuffer header,
+                             ByteBuffer payload, int padding, int tailroom) {
+        var twoByte = false;
+        var data = 0;
+        for (var index = 0; index < count; index++) {
+            var length = extensionLengths[index];
+            if (extensionIds[index] > 14 || length == 0 || length > 16) {
+                twoByte = true;
+            }
+            data += length;
         }
-        var capacity = RtpPacket.FIXED_HEADER_LENGTH + 4 * csrcs.size() + 4 + extensionBytes + 3
-                + payload.remaining() + padding + session.tailroom();
-        var writer = RtpPacketWriter.into(ByteBuffer.allocate(capacity)).ssrc(ssrc).payloadType(payloadType)
-                .sequence(seq).timestamp(timestamp).marker(marker).csrcs(csrcs).payload(payload).padding(padding);
-        for (var entry : extensions) {
-            writer.extension(entry.getKey(), entry.getValue());
+        data = (data + count * (twoByte ? 2 : 1) + 3) & ~3;
+        var csrcCount = csrcs.size();
+        var headerLength = RtpPacket.FIXED_HEADER_LENGTH + 4 * csrcCount + (count > 0 ? 4 + data : 0);
+        var headerBytes = header.remaining();
+        var payloadLength = headerBytes + payload.remaining();
+        var total = headerLength + payloadLength + padding;
+        var array = new byte[total + tailroom];
+        array[0] = (byte) (0x80 | (padding > 0 ? 0x20 : 0) | (count > 0 ? 0x10 : 0) | csrcCount);
+        array[1] = (byte) ((marker ? 0x80 : 0) | payloadType);
+        array[2] = (byte) (seq >>> 8);
+        array[3] = (byte) seq;
+        putInt(array, 4, timestamp);
+        putInt(array, 8, ssrc);
+        var cursor = RtpPacket.FIXED_HEADER_LENGTH;
+        for (var index = 0; index < csrcCount; index++) {
+            putInt(array, cursor, csrcs.get(index));
+            cursor += 4;
         }
-        return writer.finish();
+        writtenTransportSequenceOffset = -1;
+        writtenAbsSendTimeOffset = -1;
+        if (count > 0) {
+            var profile = twoByte ? RtpPacket.TWO_BYTE_PROFILE : RtpPacket.ONE_BYTE_PROFILE;
+            array[cursor] = (byte) (profile >>> 8);
+            array[cursor + 1] = (byte) profile;
+            array[cursor + 2] = (byte) (data / 4 >>> 8);
+            array[cursor + 3] = (byte) (data / 4);
+            cursor += 4;
+            var dataStart = cursor;
+            for (var index = 0; index < count; index++) {
+                var length = extensionLengths[index];
+                if (twoByte) {
+                    array[cursor++] = (byte) extensionIds[index];
+                    array[cursor++] = (byte) length;
+                } else {
+                    array[cursor++] = (byte) (extensionIds[index] << 4 | (length - 1));
+                }
+                if (index == transportSequenceIndex) {
+                    writtenTransportSequenceOffset = cursor;
+                } else if (index == absSendTimeIndex) {
+                    writtenAbsSendTimeOffset = cursor;
+                }
+                var constant = extensionConstants[index];
+                var buffer = extensionBuffers[index];
+                if (constant != null) {
+                    System.arraycopy(constant, 0, array, cursor, length);
+                    extensionConstants[index] = null;
+                } else if (buffer != null) {
+                    buffer.get(buffer.position(), array, cursor, length);
+                    extensionBuffers[index] = null;
+                }
+                cursor += length;
+            }
+            // The padding to a whole word is already zero
+            cursor = dataStart + data;
+        }
+        header.get(header.position(), array, cursor, headerBytes);
+        payload.get(payload.position(), array, cursor + headerBytes, payloadLength - headerBytes);
+        if (padding > 0) {
+            array[total - 1] = (byte) padding;
+        }
+        writtenHeaderLength = headerLength;
+        writtenPayloadLength = payloadLength;
+        return ByteBuffer.wrap(array, 0, total);
+    }
+
+    /// Writes the low 32 bits of `value` big-endian at `offset`.
+    private static void putInt(byte[] array, int offset, long value) {
+        array[offset] = (byte) (value >>> 24);
+        array[offset + 1] = (byte) (value >>> 16);
+        array[offset + 2] = (byte) (value >>> 8);
+        array[offset + 3] = (byte) value;
     }
 
     private static RtpPacket view(ByteBuffer packet) {
@@ -620,6 +852,11 @@ public final class RtpSendStream {
         } finally {
             lock.unlock();
         }
+    }
+
+    /// {@return the session the stream sends on}
+    RtpSession session() {
+        return session;
     }
 
     long ssrc() {
@@ -755,26 +992,34 @@ public final class RtpSendStream {
             copy.put(original.buffer()).flip();
             return new RtpSession.Outgoing(copy, priority, current.ssrc(), kind, this, now);
         }
-        var extensions = new ArrayList<Map.Entry<Integer, ByteBuffer>>();
+        var count = 0;
+        var transportSequenceIndex = -1;
+        var absSendTimeIndex = -1;
         for (var id : original.extensionIds()) {
-            var value = original.extension(id).orElseThrow();
             if (ridId.isPresent() && id == ridId.getAsInt()) {
-                repairedRidId.ifPresent(rrid -> extensions.add(Map.entry(rrid,
-                        new RepairedRtpStreamId(current.rid().orElseThrow()).encode())));
+                if (repairedRidValue != null) {
+                    count = addExtension(count, repairedRidId.getAsInt(), repairedRidValue, null,
+                            repairedRidValue.length);
+                }
             } else if (transportSequenceId.isPresent() && id == transportSequenceId.getAsInt()) {
-                extensions.add(Map.entry(id, ByteBuffer.allocate(2)));
+                transportSequenceIndex = count;
+                count = addExtension(count, id, null, null, 2);
             } else if (absSendTimeId.isPresent() && id == absSendTimeId.getAsInt()) {
-                extensions.add(Map.entry(id, ByteBuffer.allocate(3)));
+                absSendTimeIndex = count;
+                count = addExtension(count, id, null, null, 3);
             } else {
-                extensions.add(Map.entry(id, value));
+                var value = original.extension(id).orElseThrow();
+                count = addExtension(count, id, null, value, value.remaining());
             }
         }
         var seq = rtxSequence;
         rtxSequence = (rtxSequence + 1) & 0xFFFF;
         var packet = write(current.rtxSsrc().getAsLong(), current.rtxPayloadType().getAsInt(), seq,
-                original.timestamp(), original.marker(), original.csrcs(), extensions, Rtx.payloadOf(original), 0);
-        return new RtpSession.Outgoing(packet, priority, current.rtxSsrc().getAsLong(), kind, this, now);
+                original.timestamp(), original.marker(), original.csrcs(), count, transportSequenceIndex,
+                absSendTimeIndex, EMPTY, Rtx.payloadOf(original), 0, session.tailroom());
+        return outgoing(packet, priority, current.rtxSsrc().getAsLong(), kind, now, false);
     }
+
 
     /// Builds padding for a probe: RTX copies of the newest packets when RTX and history are available, otherwise
     /// padding-only packets. Called under the session lock.
@@ -811,15 +1056,25 @@ public final class RtpSendStream {
                 seq = sequence;
                 sequence = (sequence + 1) & 0xFFFF;
             }
-            var extensions = new ArrayList<Map.Entry<Integer, ByteBuffer>>(3);
-            midId.ifPresent(id -> extensions.add(Map.entry(id, new Mid(current.mid()).encode())));
-            transportSequenceId.ifPresent(id -> extensions.add(Map.entry(id, ByteBuffer.allocate(2))));
-            absSendTimeId.ifPresent(id -> extensions.add(Map.entry(id, ByteBuffer.allocate(3))));
-            var packet = write(ssrc, payloadType, seq, lastRtpTimestamp, false, List.of(), extensions,
-                    ByteBuffer.allocate(0), MAX_PADDING);
+            var count = 0;
+            if (midValue != null) {
+                count = addExtension(count, midId.getAsInt(), midValue, null, midValue.length);
+            }
+            var transportSequenceIndex = -1;
+            if (transportSequenceId.isPresent()) {
+                transportSequenceIndex = count;
+                count = addExtension(count, transportSequenceId.getAsInt(), null, null, 2);
+            }
+            var absSendTimeIndex = -1;
+            if (absSendTimeId.isPresent()) {
+                absSendTimeIndex = count;
+                count = addExtension(count, absSendTimeId.getAsInt(), null, null, 3);
+            }
+            var packet = write(ssrc, payloadType, seq, lastRtpTimestamp, false, List.of(), count,
+                    transportSequenceIndex, absSendTimeIndex, EMPTY, EMPTY, MAX_PADDING, session.tailroom());
             produced += packet.remaining();
-            out.add(new RtpSession.Outgoing(packet, OutgoingPacketScheduler.Priority.PADDING, ssrc,
-                    RtpSession.PacketKind.PADDING, this, now));
+            out.add(outgoing(packet, OutgoingPacketScheduler.Priority.PADDING, ssrc, RtpSession.PacketKind.PADDING,
+                    now, false));
         }
         return produced;
     }

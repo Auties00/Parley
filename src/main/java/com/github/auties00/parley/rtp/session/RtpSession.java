@@ -155,11 +155,33 @@ public final class RtpSession implements AutoCloseable {
         MEDIA, RETRANSMISSION, FEC, PADDING
     }
 
-    /// One packet ready for the scheduler.
+    /// One packet ready for the scheduler, and the sink the scheduler hands it back to.
     ///
-    /// @param scheduledNanos when it was handed to the scheduler, so the pacer queue time is measured
+    /// The layout lets the sender stamp the send-time extensions without parsing the packet again; offsets count
+    /// from the packet's first byte.
+    ///
+    /// @param scheduledNanos          when it was handed to the scheduler, so the pacer queue time is measured
+    /// @param headerLength            the header length, or `-1` when the layout is unknown and the sender parses
+    ///                                the packet
+    /// @param payloadLength           the payload length
+    /// @param transportSequenceOffset the offset of the transport-wide sequence number value, or `-1`
+    /// @param absSendTimeOffset       the offset of the abs-send-time value, or `-1`
+    /// @param retained                whether the send stream's history keeps the packet itself for
+    ///                                retransmission, so the transport gets a read-only view and protects a copy
     record Outgoing(ByteBuffer buffer, OutgoingPacketScheduler.Priority priority, long ssrc, PacketKind kind,
-                    RtpSendStream stream, long scheduledNanos) {
+                    RtpSendStream stream, long scheduledNanos, int headerLength, int payloadLength,
+                    int transportSequenceOffset, int absSendTimeOffset, boolean retained)
+            implements OutgoingPacketScheduler.PacketSink {
+        /// Creates an entry the history does not keep, whose layout the sender finds by parsing the packet.
+        Outgoing(ByteBuffer buffer, OutgoingPacketScheduler.Priority priority, long ssrc, PacketKind kind,
+                 RtpSendStream stream, long scheduledNanos) {
+            this(buffer, priority, ssrc, kind, stream, scheduledNanos, -1, 0, -1, -1, false);
+        }
+
+        @Override
+        public void send(ByteBuffer plainRtp) throws IOException {
+            stream.session().sendNow(this, plainRtp);
+        }
     }
 
     /// A BYE waiting for the reconsideration timer.
@@ -707,21 +729,11 @@ public final class RtpSession implements AutoCloseable {
     /// Hands packets to the scheduler; with the immediate scheduler, sends them and reports the first failure.
     void dispatch(List<Outgoing> outgoing) throws IOException {
         IOException failure = null;
-        for (var packet : outgoing) {
-            OutgoingPacketScheduler.PacketSink sink = new OutgoingPacketScheduler.PacketSink() {
-                @Override
-                public void send(ByteBuffer plainRtp) throws IOException {
-                    sendNow(packet, plainRtp);
-                }
-
-                @Override
-                public void send(ByteBuffer plainRtp, boolean probe) throws IOException {
-                    sendNow(packet, plainRtp);
-                }
-            };
+        for (var index = 0; index < outgoing.size(); index++) {
+            var packet = outgoing.get(index);
             if (scheduler == ImmediateScheduler.INSTANCE) {
                 try {
-                    sink.send(packet.buffer());
+                    sendNow(packet, packet.buffer());
                 } catch (IOException exception) {
                     if (failure == null) {
                         failure = exception;
@@ -730,7 +742,7 @@ public final class RtpSession implements AutoCloseable {
                     }
                 }
             } else {
-                scheduler.schedule(packet.buffer(), packet.priority(), packet.ssrc(), sink);
+                scheduler.schedule(packet.buffer(), packet.priority(), packet.ssrc(), packet);
             }
         }
         if (failure != null) {
@@ -739,7 +751,7 @@ public final class RtpSession implements AutoCloseable {
     }
 
     /// Stamps the send-time extensions, protects and sends one packet, then accounts for it.
-    private void sendNow(Outgoing packet, ByteBuffer buffer) throws IOException {
+    void sendNow(Outgoing packet, ByteBuffer buffer) throws IOException {
         int sequence = -1;
         int size;
         int payloadBytes;
@@ -749,34 +761,43 @@ public final class RtpSession implements AutoCloseable {
         sendLock.lock();
         try {
             sentAt = clock.nanos();
-            RtpPacket view;
-            try {
-                view = RtpPacket.parse(buffer);
-            } catch (RtpFormatException exception) {
-                throw new IOException("the scheduler returned a malformed packet", exception);
-            }
-            var twcc = packet.stream().transportSequenceId();
-            if (twcc.isPresent()) {
-                var offset = view.extensionOffset(twcc.getAsInt());
-                if (offset.isPresent()) {
-                    sequence = transportSequence;
-                    transportSequence = (transportSequence + 1) & 0xFFFF;
-                    transportSequenceUsed = true;
-                    TransportSequenceNumber.stamp(buffer, offset.getAsInt(), sequence);
+            int transportSequenceIndex;
+            int absSendTimeIndex;
+            if (packet.headerLength() >= 0) {
+                var start = buffer.position();
+                transportSequenceIndex = packet.transportSequenceOffset() < 0 ? -1
+                        : start + packet.transportSequenceOffset();
+                absSendTimeIndex = packet.absSendTimeOffset() < 0 ? -1 : start + packet.absSendTimeOffset();
+                size = buffer.remaining();
+                payloadBytes = packet.payloadLength();
+                rtpSequence = buffer.getShort(start + 2) & 0xFFFF;
+            } else {
+                RtpPacket view;
+                try {
+                    view = RtpPacket.parse(buffer);
+                } catch (RtpFormatException exception) {
+                    throw new IOException("the scheduler returned a malformed packet", exception);
                 }
+                var twcc = packet.stream().transportSequenceId();
+                transportSequenceIndex = twcc.isPresent() ? view.extensionOffset(twcc.getAsInt()).orElse(-1) : -1;
+                var abs = packet.stream().absSendTimeId();
+                absSendTimeIndex = abs.isPresent() ? view.extensionOffset(abs.getAsInt()).orElse(-1) : -1;
+                size = view.length();
+                payloadBytes = view.payloadLength();
+                rtpSequence = view.sequence();
             }
-            var abs = packet.stream().absSendTimeId();
-            if (abs.isPresent()) {
-                var offset = view.extensionOffset(abs.getAsInt());
-                if (offset.isPresent()) {
-                    AbsSendTime.stamp(buffer, offset.getAsInt(), sentAt);
-                }
+            if (transportSequenceIndex >= 0) {
+                sequence = transportSequence;
+                transportSequence = (transportSequence + 1) & 0xFFFF;
+                transportSequenceUsed = true;
+                TransportSequenceNumber.stamp(buffer, transportSequenceIndex, sequence);
             }
-            size = view.length();
-            payloadBytes = view.payloadLength();
+            if (absSendTimeIndex >= 0) {
+                AbsSendTime.stamp(buffer, absSendTimeIndex, sentAt);
+            }
             headerBytes = size - payloadBytes;
-            rtpSequence = view.sequence();
-            transport.sendRtp(buffer);
+            // A packet the history keeps must survive protection: SRTP protects a copy of a read-only view
+            transport.sendRtp(packet.retained() ? buffer.asReadOnlyBuffer() : buffer);
         } finally {
             sendLock.unlock();
         }
@@ -870,7 +891,7 @@ public final class RtpSession implements AutoCloseable {
         }
         var stream = target.get();
         sendFeedbackQuietly(work.feedback());
-        stream.deliver(work.deliveries());
+        stream.deliver(work);
         if (stream.nextDeadline() != Long.MAX_VALUE) {
             wakeTimer();
         }
@@ -1362,7 +1383,7 @@ public final class RtpSession implements AutoCloseable {
                 for (var stream : receiveStreams) {
                     var work = new RtpReceiveStream.Work();
                     stream.onTick(now, work);
-                    if (!work.deliveries().isEmpty() || !work.feedback().isEmpty()) {
+                    if (!work.isEmpty()) {
                         works.add(Map.entry(stream, work));
                     }
                 }
@@ -1399,7 +1420,7 @@ public final class RtpSession implements AutoCloseable {
         }
         for (var entry : works) {
             sendFeedbackQuietly(entry.getValue().feedback());
-            entry.getKey().deliver(entry.getValue().deliveries());
+            entry.getKey().deliver(entry.getValue());
         }
         for (var compound : regular) {
             try {

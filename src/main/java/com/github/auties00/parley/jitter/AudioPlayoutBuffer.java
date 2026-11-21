@@ -14,8 +14,6 @@ import com.github.auties00.parley.rtp.session.NtpRtpMapping;
 
 import java.time.Duration;
 import java.time.Instant;
-import java.util.ArrayDeque;
-import java.util.Arrays;
 import java.util.List;
 import java.util.Objects;
 import java.util.Optional;
@@ -110,8 +108,17 @@ public final class AudioPlayoutBuffer implements AutoCloseable {
     /// The buffered packets by unwrapped timestamp.
     private final TreeMap<Long, Slot> packets = new TreeMap<>();
 
-    /// The recent transit times in nanoseconds, oldest first.
-    private final ArrayDeque<Long> transits = new ArrayDeque<>();
+    /// The recent transit times in nanoseconds, a ring of the last [#HISTORY] starting at [#transitHead].
+    private final long[] transits = new long[HISTORY];
+
+    /// The index of the oldest transit time in [#transits].
+    private int transitHead;
+
+    /// The number of transit times in [#transits].
+    private int transitCount;
+
+    /// The scratch array the percentile is selected in, so taking it allocates nothing.
+    private final long[] transitScratch = new long[HISTORY];
 
     /// The unwrapper of RTP timestamps.
     private final Unwrapper timestamps = new Unwrapper(32);
@@ -675,27 +682,65 @@ public final class AudioPlayoutBuffer implements AutoCloseable {
 
     /// {@return the 95th percentile of the recent transit times above the fastest one}
     private long percentileNanos() {
-        if (transits.size() < 2) {
+        var count = transitCount;
+        if (count < 2) {
             return 0;
         }
-        var values = new long[transits.size()];
-        var i = 0;
+        var values = transitScratch;
         var minimum = Long.MAX_VALUE;
-        for (var transit : transits) {
-            values[i++] = transit;
+        for (var i = 0; i < count; i++) {
+            var transit = transits[i];
+            values[i] = transit;
             minimum = Math.min(minimum, transit);
         }
-        Arrays.sort(values);
-        var index = (int) Math.ceil(PERCENTILE * values.length) - 1;
-        return values[Math.max(0, Math.min(index, values.length - 1))] - minimum;
+        var index = (int) Math.ceil(PERCENTILE * count) - 1;
+        return select(values, count, Math.max(0, Math.min(index, count - 1))) - minimum;
+    }
+
+    /// {@return the `k`-th smallest of `values[0, count)`, which it reorders: a quickselect, linear on average,
+    /// rather than a full sort}
+    private static long select(long[] values, int count, int k) {
+        var low = 0;
+        var high = count - 1;
+        while (low < high) {
+            var pivot = values[(low + high) >>> 1];
+            var i = low;
+            var j = high;
+            while (i <= j) {
+                while (values[i] < pivot) {
+                    i++;
+                }
+                while (values[j] > pivot) {
+                    j--;
+                }
+                if (i <= j) {
+                    var swap = values[i];
+                    values[i] = values[j];
+                    values[j] = swap;
+                    i++;
+                    j--;
+                }
+            }
+            if (k <= j) {
+                high = j;
+            } else if (k >= i) {
+                low = i;
+            } else {
+                return values[k];
+            }
+        }
+        return values[k];
     }
 
     /// Feeds the jitter estimators with one packet.
     private void updateJitter(long timestamp, long arrivalNanos) {
         var transitNanos = arrivalNanos - toNanos(timestamp);
-        transits.addLast(transitNanos);
-        while (transits.size() > HISTORY) {
-            transits.removeFirst();
+        if (transitCount < HISTORY) {
+            transits[(transitHead + transitCount) % HISTORY] = transitNanos;
+            transitCount++;
+        } else {
+            transits[transitHead] = transitNanos;
+            transitHead = (transitHead + 1) % HISTORY;
         }
         var transit = (double) arrivalNanos * clockRate / 1_000_000_000.0 - timestamp;
         if (!Double.isNaN(previousTransit)) {

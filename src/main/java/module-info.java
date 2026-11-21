@@ -41,6 +41,14 @@
 /// events arrive through blocking [com.github.auties00.parley.event.EventStream]s. Parley logs through [System#getLogger(String)], under the name of the logging class,
 /// and never logs key material or ICE credentials.
 ///
+/// # Vectorized kernels
+///
+/// The byte loops of the packet paths (the XOR of forward error correction parity, the search for H.264 and H.265
+/// start codes) run on the incubating Vector API when the application resolves the optional
+/// `jdk.incubator.vector` module (`--add-modules jdk.incubator.vector`) on a platform whose vectors are wider than
+/// 64 bits. Without it, or with the {@systemProperty parley.vector} system property set to `false`, they run
+/// scalar code with identical results.
+///
 /// @spec https://www.w3.org/TR/webrtc/ WebRTC: Real-Time Communication in Browsers
 /// @spec https://www.rfc-editor.org/rfc/rfc9429.html RFC 9429: JavaScript Session Establishment Protocol (JSEP)
 /// @spec https://www.rfc-editor.org/rfc/rfc8866.html RFC 8866: SDP: Session Description Protocol
@@ -54,6 +62,7 @@
 module com.github.auties00.parley {
     requires transitive com.github.auties00.srtp;
     requires com.github.auties00.sctp;
+    requires static jdk.incubator.vector;
 
     exports com.github.auties00.parley.peer;
     exports com.github.auties00.parley.event;

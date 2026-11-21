@@ -37,6 +37,19 @@ public final class RedEncoder {
     /// @param frame       the frame; its bytes are copied into the history
     /// @return the RED payload, a new heap buffer
     public ByteBuffer encode(int payloadType, long timestamp, ByteBuffer frame) {
+        var header = encodeHeader(payloadType, timestamp, frame);
+        return ByteBuffer.allocate(header.remaining() + frame.remaining()).put(header).put(frame.duplicate()).flip();
+    }
+
+    /// Encodes the part of the next RED payload before the frame itself, the block headers and the redundant copies
+    /// of earlier frames ([Red#encodeHeader(List,int)]), and remembers the frame for the next payloads. The payload
+    /// is this header followed by `frame`.
+    ///
+    /// @param payloadType the frame's payload type
+    /// @param timestamp   the frame's RTP timestamp
+    /// @param frame       the frame, copied into the history when the distance is positive
+    /// @return the header, a new buffer
+    public ByteBuffer encodeHeader(int payloadType, long timestamp, ByteBuffer frame) {
         var redundant = new ArrayList<Red.Redundant>(history.size());
         for (var previous : history) {
             var offset = (timestamp - previous.timestamp()) & 0xFFFFFFFFL;
@@ -45,7 +58,7 @@ public final class RedEncoder {
                 redundant.add(new Red.Redundant(previous.payloadType(), (int) offset, previous.data()));
             }
         }
-        var payload = Red.encode(redundant, payloadType, frame);
+        var header = Red.encodeHeader(redundant, payloadType);
         if (distance > 0) {
             var copy = ByteBuffer.allocate(frame.remaining()).put(frame.duplicate()).flip();
             history.addLast(new Previous(payloadType, timestamp, copy));
@@ -53,7 +66,7 @@ public final class RedEncoder {
                 history.removeFirst();
             }
         }
-        return payload;
+        return header;
     }
 
     /// Forgets the history, so the next payload carries no redundancy (after a discontinuity).
