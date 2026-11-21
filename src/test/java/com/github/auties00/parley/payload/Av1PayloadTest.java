@@ -246,7 +246,7 @@ class Av1PayloadTest {
                 diffs.add(value.get(i) & 0xFF);
             }
             return new DependencyDescriptor((flags & 0x80) != 0, (flags & 0x40) != 0, 0, number, Optional.empty(),
-                    diffs);
+                    java.util.OptionalLong.empty(), 0, 0, List.of(), diffs, List.of());
         };
 
         @Test
