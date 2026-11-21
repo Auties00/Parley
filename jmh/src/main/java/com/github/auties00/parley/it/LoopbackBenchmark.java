@@ -50,7 +50,6 @@ public class LoopbackBenchmark {
     private PeerConnection receiver;
     private LocalTrack track;
     private EventStream<RemoteTrack.Packet> packets;
-    private EventStream<EncodedFrame> frames;
     private byte[] data;
     private long timestamp;
     private int pictureId;
@@ -80,7 +79,7 @@ public class LoopbackBenchmark {
     public void setup() throws Exception {
         var audio = path.equals("audioPacket");
         sender = peer(RemoteTrackMode.JITTER_BUFFERED);
-        receiver = peer(path.equals("videoFrame") ? RemoteTrackMode.JITTER_BUFFERED : RemoteTrackMode.RAW_PACKETS);
+        receiver = peer(RemoteTrackMode.RAW_PACKETS);
         var tracks = new LinkedBlockingQueue<RemoteTrack>();
         var states = new LinkedBlockingQueue<PeerConnectionState>();
         receiver.addListener(event -> {
@@ -110,11 +109,7 @@ public class LoopbackBenchmark {
         if (remote == null) {
             throw new TimeoutException("no remote track");
         }
-        if (path.equals("videoFrame")) {
-            frames = remote.frames();
-        } else {
-            packets = remote.packets();
-        }
+        packets = remote.packets();
         data = new byte[audio ? 160 : 5000];
         new Random(1).nextBytes(data);
         data[0] = (byte) (audio ? 0x78 : 0x10);
@@ -153,11 +148,8 @@ public class LoopbackBenchmark {
         }
     }
 
-    /// Reads one frame's worth: one frame, or the packets up to the one with the marker bit.
+    /// Reads one frame's worth of packets: up to the one with the marker bit.
     private boolean read(Duration timeout) throws InterruptedException {
-        if (frames != null) {
-            return frames.next(timeout).isPresent();
-        }
         while (true) {
             var packet = packets.next(timeout);
             if (packet.isEmpty()) {

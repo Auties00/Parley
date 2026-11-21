@@ -1,7 +1,7 @@
 # Pushes and pull requests: the test suite on each system (unit tests, RFC vectors, fuzzing, and the loopback
-# end-to-end tests of two peer connections over ICE, TURN, DTLS, SRTP and SCTP), a call against headless Chrome for
-# Testing, then a release dry run that builds the sources and javadoc jars, so a comment doclint rejects fails the
-# change.
+# end-to-end tests of two peer connections over ICE, TURN, DTLS, SRTP and SCTP), once more on the scalar byte
+# kernels, a call against headless Chrome for Testing, the JMH smoke benchmarks, then a release dry run that builds
+# the sources and javadoc jars, so a comment doclint rejects fails the change.
 name: CI
 
 on:
@@ -45,6 +45,12 @@ jobs:
       # The loopback end-to-end tests depend on timers and the runner's scheduler; one rerun absorbs a slow runner
       - name: Test
         run: mvn -B -ntp verify -Dsurefire.rerunFailingTestsCount=1
+
+      # The same suite on the scalar byte kernels (the step above runs the vectorized ones, surefire resolving
+      # jdk.incubator.vector); once is enough, the kernels are pure Java
+      - name: Test on the scalar kernels
+        if: matrix.os == 'ubuntu-latest'
+        run: mvn -B -ntp test -Dparley.vector=false -Dsurefire.rerunFailingTestsCount=1
 
       - name: Upload the test reports
         if: failure()
@@ -91,6 +97,43 @@ jobs:
           name: reports-chrome
           path: target/surefire-reports/
           retention-days: 14
+
+  # The JMH benchmarks of the packet paths (jmh/) with short iterations, so a benchmark that breaks fails the change
+  # and the allocation per operation, which does not depend on the runner's speed, is checked against the recorded
+  # baseline; the times are in the uploaded report, too noisy on shared runners to gate on
+  benchmarks:
+    name: JMH smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '26'
+          cache: maven
+
+      - name: Build the library and the benchmarks
+        run: |
+          mvn -B -ntp -DskipTests install
+          mvn -B -ntp -f jmh/pom.xml package
+
+      - name: Run the benchmarks
+        run: java -jar jmh/target/benchmarks.jar -f 1 -wi 2 -w 1s -i 2 -r 1s -prof gc -foe true -rf json -rff jmh-smoke.json
+
+      - name: Check the allocation per operation against the baseline
+        run: python3 jmh/check-allocation.py jmh-smoke.json jmh/allocation-baseline.json
+
+      - name: Upload the benchmark report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: jmh-smoke
+          path: jmh-smoke.json
+          retention-days: 30
 
   javadoc:
     name: release dry run

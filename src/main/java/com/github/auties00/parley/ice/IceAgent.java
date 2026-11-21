@@ -62,6 +62,7 @@ import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.ThreadLocalRandom;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.locks.Condition;
@@ -345,6 +346,13 @@ public final class IceAgent implements IceTransport {
 
     /// The pair each (local candidate, remote address) routes to, for the reading threads.
     private final Map<PairKey, CheckPair> routes = new ConcurrentHashMap<>();
+
+    /// The version of [#routes], incremented after every change, so a cached route is used only while it is current.
+    private final AtomicInteger routesVersion = new AtomicInteger();
+
+    /// The route the last application datagram took, or `null`: media arrives from one remote address on one local
+    /// candidate, so this spares a lookup key per datagram.
+    private volatile CachedRoute lastRoute;
 
     /// Datagrams queued under the lock and sent after it is released.
     private final ConcurrentLinkedQueue<Outgoing> outgoing = new ConcurrentLinkedQueue<>();
@@ -1542,6 +1550,7 @@ public final class IceAgent implements IceTransport {
             }
             pairs.removeLast();
             routes.values().remove(lowest);
+            routesVersion.incrementAndGet();
         }
         var foundation = pair.foundation();
         var active = pairs.stream().anyMatch(other -> other.foundation().equals(foundation)
@@ -1549,6 +1558,7 @@ public final class IceAgent implements IceTransport {
         pair.state = active ? IceCandidatePairState.FROZEN : IceCandidatePairState.WAITING;
         pairs.add(pair);
         routes.put(new PairKey(local, remote.address), pair);
+        routesVersion.incrementAndGet();
         if (local.path instanceof RelayPath relay) {
             installPermission(relay, remote.address);
         }
@@ -1593,6 +1603,7 @@ public final class IceAgent implements IceTransport {
         remoteIndex.clear();
         pendingResolutions.clear();
         routes.values().removeIf(pair -> pair != retained);
+        routesVersion.incrementAndGet();
         nominating = null;
         nominationScheduled = false;
         firstValidNanos = -1;
@@ -1607,6 +1618,7 @@ public final class IceAgent implements IceTransport {
             retainedLocal = local;
             retainedRemote = remote;
             routes.put(new PairKey(retained.local, retained.remoteAddress), retained);
+            routesVersion.incrementAndGet();
         }
     }
 
@@ -1907,7 +1919,18 @@ public final class IceAgent implements IceTransport {
             drainOutgoing();
             return;
         }
-        var pair = routes.get(new PairKey(local, source));
+        CheckPair pair;
+        var version = routesVersion.get();
+        var cached = lastRoute;
+        if (cached != null && cached.version() == version && cached.local() == local
+                && cached.remote().equals(source)) {
+            pair = cached.pair();
+        } else {
+            pair = routes.get(new PairKey(local, source));
+            if (pair != null) {
+                lastRoute = new CachedRoute(local, source, pair, version);
+            }
+        }
         if (pair == null && link != null) {
             pair = findByLink(link);
         }
@@ -2022,6 +2045,7 @@ public final class IceAgent implements IceTransport {
                 pair.state = IceCandidatePairState.WAITING;
                 pairs.add(pair);
                 routes.put(new PairKey(local, source), pair);
+                routesVersion.incrementAndGet();
                 sortPairs();
             }
             if (pair == null) {
@@ -2261,6 +2285,7 @@ public final class IceAgent implements IceTransport {
                     pairs.remove(pair);
                     triggered.remove(pair);
                     routes.values().remove(pair);
+                    routesVersion.incrementAndGet();
                 }
                 case IN_PROGRESS -> {
                     if (pair.inFlight != null) {
@@ -2310,6 +2335,7 @@ public final class IceAgent implements IceTransport {
         }
         if (candidate != null && candidate != retained && retained != null) {
             routes.values().remove(retained);
+            routesVersion.incrementAndGet();
             retained = null;
             retainedLocal = null;
             retainedRemote = null;
@@ -2400,6 +2426,7 @@ public final class IceAgent implements IceTransport {
         }
         if (pair == retained) {
             routes.values().remove(retained);
+            routesVersion.incrementAndGet();
             retained = null;
         }
         if (selected == pair) {
@@ -2643,6 +2670,15 @@ public final class IceAgent implements IceTransport {
     /// @param local  the local candidate the data arrived on
     /// @param remote the source address
     private record PairKey(LocalCandidate local, InetSocketAddress remote) {
+    }
+
+    /// A route a datagram took, valid while [#routesVersion] still holds `version`.
+    ///
+    /// @param local   the local candidate the datagram arrived on
+    /// @param remote  its source address
+    /// @param pair    the pair it routed to
+    /// @param version the version of the routes it was looked up in
+    private record CachedRoute(LocalCandidate local, InetSocketAddress remote, CheckPair pair, int version) {
     }
 
     /// A datagram queued for sending once the lock is released.
