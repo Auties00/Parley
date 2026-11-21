@@ -166,6 +166,20 @@ class DtlsTransportTest {
             }
         }
 
+        @ParameterizedTest(name = "cookie exchange {0}")
+        @org.junit.jupiter.params.provider.ValueSource(booleans = {true, false})
+        @DisplayName("answers a DTLS 1.3 HelloRetryRequest for another group")
+        void helloRetryForGroup(boolean cookies) throws Exception {
+            ClientHandshake.forceGroupRetry = true;
+            try (var pair = connect(new MemoryLink(), DtlsConfig.of(ECDSA_CLIENT),
+                    DtlsConfig.of(ECDSA_SERVER).withCookieExchange(cookies))) {
+                assertEquals(DtlsVersion.DTLS_1_3, pair.client().negotiatedVersion().orElseThrow());
+                assertMirrored(pair.clientKeys(), pair.serverKeys());
+            } finally {
+                ClientHandshake.forceGroupRetry = false;
+            }
+        }
+
         @ParameterizedTest(name = "{0}")
         @EnumSource(DtlsVersion.class)
         @DisplayName("completes without the cookie exchange")

@@ -29,6 +29,13 @@ import java.util.Map;
 /// @spec https://www.rfc-editor.org/rfc/rfc8422.html RFC 8422: Elliptic Curve Cryptography (ECC) Cipher Suites for Transport Layer Security (TLS) Versions 1.2 and Earlier
 /// @spec https://www.rfc-editor.org/rfc/rfc5746.html RFC 5746: Transport Layer Security (TLS) Renegotiation Indication Extension
 final class ClientHandshake extends Handshake {
+    /// The unassigned group id of the key share [#forceGroupRetry] sends.
+    static final int UNASSIGNED_GROUP = 0x7777;
+
+    /// Test hook: when set, the first DTLS 1.3 `ClientHello` carries only a key share for an unassigned group, which
+    /// forces the server to answer with a `HelloRetryRequest` naming a group.
+    static volatile boolean forceGroupRetry;
+
     /// Whether DTLS 1.2 is offered.
     private final boolean offer12;
 
@@ -96,7 +103,7 @@ final class ClientHandshake extends Handshake {
     @Override
     void start() throws IOException {
         clientRandom = random();
-        if (offer13) {
+        if (offer13 && !forceGroupRetry) {
             keyShares.put(NamedGroup.X25519, NamedGroup.X25519.generate());
         }
         sendClientHello();
@@ -165,6 +172,9 @@ final class ClientHandshake extends Handshake {
             var list = shares.open16();
             for (var entry : keyShares.entrySet()) {
                 shares.u16(entry.getKey().id()).vector16(entry.getKey().encode(entry.getValue().getPublic()));
+            }
+            if (keyShares.isEmpty()) {
+                shares.u16(UNASSIGNED_GROUP).vector16(random());
             }
             shares.close(list);
             writeExtension(body, EXT_KEY_SHARE, shares.toByteArray());
