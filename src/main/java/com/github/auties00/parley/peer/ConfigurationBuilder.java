@@ -54,7 +54,7 @@ public abstract sealed class ConfigurationBuilder<B extends ConfigurationBuilder
     /// The DTLS versions.
     private Set<DtlsVersion> dtlsVersions = Set.of(DtlsVersion.DTLS_1_2, DtlsVersion.DTLS_1_3);
     /// The SRTP profiles.
-    private List<SrtpProfile> srtpProfiles = List.of(SrtpProfile.AEAD_AES_128_GCM,
+    private List<SrtpProfile> srtpProfiles = List.of(SrtpProfile.AEAD_AES_128_GCM, SrtpProfile.AEAD_AES_256_GCM,
             SrtpProfile.AES128_CM_HMAC_SHA1_80, SrtpProfile.AES128_CM_HMAC_SHA1_32);
     /// The codecs.
     private List<Codec> codecs = CodecCatalog.defaultCodecs();
@@ -70,6 +70,10 @@ public abstract sealed class ConfigurationBuilder<B extends ConfigurationBuilder
     private long maxBitrate = 10_000_000;
     /// The DTLS handshake timeout.
     private Duration handshakeTimeout = Duration.ofSeconds(30);
+    /// Whether ICE gathers TCP candidates.
+    private boolean tcpCandidates = true;
+    /// Whether ICE gathers loopback candidates.
+    private boolean loopbackCandidates;
 
     /// Creates a builder with the defaults.
     ConfigurationBuilder() {
@@ -100,6 +104,8 @@ public abstract sealed class ConfigurationBuilder<B extends ConfigurationBuilder
         startBitrate = configuration.startBitrate();
         maxBitrate = configuration.maxBitrate();
         handshakeTimeout = configuration.handshakeTimeout();
+        tcpCandidates = configuration.tcpCandidates();
+        loopbackCandidates = configuration.loopbackCandidates();
     }
 
     /// {@return the configuration of the current settings}
@@ -109,7 +115,7 @@ public abstract sealed class ConfigurationBuilder<B extends ConfigurationBuilder
         return new Configuration(iceServers, iceTransportPolicy, bundlePolicy, rtcpMuxPolicy, certificates,
                 iceCandidatePoolSize, hostCandidatePolicy, Optional.ofNullable(networkStack), threadFactory, clock,
                 iceLite, dtlsVersions, srtpProfiles, codecs, headerExtensions, remoteTrackMode, minBitrate,
-                startBitrate, maxBitrate, handshakeTimeout);
+                startBitrate, maxBitrate, handshakeTimeout, tcpCandidates, loopbackCandidates);
     }
 
     /// Sets the STUN and TURN servers.
@@ -271,6 +277,26 @@ public abstract sealed class ConfigurationBuilder<B extends ConfigurationBuilder
         minBitrate = min;
         startBitrate = start;
         maxBitrate = max;
+        return self();
+    }
+
+    /// Sets whether ICE gathers TCP host candidates (passive and active, RFC 6544) besides UDP ones; on by default.
+    ///
+    /// @param enabled whether TCP candidates are gathered
+    /// @return this builder
+    /// @spec https://www.rfc-editor.org/rfc/rfc6544.html RFC 6544: TCP Candidates with Interactive Connectivity Establishment (ICE)
+    public B tcpCandidates(boolean enabled) {
+        tcpCandidates = enabled;
+        return self();
+    }
+
+    /// Sets whether ICE gathers host candidates on loopback interfaces; off by default, on for two peers in one host
+    /// or one test.
+    ///
+    /// @param enabled whether loopback candidates are gathered
+    /// @return this builder
+    public B loopbackCandidates(boolean enabled) {
+        loopbackCandidates = enabled;
         return self();
     }
 

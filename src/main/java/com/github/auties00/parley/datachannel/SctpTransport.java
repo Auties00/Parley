@@ -116,12 +116,15 @@ public final class SctpTransport implements AutoCloseable {
         return new SctpTransport(dtls::applicationData, config);
     }
 
-    /// Creates a transport directly over a datagram transport that already provides DTLS (or, in tests, nothing).
+    /// Creates a transport directly over a datagram transport that already provides DTLS, such as the application
+    /// data of a [DtlsTransport] that is attached later, or (in tests) a plain datagram path.
+    ///
+    /// Data channels can be created before [#start(DtlsRole, int, long, Duration)]; they open once it completes.
     ///
     /// @param applicationData the datagram transport
     /// @param config          the configuration
-    /// @return the transport
-    static SctpTransport overDatagrams(DatagramTransport applicationData, SctpConfig config) {
+    /// @return the transport, [SctpTransportState#CONNECTING] and not started
+    public static SctpTransport overDatagrams(DatagramTransport applicationData, SctpConfig config) {
         Objects.requireNonNull(applicationData, "applicationData");
         Objects.requireNonNull(config, "config");
         return new SctpTransport(() -> applicationData, config);

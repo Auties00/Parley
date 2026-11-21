@@ -199,6 +199,54 @@ public final class RtpSendStream {
         session.dispatch(outgoing);
     }
 
+    /// Sends payloads of another payload type on this stream's source and sequence space, without RED, FEC or the
+    /// sender report clock update, as RFC 4733 telephone events need: they share the audio source and its sequence
+    /// numbers but have their own payload type and timestamps.
+    ///
+    /// @param payloadType  the payload type of the packets, `0..127`
+    /// @param payloads     the payloads, in order, at least one
+    /// @param rtpTimestamp the RTP timestamp, an unsigned 32-bit value
+    /// @param priority     the scheduling priority
+    /// @throws IOException             if the scheduler sends at once and the transport fails
+    /// @throws IllegalArgumentException if `payloads` is empty or a value is out of range
+    /// @throws IllegalStateException   if the session is closed
+    /// @spec https://www.rfc-editor.org/rfc/rfc4733.html RFC 4733: RTP Payload for DTMF Digits, Telephony Tones, and Telephony Signals
+    public void sendWithPayloadType(int payloadType, List<Payload> payloads, long rtpTimestamp,
+                                    OutgoingPacketScheduler.Priority priority) throws IOException {
+        Objects.requireNonNull(payloads, "payloads cannot be null");
+        Objects.requireNonNull(priority, "priority cannot be null");
+        if (payloads.isEmpty()) {
+            throw new IllegalArgumentException("payloads cannot be empty");
+        }
+        if (payloadType < 0 || payloadType > 127) {
+            throw new IllegalArgumentException("payload type out of range: " + payloadType);
+        }
+        if (rtpTimestamp < 0 || rtpTimestamp > 0xFFFFFFFFL) {
+            throw new IllegalArgumentException("rtpTimestamp must be an unsigned 32-bit value: " + rtpTimestamp);
+        }
+        var outgoing = new ArrayList<RtpSession.Outgoing>(payloads.size());
+        var lock = session.lock();
+        lock.lock();
+        try {
+            session.checkOpen();
+            var now = session.now();
+            for (var payload : payloads) {
+                var seq = sequence;
+                sequence = (sequence + 1) & 0xFFFF;
+                var packet = writePacket(config.ssrc(), payloadType, seq, rtpTimestamp, payload.marker(),
+                        payload.extensions(), payload.payload(), ridId);
+                if (history != null) {
+                    history.store(view(packet).copy(), now, priority);
+                }
+                outgoing.add(new RtpSession.Outgoing(packet, priority, config.ssrc(), RtpSession.PacketKind.MEDIA,
+                        this));
+            }
+        } finally {
+            lock.unlock();
+        }
+        session.dispatch(outgoing);
+    }
+
     private void buildMedia(Payload payload, long timestamp, OutgoingPacketScheduler.Priority priority, long now,
                             List<RtpSession.Outgoing> out) {
         var mediaPayload = payload.payload();

@@ -387,7 +387,9 @@ public final class PeerConnection implements AutoCloseable {
                     || current.remoteTrackMode() != newConfiguration.remoteTrackMode()
                     || !current.networkStack().equals(newConfiguration.networkStack())
                     || current.threadFactory() != newConfiguration.threadFactory()
-                    || current.clock() != newConfiguration.clock()) {
+                    || current.clock() != newConfiguration.clock()
+                    || current.tcpCandidates() != newConfiguration.tcpCandidates()
+                    || current.loopbackCandidates() != newConfiguration.loopbackCandidates()) {
                 throw new InvalidModificationException("only the ICE servers, ICE transport policy and candidate pool "
                         + "size can change");
             }

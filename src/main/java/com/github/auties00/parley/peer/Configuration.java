@@ -45,6 +45,8 @@ import java.util.concurrent.ThreadFactory;
 /// @param startBitrate         the send bitrate before the first estimate, in bits per second
 /// @param maxBitrate           the highest send bitrate congestion control goes to, in bits per second
 /// @param handshakeTimeout     the longest time a DTLS handshake may take
+/// @param tcpCandidates        whether ICE gathers TCP host candidates (RFC 6544) besides UDP ones
+/// @param loopbackCandidates   whether ICE gathers host candidates on loopback interfaces, for peers on one host
 /// @spec https://www.w3.org/TR/webrtc/ WebRTC: Real-Time Communication in Browsers
 public record Configuration(List<IceServer> iceServers, IceTransportPolicy iceTransportPolicy,
                             BundlePolicy bundlePolicy, RtcpMuxPolicy rtcpMuxPolicy,
@@ -53,7 +55,8 @@ public record Configuration(List<IceServer> iceServers, IceTransportPolicy iceTr
                             ThreadFactory threadFactory, MonotonicClock clock, boolean iceLite,
                             Set<DtlsVersion> dtlsVersions, List<SrtpProfile> srtpProfiles, List<Codec> codecs,
                             List<RtpHeaderExtensionCapability> headerExtensions, RemoteTrackMode remoteTrackMode,
-                            long minBitrate, long startBitrate, long maxBitrate, Duration handshakeTimeout) {
+                            long minBitrate, long startBitrate, long maxBitrate, Duration handshakeTimeout,
+                            boolean tcpCandidates, boolean loopbackCandidates) {
     /// Creates a configuration, copying its collections.
     ///
     /// @param iceServers           the ICE servers
@@ -76,6 +79,8 @@ public record Configuration(List<IceServer> iceServers, IceTransportPolicy iceTr
     /// @param startBitrate         the start bitrate
     /// @param maxBitrate           the maximum bitrate
     /// @param handshakeTimeout     the DTLS handshake timeout
+    /// @param tcpCandidates        whether ICE gathers TCP candidates
+    /// @param loopbackCandidates   whether ICE gathers loopback candidates
     /// @throws IllegalArgumentException if `iceCandidatePoolSize` is outside `0..255`, `dtlsVersions`,
     ///                                  `srtpProfiles` or `codecs` is empty, the bitrates are not positive and
     ///                                  ordered, or `handshakeTimeout` is not positive

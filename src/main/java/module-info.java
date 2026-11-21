@@ -25,15 +25,16 @@
 /// | [com.github.auties00.parley.rtp] | RTP packets |
 /// | [com.github.auties00.parley.transport] | SRTP-protected RTP transports, keyed by DTLS-SRTP or SDES |
 /// | [com.github.auties00.parley.dtls] | DTLS 1.2 and 1.3 transports, certificates and fingerprints |
-/// | [com.github.auties00.parley.ice] | ICE agents, full and lite, with their candidates |
-/// | [com.github.auties00.parley.stun] | STUN messages and transactions |
-/// | [com.github.auties00.parley.net] | The network SPI every socket goes through |
+/// | [com.github.auties00.parley.ice] | ICE agents, full and lite, with candidate gathering (host, mDNS, server-reflexive, relayed, TCP), trickle, restarts and consent freshness |
+/// | [com.github.auties00.parley.turn] | The TURN client: allocations, permissions and channels over UDP, TCP and TLS |
+/// | [com.github.auties00.parley.stun] | STUN messages, attributes, long-term and short-term credentials, client transactions |
+/// | [com.github.auties00.parley.net] | The network SPI every socket goes through, and its JDK implementation |
 ///
 /// # Threading and logging
 ///
 /// Parley starts its threads through the [java.util.concurrent.ThreadFactory] of the peer connection's configuration
-/// (virtual threads by default) and never through any other means, so the application decides how they are named and
-/// run. Every call that waits on the network blocks the calling thread and takes a timeout or can be interrupted;
+/// (virtual threads by default), or of the [com.github.auties00.parley.net.NetworkStack] for the sockets' readers, so
+/// the application decides how they are named and run. Every call that waits on the network blocks the calling thread and takes a timeout or can be interrupted;
 /// nothing returns a future. Parley logs through [System#getLogger(String)], under the name of the logging class,
 /// and never logs key material or ICE credentials.
 ///
@@ -66,6 +67,7 @@ module com.github.auties00.parley {
     exports com.github.auties00.parley.transport;
     exports com.github.auties00.parley.dtls;
     exports com.github.auties00.parley.ice;
+    exports com.github.auties00.parley.turn;
     exports com.github.auties00.parley.stun;
     exports com.github.auties00.parley.net;
 }

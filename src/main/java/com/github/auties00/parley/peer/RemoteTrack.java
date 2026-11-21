@@ -9,7 +9,6 @@ import java.time.Duration;
 import java.util.ArrayDeque;
 import java.util.Objects;
 import java.util.Optional;
-import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.Condition;
 import java.util.concurrent.locks.ReentrantLock;
@@ -182,7 +181,8 @@ public final class RemoteTrack {
             throw new IllegalStateException("only an audio track has playout outcomes");
         }
         var item = take(Long.MAX_VALUE).orElseThrow(() -> new IllegalStateException("the track has ended"));
-        return item instanceof AudioPlayout playout ? playout : new AudioPlayout.Frame((EncodedFrame) item);
+        return item instanceof AudioPlayout playout ? playout : new AudioPlayout.Frame((EncodedFrame) item,
+                java.time.Duration.ZERO);
     }
 
     /// Waits for the next RTP packet.
@@ -218,7 +218,7 @@ public final class RemoteTrack {
     private static Optional<EncodedFrame> asFrame(Object item) {
         return switch (item) {
             case EncodedFrame frame -> Optional.of(frame);
-            case AudioPlayout.Frame(var frame) -> Optional.of(frame);
+            case AudioPlayout.Frame(var frame, var ignored) -> Optional.of(frame);
             default -> Optional.empty();
         };
     }
@@ -293,10 +293,5 @@ public final class RemoteTrack {
     @Override
     public String toString() {
         return "RemoteTrack[id=" + id + ", kind=" + kind + "]";
-    }
-
-    /// {@return the unit `timeout` expressed in nanoseconds, saturating}
-    static long nanos(Duration timeout) {
-        return TimeUnit.NANOSECONDS.convert(timeout);
     }
 }

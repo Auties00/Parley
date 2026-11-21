@@ -5,7 +5,6 @@ import com.github.auties00.parley.ice.IceGatheringState;
 import com.github.auties00.parley.ice.IceTransportPolicy;
 import com.github.auties00.parley.ice.IceTransportState;
 import com.github.auties00.parley.media.EncodedFrame;
-import com.github.auties00.parley.media.GenericFrameMetadata;
 import com.github.auties00.parley.media.MediaKind;
 import com.github.auties00.parley.stats.InboundRtpStreamStats;
 import com.github.auties00.parley.stats.OutboundRtpStreamStats;
@@ -42,8 +41,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 @DisplayName("peer API")
 class PeerApiTest {
     static EncodedFrame frame(MediaKind kind) {
-        return new EncodedFrame(kind, ByteBuffer.wrap(new byte[]{1, 2, 3}), 1000, true, Optional.empty(),
-                new GenericFrameMetadata(kind));
+        return EncodedFrame.of(kind, ByteBuffer.wrap(new byte[]{1, 2, 3}), 1000, true);
     }
 
     @Nested
@@ -160,8 +158,7 @@ class PeerApiTest {
             sender.setPipeline((frame, rid) -> seen.add(frame));
             track.write(frame(MediaKind.VIDEO));
             assertEquals(1, seen.size());
-            sender.setTransform(frame -> new EncodedFrame(frame.kind(), ByteBuffer.wrap(new byte[]{9}),
-                    frame.rtpTimestamp(), frame.keyframe(), frame.captureTime(), frame.metadata()));
+            sender.setTransform(frame -> frame.withData(ByteBuffer.wrap(new byte[]{9})));
             track.write(frame(MediaKind.VIDEO));
             assertEquals(1, seen.get(1).data().remaining());
             sender.setTransform(frame -> {
@@ -219,8 +216,7 @@ class PeerApiTest {
         void overflow() throws InterruptedException {
             var track = new RemoteTrack("t", MediaKind.VIDEO, RemoteTrackMode.JITTER_BUFFERED);
             for (var index = 0; index < 1030; index++) {
-                track.deliver(new EncodedFrame(MediaKind.VIDEO, ByteBuffer.allocate(1), index, false,
-                        Optional.empty(), new GenericFrameMetadata(MediaKind.VIDEO)));
+                track.deliver(EncodedFrame.of(MediaKind.VIDEO, ByteBuffer.allocate(1), index, false));
             }
             assertEquals(6, track.dropped());
             assertEquals(6, track.read().rtpTimestamp());
