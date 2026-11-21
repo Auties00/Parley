@@ -278,6 +278,10 @@ public final class IceAgent implements IceTransport {
     /// Whether the nomination timer is scheduled; guarded by [#lock].
     private boolean nominationScheduled;
 
+    /// Whether the checklist concluded: a nominated pair is selected, so no new ordinary pair is checked (RFC 8445
+    /// section 8.1.2); guarded by [#lock].
+    private boolean concluded;
+
     /// The pair the controlling agent is nominating, or `null`; guarded by [#lock].
     private CheckPair nominating;
 
@@ -1097,7 +1101,7 @@ public final class IceAgent implements IceTransport {
             if (signaled != null) {
                 emit(new IceEvent.CandidateGathered(signaled.withUsernameFragment(localParameters.usernameFragment())));
             }
-            if (local.isPairable()) {
+            if (local.isPairable() && !concluded) {
                 for (var remote : List.copyOf(remotes)) {
                     formPair(local, remote);
                 }
@@ -1172,7 +1176,7 @@ public final class IceAgent implements IceTransport {
         var remote = new RemoteCandidate(candidate, address);
         remotes.add(remote);
         for (var local : List.copyOf(locals)) {
-            if (local.isPairable()) {
+            if (local.isPairable() && !concluded) {
                 formPair(local, remote);
             }
         }
@@ -1278,6 +1282,7 @@ public final class IceAgent implements IceTransport {
         nominating = null;
         nominationScheduled = false;
         firstValidNanos = -1;
+        concluded = false;
     }
 
     /// Keeps the selected pair alive across a restart, with the credentials of its generation; the caller holds
@@ -1510,6 +1515,9 @@ public final class IceAgent implements IceTransport {
             InetSocketAddress source;
             try {
                 source = endpoint.receive(buffer);
+            } catch (java.net.PortUnreachableException exception) {
+                // An ICMP error for an earlier check to a dead candidate; the socket is still usable.
+                continue;
             } catch (IOException exception) {
                 return;
             }
@@ -1929,6 +1937,33 @@ public final class IceAgent implements IceTransport {
         }
     }
 
+    /// Concludes the checklist once a nominated pair is selected: pairs not yet checked are removed and checks in
+    /// progress stop, as RFC 8445 section 8.1.2 describes; the caller holds [#lock].
+    ///
+    /// Checks the peer triggers later still run, so a peer that nominates another pair is followed.
+    private void conclude() {
+        concluded = true;
+        for (var pair : List.copyOf(pairs)) {
+            switch (pair.state) {
+                case WAITING, FROZEN -> {
+                    pairs.remove(pair);
+                    triggered.remove(pair);
+                    routes.values().remove(pair);
+                }
+                case IN_PROGRESS -> {
+                    if (pair.inFlight != null) {
+                        pair.inFlight.cancel();
+                        checks.remove(pair.inFlight.id);
+                        pair.inFlight = null;
+                    }
+                    pair.state = IceCandidatePairState.FAILED;
+                }
+                case SUCCEEDED, FAILED -> {
+                }
+            }
+        }
+    }
+
     /// {@return the highest-priority valid pair whose consent did not expire, or `null`}; the caller holds [#lock].
     private CheckPair bestValid() {
         for (var pair : pairs) {
@@ -1966,6 +2001,9 @@ public final class IceAgent implements IceTransport {
             retained = null;
             retainedLocal = null;
             retainedRemote = null;
+        }
+        if (candidate != null && candidate.nominated && !concluded) {
+            conclude();
         }
         if (candidate == selected) {
             return;

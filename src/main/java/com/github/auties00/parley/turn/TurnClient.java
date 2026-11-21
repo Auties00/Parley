@@ -471,7 +471,13 @@ public final class TurnClient implements AutoCloseable {
         var buffer = ByteBuffer.allocate(MAX_MESSAGE);
         while (!closed) {
             buffer.clear();
-            var source = udp.endpoint().receive(buffer);
+            InetSocketAddress source;
+            try {
+                source = udp.endpoint().receive(buffer);
+            } catch (java.net.PortUnreachableException exception) {
+                // An ICMP error for an earlier datagram; the socket is still usable.
+                continue;
+            }
             var arrival = clock.nanos();
             if (!source.equals(udp.server())) {
                 continue;
