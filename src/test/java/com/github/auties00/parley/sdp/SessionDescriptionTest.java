@@ -111,18 +111,18 @@ class SessionDescriptionTest {
             var description = SessionDescription.parse(SDES_OFFER);
             var crypto = SdesCrypto.parse(description.media().getFirst().attribute("crypto").orElseThrow());
             assertEquals(1, crypto.tag());
-            assertEquals("AES_CM_128_HMAC_SHA1_80", crypto.suite());
+            assertEquals(com.github.auties00.srtp.SrtpCryptoSuite.AES_CM_128_HMAC_SHA1_80, crypto.suite());
             assertEquals(30, crypto.keySalt().length);
         }
 
         @Test
         @DisplayName("generates a key that survives formatting and parsing")
         void generate() {
-            var crypto = SdesCrypto.generate(2, "AES_CM_128_HMAC_SHA1_80", 16, 14);
+            var crypto = SdesCrypto.generate(2, com.github.auties00.srtp.SrtpCryptoSuite.AES_CM_128_HMAC_SHA1_80);
             var parsed = SdesCrypto.parse(crypto.value());
             assertArrayEquals(crypto.keySalt(), parsed.keySalt());
-            assertArrayEquals(crypto.masterKey(16), parsed.masterKey(16));
-            assertEquals(14, parsed.masterSalt(16, 14).length);
+            assertArrayEquals(crypto.masterKey(), parsed.masterKey());
+            assertEquals(14, parsed.masterSalt().length);
         }
     }
 }

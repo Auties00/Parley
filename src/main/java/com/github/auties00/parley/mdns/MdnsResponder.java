@@ -20,6 +20,10 @@ import java.util.concurrent.ThreadFactory;
 
 /// Answers multicast DNS queries for the `<uuid>.local` names that hide local host candidate addresses.
 ///
+/// A responder listens on one socket per address family: [#openMulticast(ThreadFactory)] joins `224.0.0.251` on every
+/// interface with an IPv4 address and `[ff02::fb]` on every interface with an IPv6 address, so peers that query over
+/// either family, IPv6-only links included, get an answer.
+///
 /// [#register(InetAddress)] generates a fresh name for an address (one name per address, reused when the same
 /// address is registered again), announces it once, and from then on answers `A`, `AAAA` and `ANY` queries for it:
 /// with a multicast response to a multicast query, a unicast response to a query with the unicast-response bit, and
@@ -38,8 +42,8 @@ public final class MdnsResponder implements AutoCloseable {
     /// The time to live of a legacy unicast answer, at most ten seconds per RFC 6762 section 6.7.
     static final long LEGACY_TTL = 10;
 
-    /// The socket.
-    private final MdnsChannel channel;
+    /// The sockets, one per address family.
+    private final List<MdnsChannel> channels;
 
     /// The registered addresses by name.
     private final Map<String, InetAddress> addresses = new ConcurrentHashMap<>();
@@ -55,21 +59,56 @@ public final class MdnsResponder implements AutoCloseable {
     /// @param channel       the socket
     /// @param threadFactory the factory of the reading thread
     public MdnsResponder(MdnsChannel channel, ThreadFactory threadFactory) {
-        this.channel = Objects.requireNonNull(channel, "channel cannot be null");
-        threadFactory.newThread(this::readLoop).start();
+        this(List.of(Objects.requireNonNull(channel, "channel cannot be null")), threadFactory);
     }
 
-    /// {@return a responder on the IPv4 multicast DNS group, joined on every multicast-capable interface that is up}
+    /// Creates a responder over several sockets bound to port 5353, one per address family, and starts one reading
+    /// thread for each.
+    ///
+    /// @param channels      the sockets, not empty
+    /// @param threadFactory the factory of the reading threads
+    /// @throws IllegalArgumentException if `channels` is empty
+    public MdnsResponder(List<MdnsChannel> channels, ThreadFactory threadFactory) {
+        this.channels = List.copyOf(channels);
+        if (this.channels.isEmpty()) {
+            throw new IllegalArgumentException("a responder needs a socket");
+        }
+        for (var channel : this.channels) {
+            threadFactory.newThread(() -> readLoop(channel)).start();
+        }
+    }
+
+    /// {@return a responder on the multicast DNS groups of both families, `224.0.0.251` joined on every
+    /// multicast-capable interface with an IPv4 address and `[ff02::fb]` on every one with an IPv6 address}
+    ///
+    /// A family whose socket cannot be opened or joined on any interface is left out, as long as the other one works.
     ///
     /// @implNote This implementation opens the socket with the JDK directly instead of through a
     /// [com.github.auties00.parley.net.NetworkStack]: answering link-local multicast needs port 5353 shared with the
     /// host's own responder and group membership, which the stack SPI does not model, and the traffic never leaves
     /// the local link, so there is nothing to route through a proxy.
     ///
-    /// @param threadFactory the factory of the reading thread
-    /// @throws IOException if the socket cannot be bound or no interface can join the group
+    /// @param threadFactory the factory of the reading threads
+    /// @throws IOException if neither socket can be bound or no interface can join either group
+    /// @spec https://www.rfc-editor.org/rfc/rfc6762.html RFC 6762: Multicast DNS
     public static MdnsResponder openMulticast(ThreadFactory threadFactory) throws IOException {
-        return new MdnsResponder(MulticastChannel.open(), threadFactory);
+        var channels = new ArrayList<MdnsChannel>(2);
+        IOException failure = null;
+        for (var family : List.of(StandardProtocolFamily.INET, StandardProtocolFamily.INET6)) {
+            try {
+                channels.add(MulticastChannel.open(family));
+            } catch (IOException exception) {
+                if (failure == null) {
+                    failure = exception;
+                } else {
+                    failure.addSuppressed(exception);
+                }
+            }
+        }
+        if (channels.isEmpty()) {
+            throw failure;
+        }
+        return new MdnsResponder(channels, threadFactory);
     }
 
     /// Registers an address under a fresh `<uuid>.local` name, or returns the name it already has.
@@ -101,17 +140,19 @@ public final class MdnsResponder implements AutoCloseable {
     private void announce(String name, InetAddress address) {
         var announcement = new MdnsMessage(0, true, List.of(),
                 List.of(MdnsMessage.Answer.address(name, address, TTL, true)));
-        try {
-            channel.send(announcement.encode(), MdnsChannel.IPV4_GROUP);
-        } catch (IOException | RuntimeException exception) {
-            if (LOGGER.isLoggable(Level.DEBUG)) {
-                LOGGER.log(Level.DEBUG, "cannot announce an mDNS name", exception);
+        for (var channel : channels) {
+            try {
+                channel.send(announcement.encode(), channel.group());
+            } catch (IOException | RuntimeException exception) {
+                if (LOGGER.isLoggable(Level.DEBUG)) {
+                    LOGGER.log(Level.DEBUG, "cannot announce an mDNS name", exception);
+                }
             }
         }
     }
 
-    /// Reads queries until the socket closes, answering the ones about registered names.
-    private void readLoop() {
+    /// Reads queries from one socket until it closes, answering the ones about registered names on that socket.
+    private void readLoop(MdnsChannel channel) {
         var buffer = ByteBuffer.allocate(MdnsMessage.MAX_LENGTH);
         while (!closed) {
             buffer.clear();
@@ -125,7 +166,7 @@ public final class MdnsResponder implements AutoCloseable {
             try {
                 var query = MdnsMessage.decode(buffer);
                 if (!query.response()) {
-                    answer(query, source);
+                    answer(channel, query, source);
                 }
             } catch (MdnsFormatException | RuntimeException exception) {
                 if (LOGGER.isLoggable(Level.TRACE)) {
@@ -135,8 +176,8 @@ public final class MdnsResponder implements AutoCloseable {
         }
     }
 
-    /// Answers the questions of one query about registered names.
-    void answer(MdnsMessage query, InetSocketAddress source) {
+    /// Answers the questions of one query about registered names, on the socket the query arrived on.
+    void answer(MdnsChannel channel, MdnsMessage query, InetSocketAddress source) {
         var legacy = source.getPort() != 5353;
         var unicast = legacy;
         var answered = new ArrayList<MdnsMessage.Question>();
@@ -161,7 +202,7 @@ public final class MdnsResponder implements AutoCloseable {
                 ? new MdnsMessage(query.id(), true, answered, answers)
                 : new MdnsMessage(0, true, List.of(), answers);
         try {
-            channel.send(response.encode(), unicast ? source : MdnsChannel.IPV4_GROUP);
+            channel.send(response.encode(), unicast ? source : channel.group());
         } catch (IOException exception) {
             if (LOGGER.isLoggable(Level.DEBUG)) {
                 LOGGER.log(Level.DEBUG, "cannot send an mDNS answer", exception);
@@ -169,46 +210,50 @@ public final class MdnsResponder implements AutoCloseable {
         }
     }
 
-    /// Closes the socket and forgets every name. Calling it again has no effect.
+    /// Closes the sockets and forgets every name. Calling it again has no effect.
     @Override
     public void close() {
         closed = true;
-        channel.close();
+        channels.forEach(MdnsChannel::close);
         addresses.clear();
         names.clear();
     }
 
-    /// The JDK socket bound to port 5353 and joined to `224.0.0.251`.
+    /// The JDK socket bound to port 5353 and joined to the multicast DNS group of one family.
     ///
     /// @param channel the socket
-    private record MulticastChannel(DatagramChannel channel) implements MdnsChannel {
-        /// Binds the socket and joins the group on every usable interface.
-        static MulticastChannel open() throws IOException {
-            var channel = DatagramChannel.open(StandardProtocolFamily.INET);
+    /// @param group   the group it joined
+    private record MulticastChannel(DatagramChannel channel, InetSocketAddress group) implements MdnsChannel {
+        /// Binds the socket of a family and joins its group on every usable interface with an address of that family.
+        static MulticastChannel open(StandardProtocolFamily family) throws IOException {
+            var ipv4 = family == StandardProtocolFamily.INET;
+            var group = ipv4 ? IPV4_GROUP : IPV6_GROUP;
+            var channel = DatagramChannel.open(family);
             try {
                 channel.setOption(StandardSocketOptions.SO_REUSEADDR, true);
-                channel.bind(new InetSocketAddress(5353));
+                channel.bind(new InetSocketAddress(ipv4 ? InetAddress.ofLiteral("0.0.0.0") : InetAddress.ofLiteral("::"), 5353));
                 channel.setOption(StandardSocketOptions.IP_MULTICAST_TTL, 255);
                 var joined = 0;
                 for (var networkInterface : NetworkInterface.networkInterfaces().toList()) {
                     if (!networkInterface.isUp() || !networkInterface.supportsMulticast()) {
                         continue;
                     }
-                    var hasIpv4 = networkInterface.inetAddresses().anyMatch(Inet4Address.class::isInstance);
-                    if (!hasIpv4) {
+                    var hasAddress = networkInterface.inetAddresses()
+                            .anyMatch(address -> (address instanceof Inet4Address) == ipv4);
+                    if (!hasAddress) {
                         continue;
                     }
                     try {
-                        channel.join(IPV4_GROUP.getAddress(), networkInterface);
+                        channel.join(group.getAddress(), networkInterface);
                         joined++;
                     } catch (IOException | UnsupportedOperationException _) {
                         // Some adapters refuse membership; the others still answer.
                     }
                 }
                 if (joined == 0) {
-                    throw new IOException("no interface could join the mDNS group");
+                    throw new IOException("no interface could join the mDNS group " + group);
                 }
-                return new MulticastChannel(channel);
+                return new MulticastChannel(channel, group);
             } catch (IOException | RuntimeException exception) {
                 channel.close();
                 throw exception;

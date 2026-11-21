@@ -149,7 +149,7 @@ class IceAgentTest {
             try (var peers = new IceTestPeers(relayed, loopbackBuilder().role(IceRole.CONTROLLED), candidate -> true, candidate -> true)) {
                 peers.gather();
                 peers.awaitConnected(TIMEOUT);
-                assertTrue(peers.firstEvents.stream().allMatch(event -> !(event instanceof IceEvent.CandidateGathered(var candidate))
+                assertTrue(peers.firstEvents.stream().allMatch(event -> !(event instanceof IceEvent.CandidateGathered(var candidate, var source))
                         || candidate.type() == IceCandidateType.RELAY));
                 assertEquals(IceCandidateType.RELAY, peers.first.selectedPair().orElseThrow().local().type());
                 exchange(peers.first, peers.second);
@@ -164,7 +164,7 @@ class IceAgentTest {
     }
 
     @Test
-    @DisplayName("hides host candidates behind mDNS names, resolves them, and sends srflx with raddr 0.0.0.0:9")
+    @DisplayName("hides host candidates behind mDNS names, resolves them, and sends srflx with raddr 0.0.0.0 rport 0")
     void mdnsCandidates() throws Exception {
         try (var server = TestTurnServer.start()) {
             var link = new MemoryMdnsLink();
@@ -176,11 +176,11 @@ class IceAgentTest {
                 peers.gather();
                 peers.awaitConnected(TIMEOUT);
                 var gathered = peers.firstEvents.stream()
-                        .flatMap(event -> event instanceof IceEvent.CandidateGathered(var candidate) ? java.util.stream.Stream.of(candidate) : java.util.stream.Stream.empty())
+                        .flatMap(event -> event instanceof IceEvent.CandidateGathered(var candidate, var source) ? java.util.stream.Stream.of(candidate) : java.util.stream.Stream.empty())
                         .toList();
                 assertTrue(gathered.stream().filter(candidate -> candidate.type() == IceCandidateType.HOST).allMatch(IceCandidate::isMdns));
                 var reflexive = gathered.stream().filter(candidate -> candidate.type() == IceCandidateType.SERVER_REFLEXIVE).findFirst().orElseThrow();
-                assertEquals(Optional.of(new InetSocketAddress(InetAddress.ofLiteral("0.0.0.0"), 9)), reflexive.relatedAddress());
+                assertEquals(Optional.of(new InetSocketAddress(InetAddress.ofLiteral("0.0.0.0"), 0)), reflexive.relatedAddress());
                 assertTrue(peers.second.remoteCandidates().stream().anyMatch(IceCandidate::isMdns));
                 exchange(peers.first, peers.second);
             }
@@ -263,7 +263,7 @@ class IceAgentTest {
             agent.addRemoteCandidate(IceCandidate.parse("candidate:1 2 udp 1 127.0.0.1 9 typ host"));
             agent.addRemoteCandidate(IceCandidate.parse("candidate:1 1 tcp 1 127.0.0.1 9 typ host tcptype so"));
             assertTrue(agent.remoteCandidates().isEmpty());
-            assertThrows(IceException.class, () -> agent.awaitConnected(Duration.ofMillis(200)));
+            assertFalse(agent.awaitConnected(Duration.ofMillis(200)));
             agent.close();
             assertEquals(IceTransportState.CLOSED, agent.state());
             assertThrows(IllegalStateException.class, agent::gather);
@@ -297,9 +297,14 @@ class IceAgentTest {
                     .iceServers(List.of(new IceServer(List.of(url), Optional.empty(), Optional.empty()))).build()) {
                 agent.gather();
                 await(() -> agent.gatheringState() == IceGatheringState.COMPLETE, "gathering to end");
-                await(() -> events.contains(new IceEvent.CandidateError(url, IceEvent.CandidateError.UNREACHABLE,
+                await(() -> events.stream().anyMatch(event -> event instanceof IceEvent.CandidateError error
+                        && error.server().equals(url) && error.errorCode() == IceEvent.CandidateError.UNREACHABLE
+                        && error.localAddress().isPresent()), "the candidate error with its local address");
+                assertTrue(events.contains(new IceEvent.CandidateError(url,
                         events.stream().filter(IceEvent.CandidateError.class::isInstance).map(IceEvent.CandidateError.class::cast)
-                                .map(IceEvent.CandidateError::reason).findFirst().orElse(""))), "the candidate error");
+                                .findFirst().orElseThrow().localAddress(), IceEvent.CandidateError.UNREACHABLE,
+                        events.stream().filter(IceEvent.CandidateError.class::isInstance).map(IceEvent.CandidateError.class::cast)
+                                .map(IceEvent.CandidateError::reason).findFirst().orElse(""))));
             }
         }
     }

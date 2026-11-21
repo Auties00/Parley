@@ -1,5 +1,7 @@
 package com.github.auties00.parley.dtls;
 
+import com.github.auties00.parley.sdp.SetupRole;
+
 import java.util.List;
 import java.util.Optional;
 
@@ -16,7 +18,7 @@ import java.util.Optional;
 /// @param tlsId        the `a=tls-id` value, absent when the description has none
 /// @spec https://www.rfc-editor.org/rfc/rfc8842.html RFC 8842: Session Description Protocol (SDP) Offer/Answer Considerations for Datagram Transport Layer Security (DTLS) and Transport Layer Security (TLS)
 /// @spec https://www.rfc-editor.org/rfc/rfc8122.html RFC 8122: Connection-Oriented Media Transport over the Transport Layer Security (TLS) Protocol in the Session Description Protocol (SDP)
-public record DtlsParameters(DtlsSetup setup, List<DtlsFingerprint> fingerprints, Optional<DtlsTlsId> tlsId) {
+public record DtlsParameters(SetupRole setup, List<DtlsFingerprint> fingerprints, Optional<DtlsTlsId> tlsId) {
     /// Creates the parameters, copying the fingerprints.
     ///
     /// @param setup        the `a=setup` value
@@ -46,6 +48,8 @@ public record DtlsParameters(DtlsSetup setup, List<DtlsFingerprint> fingerprints
         if (!java.util.Set.copyOf(fingerprints).equals(java.util.Set.copyOf(previous.fingerprints))) {
             return true;
         }
-        return setup.role().isPresent() && previous.setup.role().isPresent() && !setup.role().equals(previous.setup.role());
+        var role = DtlsRole.of(setup);
+        var previousRole = DtlsRole.of(previous.setup);
+        return role.isPresent() && previousRole.isPresent() && !role.equals(previousRole);
     }
 }

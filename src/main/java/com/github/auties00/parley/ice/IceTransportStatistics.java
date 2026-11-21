@@ -19,12 +19,14 @@ import java.util.Optional;
 /// @param localCandidates             the local candidates, as signalled
 /// @param remoteCandidates            the remote candidates, signalled and peer-reflexive
 /// @param pairs                       the statistics of every pair in the checklist
+/// @param remoteCandidatesDropped     the remote candidates dropped because their generation already held the most
+///                                    the agent keeps, or because too many `.local` names waited for resolution
 /// @spec https://www.w3.org/TR/webrtc-stats/ Identifiers for WebRTC's Statistics API
 public record IceTransportStatistics(IceRole role, IceTransportState state, IceGatheringState gatheringState,
                                      Optional<IceCandidatePair> selectedPair, long selectedCandidatePairChanges,
                                      long packetsSent, long packetsReceived, long bytesSent, long bytesReceived,
                                      List<IceCandidate> localCandidates, List<IceCandidate> remoteCandidates,
-                                     List<IceCandidatePairStatistics> pairs) {
+                                     List<IceCandidatePairStatistics> pairs, long remoteCandidatesDropped) {
     /// Creates a snapshot.
     ///
     /// @param role                         the role
@@ -39,6 +41,7 @@ public record IceTransportStatistics(IceRole role, IceTransportState state, IceG
     /// @param localCandidates              the local candidates, copied
     /// @param remoteCandidates             the remote candidates, copied
     /// @param pairs                        the pair statistics, copied
+    /// @param remoteCandidatesDropped      the remote candidates dropped
     public IceTransportStatistics {
         Objects.requireNonNull(role, "role cannot be null");
         Objects.requireNonNull(state, "state cannot be null");

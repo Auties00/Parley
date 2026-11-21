@@ -127,7 +127,8 @@ class IceCandidateTest {
         var turn = new IceServer(List.of(URI.create("turn:turn.example.org"), URI.create("turns:turn.example.org:443?transport=tcp"),
                 URI.create("stuns:turn.example.org")), Optional.of("user"), Optional.of("secret"));
         assertEquals(2, turn.turnServers().size());
-        assertEquals(0, turn.stunServers().size());
+        assertEquals(1, turn.stunServers().size());
+        assertTrue(turn.stunServers().getFirst().secure());
         assertFalse(turn.toString().contains("secret"));
         assertThrows(IllegalArgumentException.class, () -> IceServer.of("turn:turn.example.org"));
         assertThrows(IllegalArgumentException.class, () -> IceServer.of("http://example.org"));

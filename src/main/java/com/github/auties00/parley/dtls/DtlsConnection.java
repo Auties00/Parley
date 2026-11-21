@@ -7,6 +7,7 @@ import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.lang.System.Logger.Level;
 import java.nio.ByteBuffer;
+import java.nio.channels.ClosedChannelException;
 import java.security.SecureRandom;
 import java.security.cert.X509Certificate;
 import java.time.Duration;
@@ -18,8 +19,10 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.TreeSet;
+import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.locks.Condition;
 import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.Consumer;
@@ -104,6 +107,12 @@ final class DtlsConnection implements DtlsTransport {
     /// The application data payloads to deliver once the lock is released.
     private final List<byte[]> pendingData = new ArrayList<>();
 
+    /// The application data payloads released by the lock and not delivered yet, in record order.
+    private final ConcurrentLinkedQueue<byte[]> deliveries = new ConcurrentLinkedQueue<>();
+
+    /// Whether a thread is delivering [#deliveries], so only one does at a time and payloads keep their order.
+    private final AtomicBoolean delivering = new AtomicBoolean();
+
     /// The DTLS 1.3 record numbers of handshake records to acknowledge, as `epoch << 48 | sequence`.
     private final TreeSet<Long> pendingAcks = new TreeSet<>();
 
@@ -158,6 +167,12 @@ final class DtlsConnection implements DtlsTransport {
 
     /// The post-handshake timer thread, or `null`; guarded by [#lock].
     private Thread timerThread;
+
+    /// Whether an acknowledgement of a partially received DTLS 1.3 handshake flight is scheduled; guarded by [#lock].
+    private boolean ackScheduled;
+
+    /// The clock time the scheduled acknowledgement is sent; guarded by [#lock].
+    private long ackDeadline;
 
     /// The clock time a flight was last sent again because the peer repeated itself; guarded by [#lock].
     private long lastDuplicateRetransmit = Long.MIN_VALUE / 2;
@@ -299,6 +314,7 @@ final class DtlsConnection implements DtlsTransport {
             transition(DtlsState.CLOSED);
             flight = null;
             timerSignal.signalAll();
+            inbound.clear();
             inbound.offer(WAKE_UP);
             lower.setReceiver(DISCARD);
         } finally {
@@ -353,6 +369,7 @@ final class DtlsConnection implements DtlsTransport {
     /// @throws IOException if encoding or the lower transport fails
     void sendFlight(List<Outgoing> items, boolean retransmitOnTimer) throws IOException {
         pendingAcks.clear();
+        ackScheduled = false;
         flight = new Flight(items, retransmitOnTimer, config.initialRetransmit().toNanos(), config.clock().nanos());
         transmit(flight);
         if (established) {
@@ -408,6 +425,9 @@ final class DtlsConnection implements DtlsTransport {
                     if (flight != null && flight.retransmitOnTimer) {
                         wait = Math.min(wait, flight.deadline - now);
                     }
+                    if (ackScheduled) {
+                        wait = Math.min(wait, ackDeadline - now);
+                    }
                 } finally {
                     unlock();
                 }
@@ -415,6 +435,10 @@ final class DtlsConnection implements DtlsTransport {
                 lock.lock();
                 try {
                     if (datagram == null) {
+                        if (ackScheduled && clock.nanos() - ackDeadline >= 0) {
+                            ackScheduled = false;
+                            sendAck();
+                        }
                         if (flight != null && flight.retransmitOnTimer && clock.nanos() - flight.deadline >= 0) {
                             retransmit(flight);
                         }
@@ -545,8 +569,13 @@ final class DtlsConnection implements DtlsTransport {
         if (closed) {
             return;
         }
-        if (version == DtlsVersion.DTLS_1_3 && established && !pendingAcks.isEmpty()) {
-            sendAck();
+        if (version == DtlsVersion.DTLS_1_3 && !pendingAcks.isEmpty()) {
+            if (established) {
+                sendAck();
+            } else if (!ackScheduled && writeEpoch >= 2) {
+                ackScheduled = true;
+                ackDeadline = config.clock().nanos() + config.initialRetransmit().toNanos() / 4;
+            }
         }
         if (peerRepeated[0] && flight != null && !(established && version == DtlsVersion.DTLS_1_3 && role == DtlsRole.SERVER)) {
             var now = config.clock().nanos();
@@ -559,22 +588,48 @@ final class DtlsConnection implements DtlsTransport {
 
     /// Processes the handshake fragments of one record.
     ///
+    /// Once a DTLS 1.3 handshake completed, records of the handshake epochs never reach the reassembler: epoch 0
+    /// carries no authentication (the record layer already drops it) and epoch 2 only repeats the peer's final
+    /// flight, which is acknowledged again. A malformed fragment in epoch 0 is dropped and counted, never fatal,
+    /// because anyone on the path can forge one.
+    ///
     /// @return whether the record repeated messages already processed, a sign that the peer missed this side's flight
     private boolean onHandshakeRecord(RecordLayer.Record record) throws IOException {
+        if (established && version == DtlsVersion.DTLS_1_3 && record.epoch() < 3) {
+            if (record.epoch() > 0) {
+                pendingAcks.add(record.epoch() << 48 | record.sequence());
+            }
+            return role == DtlsRole.CLIENT;
+        }
+        var unkeyed = record.epoch() == 0;
         var reader = new TlsReader(record.payload());
         var repeated = false;
         while (reader.remaining() >= HandshakeMessage.DTLS_HEADER_LENGTH) {
-            var type = reader.u8();
-            var length = reader.u24();
-            var messageSeq = reader.u16();
-            var fragmentOffset = reader.u24();
-            var fragment = reader.vector24();
-            if (established && version == DtlsVersion.DTLS_1_2) {
-                repeated |= onHandshakeAfterEstablished12(record, type, messageSeq);
-                continue;
+            int type;
+            int messageSeq;
+            HandshakeReassembler.Result result;
+            try {
+                type = reader.u8();
+                var length = reader.u24();
+                messageSeq = reader.u16();
+                var fragmentOffset = reader.u24();
+                var fragment = reader.vector24();
+                if (established && version == DtlsVersion.DTLS_1_2) {
+                    repeated |= onHandshakeAfterEstablished12(record, type, messageSeq);
+                    continue;
+                }
+                result = reassembler.offer(type, length, messageSeq, fragmentOffset, fragment, record.epoch());
+            } catch (DtlsException exception) {
+                if (!unkeyed) {
+                    throw exception;
+                }
+                records.countDropped();
+                return repeated;
             }
-            var result = reassembler.offer(type, length, messageSeq, fragmentOffset, fragment, record.epoch());
-            if (version == DtlsVersion.DTLS_1_3 && record.epoch() > 0 && result != HandshakeReassembler.Result.DROPPED) {
+            if (result == HandshakeReassembler.Result.DROPPED && unkeyed) {
+                records.countDropped();
+            }
+            if (version == DtlsVersion.DTLS_1_3 && !unkeyed && result != HandshakeReassembler.Result.DROPPED) {
                 pendingAcks.add(record.epoch() << 48 | record.sequence());
             }
             if (result == HandshakeReassembler.Result.OLD) {
@@ -588,6 +643,9 @@ final class DtlsConnection implements DtlsTransport {
                     onPostHandshakeMessage13(message.message(), message.epoch());
                 } else {
                     handshake.onMessage(message.message(), message.epoch());
+                    if (handshake.helloAccepted()) {
+                        reassembler.relax();
+                    }
                     if (handshake.complete) {
                         onHandshakeComplete();
                     }
@@ -633,6 +691,7 @@ final class DtlsConnection implements DtlsTransport {
                 }
                 readEpoch++;
                 records.installRead(readEpoch, Dtls13RecordCipher.fromSecret(suite, next));
+                records.dropReadEpochsBelow(readEpoch - 1);
                 if (request == 1 && (flight == null || !flight.retransmitOnTimer)) {
                     sendKeyUpdate(false);
                 }
@@ -674,6 +733,10 @@ final class DtlsConnection implements DtlsTransport {
             srtpKeys = handshake.srtpKeys();
         }
         remoteCertificate = handshake.peerCertificate;
+        ackScheduled = false;
+        records.restrictEpochZero(version == DtlsVersion.DTLS_1_2
+                ? RecordLayer.EpochZero.HANDSHAKE_ONLY
+                : RecordLayer.EpochZero.NONE);
         if (version == DtlsVersion.DTLS_1_3 && role == DtlsRole.SERVER) {
             flight = null;
             sendAck();
@@ -683,8 +746,11 @@ final class DtlsConnection implements DtlsTransport {
         transition(DtlsState.CONNECTED);
     }
 
-    /// Handles an alert.
+    /// Handles an alert; once the handshake completed, an alert in epoch 0 is unauthenticated and ignored.
     private void onAlert(RecordLayer.Record record) throws DtlsException {
+        if (established && record.epoch() == 0) {
+            return;
+        }
         var payload = record.payload();
         if (payload.length != 2) {
             return;
@@ -897,14 +963,13 @@ final class DtlsConnection implements DtlsTransport {
     /// Releases the lock, then reports the state changes and delivers the application data that queued under it.
     private void unlock() {
         List<DtlsState> states = List.of();
-        List<byte[]> data = List.of();
         if (lock.getHoldCount() == 1) {
             if (!pendingStates.isEmpty()) {
                 states = List.copyOf(pendingStates);
                 pendingStates.clear();
             }
             if (!pendingData.isEmpty()) {
-                data = List.copyOf(pendingData);
+                deliveries.addAll(pendingData);
                 pendingData.clear();
             }
         }
@@ -916,15 +981,26 @@ final class DtlsConnection implements DtlsTransport {
                 LOGGER.log(Level.WARNING, "a DTLS state listener failed", exception);
             }
         }
-        if (!data.isEmpty()) {
-            var receiver = applicationReceiver;
-            var now = config.clock().nanos();
-            for (var payload : data) {
-                try {
-                    receiver.receive(ByteBuffer.wrap(payload), now);
-                } catch (RuntimeException exception) {
-                    LOGGER.log(Level.WARNING, "a DTLS application data receiver failed", exception);
+        drainApplicationData();
+    }
+
+    /// Delivers the released application data, one thread at a time and in record order: a thread that finds another
+    /// delivering leaves its payloads to it.
+    private void drainApplicationData() {
+        while (!deliveries.isEmpty() && delivering.compareAndSet(false, true)) {
+            try {
+                var receiver = applicationReceiver;
+                var now = config.clock().nanos();
+                byte[] payload;
+                while ((payload = deliveries.poll()) != null) {
+                    try {
+                        receiver.receive(ByteBuffer.wrap(payload), now);
+                    } catch (RuntimeException exception) {
+                        LOGGER.log(Level.WARNING, "a DTLS application data receiver failed", exception);
+                    }
                 }
+            } finally {
+                delivering.set(false);
             }
         }
     }
@@ -1015,7 +1091,7 @@ final class DtlsConnection implements DtlsTransport {
             lock.lock();
             try {
                 if (!established || closed) {
-                    throw new IllegalStateException("the DTLS association is not connected");
+                    throw new ClosedChannelException();
                 }
                 record = records.encode(RecordLayer.APPLICATION_DATA, writeEpoch, payload,
                         DtlsVersion.DTLS_1_2.wireValue()).bytes();

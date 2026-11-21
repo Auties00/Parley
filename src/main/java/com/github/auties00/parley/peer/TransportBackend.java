@@ -248,10 +248,10 @@ final class TransportBackend implements PeerBackend {
     /// Forwards an ICE event to the connection.
     private void onIceEvent(String transportId, IceEvent event) {
         switch (event) {
-            case IceEvent.CandidateGathered(var candidate) -> listener.onLocalCandidate(transportId,
+            case IceEvent.CandidateGathered(var candidate, _) -> listener.onLocalCandidate(transportId,
                     stripPrefix(candidate.toSdp()));
             case IceEvent.GatheringStateChanged(var state) -> listener.onGatheringState(transportId, state);
-            case IceEvent.CandidateError(var server, var code, var reason) ->
+            case IceEvent.CandidateError(var server, _, var code, var reason) ->
                     listener.onCandidateError(transportId, server, code, reason);
             case IceEvent.StateChanged(var state) -> listener.onIceState(transportId, state);
             case IceEvent.SelectedPairChanged ignored -> {
@@ -436,7 +436,7 @@ final class TransportBackend implements PeerBackend {
             if (data.isPresent()) {
                 var association = sctp();
                 dataPath.attach(runtime.dtls.applicationData());
-                association.start(transport.dtlsRole(), data.get().remotePort(), data.get().remoteMaxMessageSize(),
+                association.start(transport.dtlsRole(), data.get().remotePort(), java.util.OptionalLong.of(data.get().remoteMaxMessageSize()),
                         configuration.handshakeTimeout());
                 while (!closed) {
                     var channel = association.acceptDataChannel();

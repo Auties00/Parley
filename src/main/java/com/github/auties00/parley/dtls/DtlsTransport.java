@@ -81,6 +81,12 @@ public sealed interface DtlsTransport extends AutoCloseable permits DtlsConnecti
     /// retransmission timeout, which starts at [DtlsConfig#initialRetransmit()] and doubles up to 60 seconds, or
     /// shows that it missed the flight. When this side rejects the handshake it sends the peer a fatal alert first.
     ///
+    /// A DTLS 1.3 client completes when it has verified the server and sent its own `Finished`; the return does not
+    /// mean the server accepted this side's certificate. A server that rejects it answers with a fatal alert after
+    /// this method returned, which moves the transport to [DtlsState#FAILED] and reaches the
+    /// [state listener][#setStateListener(Consumer)]. A DTLS 1.2 client, and a server in either version, return only
+    /// once the peer's `Finished` was verified.
+    ///
     /// @param role               the role of this endpoint, from `a=setup`
     /// @param remoteFingerprints the peer's `a=fingerprint` values; its certificate must match one of those of the
     ///                           strongest hash function listed
@@ -134,7 +140,8 @@ public sealed interface DtlsTransport extends AutoCloseable permits DtlsConnecti
 
     /// {@return the transport of DTLS application data, which an SCTP association runs over}
     ///
-    /// Sending fails with an [IllegalStateException] before the handshake completed or after the association ended.
+    /// Sending fails with a [java.nio.channels.ClosedChannelException] before the handshake completed or after the
+    /// association ended.
     /// Its receiver is called on the lower transport's reader thread with the plaintext of each application data
     /// record. Closing it only detaches its receiver; the association stays open.
     DatagramTransport applicationData();

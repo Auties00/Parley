@@ -153,6 +153,10 @@ abstract sealed class Handshake permits ClientHandshake, ServerHandshake {
     /// {@return the role of this side}
     abstract DtlsRole role();
 
+    /// {@return whether the peer's first flight was verified: a server accepted a `ClientHello` (after its cookie when
+    /// cookies are exchanged), a client accepted the `ServerHello`}
+    abstract boolean helloAccepted();
+
     /// {@return a new outgoing message with the next message sequence number}
     ///
     /// @param type the handshake type

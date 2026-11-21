@@ -74,6 +74,22 @@ final class RecordLayer {
     /// The records that failed authentication since creation.
     private long authenticationFailures;
 
+    /// The content types epoch 0 still accepts: every type until the handshake completes, then only `handshake` for
+    /// DTLS 1.2 (the peer repeating its last flight is the trigger to retransmit this side's) and nothing for DTLS 1.3.
+    private EpochZero epochZero = EpochZero.ALL;
+
+    /// What epoch 0, whose records carry no authentication, still accepts.
+    enum EpochZero {
+        /// Every content type, during the handshake.
+        ALL,
+
+        /// Only `handshake` records, after a DTLS 1.2 handshake.
+        HANDSHAKE_ONLY,
+
+        /// Nothing, after a DTLS 1.3 handshake.
+        NONE
+    }
+
     /// Creates a record layer with only the plaintext epoch 0 in both directions.
     RecordLayer() {
         writeStates.put(0L, new WriteState(null, null));
@@ -119,11 +135,30 @@ final class RecordLayer {
         readStates.put(epoch, new ReadState(null, cipher));
     }
 
+    /// Restricts what epoch 0 accepts once the handshake completed: after it, an unauthenticated record must not
+    /// change the state of the association.
+    ///
+    /// @param accepted what epoch 0 still accepts
+    /// @spec https://www.rfc-editor.org/rfc/rfc9147.html RFC 9147: The Datagram Transport Layer Security (DTLS) Protocol Version 1.3
+    void restrictEpochZero(EpochZero accepted) {
+        epochZero = accepted;
+    }
+
+    /// Counts a record dropped above the record layer, such as a malformed handshake fragment of epoch 0.
+    void countDropped() {
+        dropped++;
+    }
+
     /// Forgets read epochs below `epoch`, except epoch 0, once records of a newer one authenticated.
     ///
     /// @param epoch the oldest epoch to keep
     void dropReadEpochsBelow(long epoch) {
         readStates.keySet().removeIf(key -> key != 0 && key < epoch);
+    }
+
+    /// {@return the number of read epochs installed, epoch 0 included}
+    int readEpochCount() {
+        return readStates.size();
     }
 
     /// {@return whether a read epoch is installed}
@@ -279,6 +314,10 @@ final class RecordLayer {
         }
         var total = PLAINTEXT_HEADER_LENGTH + length;
         if ((recordVersion & 0xFF00) != 0xFE00) {
+            dropped++;
+            return total;
+        }
+        if (epoch == 0 && (epochZero == EpochZero.NONE || (epochZero == EpochZero.HANDSHAKE_ONLY && type != HANDSHAKE))) {
             dropped++;
             return total;
         }

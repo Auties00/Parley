@@ -250,6 +250,7 @@ class RecordCodecTest {
             var random = new Random(31);
             for (var round = 0; round < 300; round++) {
                 var reassembler = new HandshakeReassembler();
+                reassembler.relax();
                 var messages = new ArrayList<byte[]>();
                 var fragments = new ArrayList<int[]>();
                 for (var seq = 0; seq < 4; seq++) {

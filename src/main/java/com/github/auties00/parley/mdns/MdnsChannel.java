@@ -9,6 +9,16 @@ public interface MdnsChannel extends AutoCloseable {
     /// The IPv4 multicast group and port of multicast DNS, `224.0.0.251:5353`.
     InetSocketAddress IPV4_GROUP = new InetSocketAddress(java.net.InetAddress.ofLiteral("224.0.0.251"), 5353);
 
+    /// The IPv6 link-local multicast group and port of multicast DNS, `[ff02::fb]:5353`.
+    InetSocketAddress IPV6_GROUP = new InetSocketAddress(java.net.InetAddress.ofLiteral("ff02::fb"), 5353);
+
+    /// {@return the multicast group this socket sends announcements and queries to}
+    ///
+    /// @implSpec The default implementation returns [#IPV4_GROUP].
+    default InetSocketAddress group() {
+        return IPV4_GROUP;
+    }
+
     /// Sends one message.
     ///
     /// @param message the message, its remaining bytes

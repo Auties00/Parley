@@ -299,7 +299,7 @@ class DtlsTransportTest {
                 pair.client().close();
                 assertEquals(DtlsState.CLOSED, states.poll(5, TimeUnit.SECONDS));
                 assertEquals(DtlsState.CLOSED, pair.server().state());
-                assertThrows(IllegalStateException.class,
+                assertThrows(java.nio.channels.ClosedChannelException.class,
                         () -> pair.server().applicationData().send(ByteBuffer.wrap(new byte[1])));
             }
         }

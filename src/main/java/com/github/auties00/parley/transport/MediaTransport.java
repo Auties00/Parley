@@ -23,12 +23,13 @@ import com.github.auties00.parley.net.DatagramTransport;
 import com.github.auties00.parley.net.MonotonicClock;
 import com.github.auties00.parley.net.NetworkStack;
 import com.github.auties00.parley.net.PacketReceiver;
-import com.github.auties00.srtp.SrtpCryptoSuite;
+import com.github.auties00.parley.sdp.SdesCrypto;
 
 import java.io.IOException;
 import java.lang.System.Logger.Level;
 import java.net.InetSocketAddress;
 import java.nio.ByteBuffer;
+import java.nio.channels.ClosedChannelException;
 import java.time.Duration;
 import java.util.EnumSet;
 import java.util.List;
@@ -38,6 +39,7 @@ import java.util.OptionalLong;
 import java.util.Set;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.ThreadFactory;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.Consumer;
 
@@ -49,16 +51,16 @@ import java.util.function.Consumer;
 ///
 /// | Mode | Built with | Established with |
 /// |---|---|---|
-/// | ICE | [Builder#build()] | [#establishDtlsSrtp(IceParameters,List,DtlsRole,List,Duration)] (`UDP/TLS/RTP/SAVPF`), [#establishSdes(IceParameters,List,SrtpCryptoSuite,byte\[\],byte\[\],byte\[\],byte\[\],Duration)] |
-/// | UDP | [Builder#buildUdp(InetSocketAddress)] | [#establishDtlsSrtp(InetSocketAddress,DtlsRole,List,Duration)], [#establishSdes(InetSocketAddress,SrtpCryptoSuite,byte\[\],byte\[\],byte\[\],byte\[\])] (`RTP/SAVP`) |
+/// | ICE | [Builder#build()] | [#establishDtlsSrtp(IceParameters,List,DtlsRole,List,Duration)] (`UDP/TLS/RTP/SAVPF`), [#establishSdes(IceParameters,List,SdesCrypto,SdesCrypto,Duration)] |
+/// | UDP | [Builder#buildUdp(InetSocketAddress)] | [#establishDtlsSrtp(InetSocketAddress,DtlsRole,List,Duration)], [#establishSdes(InetSocketAddress,SdesCrypto,SdesCrypto)] (`RTP/SAVP`) |
 ///
 /// {@snippet lang = java :
 /// var transport = MediaTransport.builder()
 ///         .iceRole(IceRole.CONTROLLING)
+///         .rtpReceiver((packet, arrival) -> handleRtp(packet))
 ///         .eventListener(event -> log(event))
 ///         .build();
 /// // signal transport.iceAgent().orElseThrow().localParameters(), its candidates and transport.fingerprints()
-/// transport.setRtpReceiver((packet, arrival) -> handleRtp(packet));
 /// var profile = transport.establishDtlsSrtp(remoteIce, remoteCandidates, DtlsRole.CLIENT, remoteFingerprints,
 ///         Duration.ofSeconds(10));
 /// transport.sendRtp(rtpBuffer);
@@ -67,13 +69,16 @@ import java.util.function.Consumer;
 /// # Failure
 ///
 /// After it is established the transport fails, closes itself and reports one [MediaTransportEvent.Failed] when ICE
-/// moves to `failed` (consent expired), when [Builder#authenticationFailureLimit(int)] consecutive packets fail SRTP
-/// authentication, or when the DTLS association is closed by the peer or fails. [#close()] stops it without a report.
+/// moves to `failed` (consent expired), when no packet authenticates for [Builder#mediaTimeout(Duration)], or when the
+/// DTLS association is closed by the peer or fails. Packets that fail SRTP authentication are counted and dropped and
+/// never fail the transport on their own, and in UDP mode they never move the remote address either: only an
+/// authenticated packet from a new source does. [#close()] stops it without a report.
 ///
 /// # Threading
 ///
-/// Events are delivered serially, in order, on one thread from the builder's thread factory. Receivers are called on
-/// the path's reader thread. The establishing methods block the calling thread; every other method may be called from
+/// Events are delivered serially, in order, on one thread from the builder's thread factory, which also watches the
+/// media timeout; every other thread of the transport and its layers comes from the same factory, through the
+/// network stack the builder makes from it. Receivers are called on the path's reader thread. The establishing methods block the calling thread; every other method may be called from
 /// any thread.
 ///
 /// @spec https://www.rfc-editor.org/rfc/rfc8445.html RFC 8445: Interactive Connectivity Establishment (ICE): A Protocol for Network Address Translator (NAT) Traversal
@@ -86,8 +91,12 @@ import java.util.function.Consumer;
 public final class MediaTransport implements AutoCloseable {
     private static final System.Logger LOGGER = System.getLogger(MediaTransport.class.getName());
 
-    /// The default number of consecutive packets failing SRTP authentication that fails the transport.
-    public static final int DEFAULT_AUTHENTICATION_FAILURE_LIMIT = 200;
+    /// The default media timeout: how long an established transport may go without an authenticated packet.
+    public static final Duration DEFAULT_MEDIA_TIMEOUT = Duration.ofSeconds(30);
+
+    /// The longest the event thread waits before checking the media timeout again, so a clock that is not the system
+    /// clock is still read regularly.
+    private static final long MAX_WATCH_NANOS = TimeUnit.SECONDS.toNanos(1);
 
     /// The marker that stops the event thread.
     private static final Object STOP = new Object();
@@ -127,13 +136,16 @@ public final class MediaTransport implements AutoCloseable {
     private volatile boolean established;
 
     /// The receiver of RTP.
-    private volatile PacketReceiver rtpReceiver = DISCARD;
+    private final PacketReceiver rtpReceiver;
 
     /// The receiver of RTCP.
-    private volatile PacketReceiver rtcpReceiver = DISCARD;
+    private final PacketReceiver rtcpReceiver;
 
     /// The clock time of the last authenticated packet, or `Long.MIN_VALUE` before any.
     private volatile long lastMediaNanos = Long.MIN_VALUE;
+
+    /// The clock time establishment completed, the start of the first media timeout.
+    private volatile long establishedNanos;
 
     /// Creates a transport; the path is already open.
     private MediaTransport(Builder settings, DtlsCertificate certificate, IceAgent iceAgent, UdpPath udpPath) {
@@ -141,11 +153,14 @@ public final class MediaTransport implements AutoCloseable {
         this.certificate = certificate;
         this.iceAgent = iceAgent;
         this.udpPath = udpPath;
+        this.rtpReceiver = settings.rtpReceiver;
+        this.rtcpReceiver = settings.rtcpReceiver;
         settings.threadFactory.newThread(this::eventLoop).start();
     }
 
     /// {@return a builder with the defaults: the system network stack, virtual threads, the controlling ICE role, a
-    /// fresh ECDSA certificate, both DTLS versions, every SRTP profile, no cryptex}
+    /// fresh ECDSA certificate, both DTLS versions, every SRTP profile, no cryptex, a 30-second media timeout, and
+    /// receivers and a listener that drop everything}
     public static Builder builder() {
         return new Builder();
     }
@@ -203,6 +218,7 @@ public final class MediaTransport implements AutoCloseable {
     /// @throws DtlsException         if the handshake fails or does not complete in time
     /// @throws InterruptedException  if the calling thread is interrupted
     /// @throws IllegalStateException if the transport is in UDP mode, closed, or already established or establishing
+    /// @throws IllegalArgumentException if `remoteFingerprints` is empty
     public SrtpProfile establishDtlsSrtp(IceParameters remoteParameters, List<IceCandidate> remoteCandidates,
                                         DtlsRole role, List<DtlsFingerprint> remoteFingerprints, Duration timeout)
             throws IceException, DtlsException, InterruptedException {
@@ -218,7 +234,7 @@ public final class MediaTransport implements AutoCloseable {
             iceAgent.addRemoteCandidate(candidate);
         }
         iceAgent.endOfRemoteCandidates();
-        iceAgent.awaitConnected(remaining(deadline));
+        awaitIce(remaining(deadline));
         var keys = dtlsTransport.handshake(role, remoteFingerprints, remaining(deadline));
         markEstablished(Optional.of(keys.profile()));
         return keys.profile();
@@ -253,23 +269,26 @@ public final class MediaTransport implements AutoCloseable {
     /// once.
     ///
     /// Packets go to `remote`; when an authenticated packet arrives from another address, the transport sends to that
-    /// address instead (symmetric RTP), which lets media cross a NAT.
+    /// address instead (symmetric RTP), which lets media cross a NAT. A packet that does not authenticate never moves
+    /// it.
     ///
-    /// @param remote     the peer's media address, from its `c=` and `m=` lines
-    /// @param suite      the crypto suite both `a=crypto` lines agreed
-    /// @param localKey   the master key of the media this side sends
-    /// @param localSalt  the master salt of the media this side sends
-    /// @param remoteKey  the master key of the media the peer sends
-    /// @param remoteSalt the master salt of the media the peer sends
-    /// @throws IllegalArgumentException if a key or salt has the wrong length for the suite
+    /// @param remote       the peer's media address, from its `c=` and `m=` lines
+    /// @param local        this side's `a=crypto` line, whose key protects the media this side sends
+    /// @param remoteCrypto the peer's `a=crypto` line, whose key protects the media the peer sends
+    /// @throws IllegalArgumentException if the two lines name different suites
     /// @throws IllegalStateException    if the transport is in ICE mode, closed, or already established
-    public void establishSdes(InetSocketAddress remote, SrtpCryptoSuite suite, byte[] localKey, byte[] localSalt,
-                              byte[] remoteKey, byte[] remoteSalt) {
+    /// @spec https://www.rfc-editor.org/rfc/rfc4568.html RFC 4568: Session Description Protocol (SDP) Security Descriptions for Media Streams
+    public void establishSdes(InetSocketAddress remote, SdesCrypto local, SdesCrypto remoteCrypto) {
         Objects.requireNonNull(remote, "remote cannot be null");
+        Objects.requireNonNull(local, "local cannot be null");
+        Objects.requireNonNull(remoteCrypto, "remoteCrypto cannot be null");
+        if (local.suite() != remoteCrypto.suite()) {
+            throw new IllegalArgumentException("the local line uses " + local.suite() + " and the remote one "
+                    + remoteCrypto.suite());
+        }
         startEstablishing(false);
         udpPath.connect(remote, true, false);
-        installSrtp(SrtpTransport.sdes(udpPath, suite, localKey, localSalt, remoteKey, remoteSalt,
-                settings.srtpOptions));
+        installSrtp(SrtpTransport.sdes(udpPath, local, remoteCrypto, settings.srtpOptions));
         markEstablished(Optional.empty());
     }
 
@@ -277,38 +296,41 @@ public final class MediaTransport implements AutoCloseable {
     ///
     /// @param remoteParameters the peer's ICE parameters
     /// @param remoteCandidates the peer's candidates, all of them
-    /// @param suite            the crypto suite both `a=crypto` lines agreed
-    /// @param localKey         the master key of the media this side sends
-    /// @param localSalt        the master salt of the media this side sends
-    /// @param remoteKey        the master key of the media the peer sends
-    /// @param remoteSalt       the master salt of the media the peer sends
+    /// @param local            this side's `a=crypto` line, whose key protects the media this side sends
+    /// @param remoteCrypto     the peer's `a=crypto` line, whose key protects the media the peer sends
     /// @param timeout          the longest time ICE may take
     /// @throws IceException             if ICE fails or does not connect in time
     /// @throws InterruptedException     if the calling thread is interrupted
-    /// @throws IllegalArgumentException if a key or salt has the wrong length for the suite
+    /// @throws IllegalArgumentException if the two lines name different suites
     /// @throws IllegalStateException    if the transport is in UDP mode, closed, or already established or
     ///                                  establishing
+    /// @spec https://www.rfc-editor.org/rfc/rfc4568.html RFC 4568: Session Description Protocol (SDP) Security Descriptions for Media Streams
     public void establishSdes(IceParameters remoteParameters, List<IceCandidate> remoteCandidates,
-                              SrtpCryptoSuite suite, byte[] localKey, byte[] localSalt, byte[] remoteKey,
-                              byte[] remoteSalt, Duration timeout) throws IceException, InterruptedException {
+                              SdesCrypto local, SdesCrypto remoteCrypto, Duration timeout)
+            throws IceException, InterruptedException {
         Objects.requireNonNull(remoteParameters, "remoteParameters cannot be null");
+        Objects.requireNonNull(local, "local cannot be null");
+        Objects.requireNonNull(remoteCrypto, "remoteCrypto cannot be null");
+        if (local.suite() != remoteCrypto.suite()) {
+            throw new IllegalArgumentException("the local line uses " + local.suite() + " and the remote one "
+                    + remoteCrypto.suite());
+        }
         startEstablishing(true);
-        installSrtp(SrtpTransport.sdes(iceAgent, suite, localKey, localSalt, remoteKey, remoteSalt,
-                settings.srtpOptions));
+        installSrtp(SrtpTransport.sdes(iceAgent, local, remoteCrypto, settings.srtpOptions));
         iceAgent.setRemoteParameters(remoteParameters);
         for (var candidate : remoteCandidates) {
             iceAgent.addRemoteCandidate(candidate);
         }
         iceAgent.endOfRemoteCandidates();
-        iceAgent.awaitConnected(timeout);
+        awaitIce(timeout);
         markEstablished(Optional.empty());
     }
 
     /// Protects and sends an RTP packet; see [RtpTransport#sendRtp(ByteBuffer)] for the buffer contract.
     ///
     /// @param plainRtp the packet
-    /// @throws IOException           if protection or the path fails
-    /// @throws IllegalStateException if the transport is not established or is closed
+    /// @throws ClosedChannelException if the transport is not established or is closed
+    /// @throws IOException            if protection or the path fails
     public void sendRtp(ByteBuffer plainRtp) throws IOException {
         requireSrtp().sendRtp(plainRtp);
     }
@@ -316,25 +338,10 @@ public final class MediaTransport implements AutoCloseable {
     /// Protects and sends a compound RTCP packet; see [RtpTransport#sendRtcp(ByteBuffer)] for the buffer contract.
     ///
     /// @param plainCompoundRtcp the packet
-    /// @throws IOException           if protection or the path fails
-    /// @throws IllegalStateException if the transport is not established or is closed
+    /// @throws ClosedChannelException if the transport is not established or is closed
+    /// @throws IOException            if protection or the path fails
     public void sendRtcp(ByteBuffer plainCompoundRtcp) throws IOException {
         requireSrtp().sendRtcp(plainCompoundRtcp);
-    }
-
-    /// Sets the receiver of unprotected RTP packets, replacing the previous one; set it before establishing, since
-    /// packets that arrive while none is set are dropped.
-    ///
-    /// @param receiver the receiver
-    public void setRtpReceiver(PacketReceiver receiver) {
-        this.rtpReceiver = Objects.requireNonNull(receiver, "receiver cannot be null");
-    }
-
-    /// Sets the receiver of unprotected compound RTCP packets, replacing the previous one.
-    ///
-    /// @param receiver the receiver
-    public void setRtcpReceiver(PacketReceiver receiver) {
-        this.rtcpReceiver = Objects.requireNonNull(receiver, "receiver cannot be null");
     }
 
     /// {@return the bytes a buffer needs after its limit to be protected in place, or the largest possible value
@@ -415,16 +422,20 @@ public final class MediaTransport implements AutoCloseable {
         return transport;
     }
 
-    /// Wires the SRTP transport's receivers and failure listener.
+    /// Wires the SRTP transport's receivers.
     private void installSrtp(SrtpTransport transport) {
         transport.setRtpReceiver((packet, arrival) -> onMedia(packet, arrival, false));
         transport.setRtcpReceiver((packet, arrival) -> onMedia(packet, arrival, true));
-        transport.setFailureListener(consecutive -> {
-            if (established && consecutive >= settings.authenticationFailureLimit) {
-                fail(new MediaTransportFailure.SrtpAuthentication(consecutive));
-            }
-        });
         srtp = transport;
+    }
+
+    /// Waits until ICE connects.
+    ///
+    /// @throws IceException if ICE fails, the agent closes, or the timeout elapses first
+    private void awaitIce(Duration timeout) throws IceException, InterruptedException {
+        if (!iceAgent.awaitConnected(timeout)) {
+            throw new IceException("no ICE candidate pair succeeded within " + timeout.toMillis() + " ms");
+        }
     }
 
     /// Delivers an authenticated packet and confirms its source to a latching path.
@@ -436,8 +447,9 @@ public final class MediaTransport implements AutoCloseable {
         (rtcp ? rtcpReceiver : rtpReceiver).receive(packet, arrival);
     }
 
-    /// Marks the transport established and reports it.
+    /// Marks the transport established, starting the media timeout, and reports it.
     private void markEstablished(Optional<SrtpProfile> profile) {
+        establishedNanos = settings.clock.nanos();
         established = true;
         events.add(new MediaTransportEvent.Established(profile));
     }
@@ -479,20 +491,24 @@ public final class MediaTransport implements AutoCloseable {
 
     /// {@return the SRTP transport}
     ///
-    /// @throws IllegalStateException if the transport is not established or is closed
-    private SrtpTransport requireSrtp() {
+    /// @throws ClosedChannelException if the transport is not established or is closed
+    private SrtpTransport requireSrtp() throws ClosedChannelException {
         var current = srtp;
         if (current == null || closed.get()) {
-            throw new IllegalStateException(closed.get() ? "the transport is closed" : "the transport is not established");
+            throw new ClosedChannelException();
         }
         return current;
     }
 
-    /// Delivers events to the listener, serially, until the transport stops.
+    /// Delivers events to the listener, serially, until the transport stops, and fails the transport once it has gone
+    /// a media timeout without an authenticated packet.
     private void eventLoop() {
         try {
             while (true) {
-                var event = events.take();
+                var event = events.poll(checkMediaTimeout(), TimeUnit.NANOSECONDS);
+                if (event == null) {
+                    continue;
+                }
                 if (event == STOP) {
                     return;
                 }
@@ -507,6 +523,26 @@ public final class MediaTransport implements AutoCloseable {
         } catch (InterruptedException exception) {
             Thread.currentThread().interrupt();
         }
+    }
+
+    /// Fails the transport when it is established and its media timed out.
+    ///
+    /// @return how long the event thread may wait before checking again
+    private long checkMediaTimeout() {
+        if (!established || closed.get()) {
+            return MAX_WATCH_NANOS;
+        }
+        var last = lastMediaNanos;
+        var since = last == Long.MIN_VALUE || last - establishedNanos < 0 ? establishedNanos : last;
+        var silence = settings.clock.nanos() - since;
+        var timeout = settings.mediaTimeout.toNanos();
+        if (silence >= timeout) {
+            var current = srtp;
+            fail(new MediaTransportFailure.MediaTimeout(Duration.ofNanos(silence),
+                    current == null ? 0 : current.failuresSinceAuthenticated()));
+            return MAX_WATCH_NANOS;
+        }
+        return Math.max(1, Math.min(MAX_WATCH_NANOS, timeout - silence));
     }
 
     /// {@return the time left before a deadline, at least one nanosecond}
@@ -564,12 +600,18 @@ public final class MediaTransport implements AutoCloseable {
         /// The local ICE parameters, `null` for generated ones.
         private IceParameters iceParameters;
 
-        /// The authentication failure limit.
-        private int authenticationFailureLimit = DEFAULT_AUTHENTICATION_FAILURE_LIMIT;
+        /// The media timeout.
+        private Duration mediaTimeout = DEFAULT_MEDIA_TIMEOUT;
 
         /// The event listener.
         private Consumer<MediaTransportEvent> eventListener = _ -> {
         };
+
+        /// The receiver of RTP.
+        private PacketReceiver rtpReceiver = DISCARD;
+
+        /// The receiver of RTCP.
+        private PacketReceiver rtcpReceiver = DISCARD;
 
         /// Creates a builder with the defaults.
         private Builder() {
@@ -721,15 +763,36 @@ public final class MediaTransport implements AutoCloseable {
             return this;
         }
 
-        /// Sets how many consecutive packets failing SRTP authentication fail the transport.
+        /// Sets how long an established transport may go without an authenticated RTP or RTCP packet before it fails
+        /// with [MediaTransportFailure.MediaTimeout]; [#DEFAULT_MEDIA_TIMEOUT] by default.
         ///
-        /// @param limit the limit, positive
+        /// @param timeout the timeout, positive
         /// @return this builder
-        public Builder authenticationFailureLimit(int limit) {
-            if (limit <= 0) {
-                throw new IllegalArgumentException("limit must be positive");
+        /// @throws IllegalArgumentException if `timeout` is not positive
+        public Builder mediaTimeout(Duration timeout) {
+            Objects.requireNonNull(timeout, "timeout cannot be null");
+            if (timeout.isNegative() || timeout.isZero()) {
+                throw new IllegalArgumentException("timeout must be positive");
             }
-            this.authenticationFailureLimit = limit;
+            this.mediaTimeout = timeout;
+            return this;
+        }
+
+        /// Sets the receiver of unprotected RTP packets, in place before the first one can arrive.
+        ///
+        /// @param receiver the receiver, called on the path's reader thread with a buffer valid only during the call
+        /// @return this builder
+        public Builder rtpReceiver(PacketReceiver receiver) {
+            this.rtpReceiver = Objects.requireNonNull(receiver, "receiver cannot be null");
+            return this;
+        }
+
+        /// Sets the receiver of unprotected compound RTCP packets, in place before the first one can arrive.
+        ///
+        /// @param receiver the receiver, called on the path's reader thread with a buffer valid only during the call
+        /// @return this builder
+        public Builder rtcpReceiver(PacketReceiver receiver) {
+            this.rtcpReceiver = Objects.requireNonNull(receiver, "receiver cannot be null");
             return this;
         }
 

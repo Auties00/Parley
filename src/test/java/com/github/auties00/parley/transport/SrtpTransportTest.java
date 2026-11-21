@@ -6,6 +6,7 @@ import com.github.auties00.parley.dtls.DtlsRole;
 import com.github.auties00.parley.dtls.DtlsTransport;
 import com.github.auties00.parley.dtls.MemoryLink;
 import com.github.auties00.parley.dtls.SrtpProfile;
+import com.github.auties00.parley.sdp.SdesCrypto;
 import com.github.auties00.srtp.SrtpCryptoSuite;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Nested;
@@ -14,6 +15,7 @@ import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.EnumSource;
 
 import java.nio.ByteBuffer;
+import java.nio.channels.ClosedChannelException;
 import java.time.Duration;
 import java.util.Arrays;
 import java.util.List;
@@ -49,6 +51,23 @@ class SrtpTransportTest {
             random.nextBytes(salt2);
             return new Keys(key1, salt1, key2, salt2);
         }
+
+        /// {@return the `a=crypto` line of the first key and salt}
+        SdesCrypto first(SrtpCryptoSuite suite) {
+            return crypto(suite, key1, salt1);
+        }
+
+        /// {@return the `a=crypto` line of the second key and salt}
+        SdesCrypto second(SrtpCryptoSuite suite) {
+            return crypto(suite, key2, salt2);
+        }
+
+        private static SdesCrypto crypto(SrtpCryptoSuite suite, byte[] key, byte[] salt) {
+            var material = new byte[key.length + salt.length];
+            System.arraycopy(key, 0, material, 0, key.length);
+            System.arraycopy(salt, 0, material, key.length, salt.length);
+            return new SdesCrypto(1, suite, material);
+        }
     }
 
     /// Two SDES transports over a link, with queues of what each receives.
@@ -57,8 +76,8 @@ class SrtpTransportTest {
         static Pair sdes(SrtpCryptoSuite suite, SrtpOptions options) {
             var link = new MemoryLink();
             var keys = Keys.of(suite, 42);
-            var left = SrtpTransport.sdes(link.left, suite, keys.key1(), keys.salt1(), keys.key2(), keys.salt2(), options);
-            var right = SrtpTransport.sdes(link.right, suite, keys.key2(), keys.salt2(), keys.key1(), keys.salt1(), options);
+            var left = SrtpTransport.sdes(link.left, keys.first(suite), keys.second(suite), options);
+            var right = SrtpTransport.sdes(link.right, keys.second(suite), keys.first(suite), options);
             return wire(left, right, link);
         }
 
@@ -227,11 +246,9 @@ class SrtpTransportTest {
         }
 
         @Test
-        @DisplayName("drops tampered packets, counts them and reports runs of failures")
+        @DisplayName("drops tampered packets and counts them since the last authenticated one")
         void tampered() throws Exception {
             try (var pair = Pair.sdes(SrtpCryptoSuite.AES_CM_128_HMAC_SHA1_80, SrtpOptions.DEFAULT)) {
-                var runs = new LinkedBlockingQueue<Integer>();
-                pair.right().setFailureListener(runs::add);
                 pair.link().left.dropFilter = _ -> true;
                 for (var sequence = 0; sequence < 3; sequence++) {
                     pair.left().sendRtp(ByteBuffer.wrap(rtp(7, sequence, 40)));
@@ -239,10 +256,16 @@ class SrtpTransportTest {
                     wire[20] ^= 1;
                     pair.link().left.inject(wire);
                 }
-                assertEquals(1, runs.poll(5, TimeUnit.SECONDS));
-                assertEquals(2, runs.poll(5, TimeUnit.SECONDS));
-                assertEquals(3, runs.poll(5, TimeUnit.SECONDS));
+                var deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+                while (pair.right().statistics().authenticationFailures() < 3 && System.nanoTime() < deadline) {
+                    Thread.sleep(5);
+                }
                 assertEquals(3, pair.right().statistics().authenticationFailures());
+                assertEquals(3, pair.right().failuresSinceAuthenticated());
+                pair.link().left.dropFilter = null;
+                pair.left().sendRtp(ByteBuffer.wrap(rtp(7, 10, 40)));
+                assertNotNull(pair.rtpAtRight().poll(5, TimeUnit.SECONDS));
+                assertEquals(0, pair.right().failuresSinceAuthenticated());
             }
         }
 
@@ -293,6 +316,29 @@ class SrtpTransportTest {
         }
     }
 
+    @ParameterizedTest(name = "{0}")
+    @EnumSource(value = SrtpCryptoSuite.class, names = {"AES_CM_128_HMAC_SHA1_80", "AEAD_AES_128_GCM"})
+    @DisplayName("applies cryptex to every stream of the transport, as one BUNDLE group must")
+    void cryptexEveryStream(SrtpCryptoSuite suite) throws Exception {
+        try (var pair = Pair.sdes(suite, SrtpOptions.DEFAULT.withCryptex(true))) {
+            for (var ssrc = 0x10; ssrc < 0x14; ssrc++) {
+                var packet = ByteBuffer.allocate(12 + 8 + 10);
+                packet.put((byte) 0x90).put((byte) 96).putShort((short) ssrc).putInt(900).putInt(ssrc)
+                        .putShort((short) 0xBEDE).putShort((short) 1).put((byte) 0x10).put((byte) 0x5A).putShort((short) 0);
+                for (var index = 0; index < 10; index++) {
+                    packet.put((byte) index);
+                }
+                var plain = packet.array();
+                pair.left().sendRtp(withTailroom(plain, pair.left().protectionOverhead()));
+                assertArrayEquals(plain, pair.rtpAtRight().poll(5, TimeUnit.SECONDS));
+                var wire = pair.link().left.sent.getLast();
+                assertEquals(0xC0DE, (wire[12] & 0xFF) << 8 | (wire[13] & 0xFF), "stream " + ssrc);
+                assertFalse(Arrays.equals(Arrays.copyOfRange(plain, 16, 20), Arrays.copyOfRange(wire, 16, 20)),
+                        "the extension of stream " + ssrc + " is encrypted");
+            }
+        }
+    }
+
     @Nested
     @DisplayName("keyed by DTLS-SRTP")
     class DtlsKeyed {
@@ -308,7 +354,7 @@ class SrtpTransportTest {
             var left = SrtpTransport.dtlsSrtp(client);
             var right = SrtpTransport.dtlsSrtp(server);
             var pair = Pair.wire(left, right, link);
-            assertThrows(IllegalStateException.class, () -> left.sendRtp(ByteBuffer.wrap(rtp(1, 1, 10))));
+            assertThrows(ClosedChannelException.class, () -> left.sendRtp(ByteBuffer.wrap(rtp(1, 1, 10))));
             assertFalse(left.isKeyed());
             var serverError = new AtomicReference<Throwable>();
             var thread = Thread.ofVirtual().start(() -> {
@@ -359,8 +405,8 @@ class SrtpTransportTest {
     @DisplayName("refuses keys of the wrong length")
     void wrongKeys() {
         var link = new MemoryLink();
-        assertThrows(IllegalArgumentException.class, () -> SrtpTransport.sdes(link.left, SrtpCryptoSuite.AEAD_AES_256_GCM,
-                new byte[16], new byte[12], new byte[32], new byte[12]));
+        assertThrows(IllegalArgumentException.class, () -> SrtpTransport.sdes(link.left,
+                SdesCrypto.generate(1, SrtpCryptoSuite.AEAD_AES_128_GCM), SdesCrypto.generate(1, SrtpCryptoSuite.AEAD_AES_256_GCM)));
         link.close();
     }
 
@@ -369,7 +415,7 @@ class SrtpTransportTest {
     void closed() {
         try (var pair = Pair.sdes(SrtpCryptoSuite.AEAD_AES_128_GCM, SrtpOptions.DEFAULT)) {
             pair.left().close();
-            assertThrows(IllegalStateException.class, () -> pair.left().sendRtp(ByteBuffer.wrap(rtp(1, 1, 1))));
+            assertThrows(ClosedChannelException.class, () -> pair.left().sendRtp(ByteBuffer.wrap(rtp(1, 1, 1))));
         }
     }
 }
