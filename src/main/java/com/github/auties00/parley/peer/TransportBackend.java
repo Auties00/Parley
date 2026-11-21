@@ -143,6 +143,10 @@ final class TransportBackend implements PeerBackend {
         volatile HeaderExtensionMap extensions = HeaderExtensionMap.empty();
         /// The thread connecting DTLS and SCTP, or `null`.
         volatile Thread connector;
+        /// Serializes the creation of the RTP session with the wiring of streams to it.
+        final ReentrantLock wiring = new ReentrantLock();
+        /// The DTLS handshake keyed SRTP, so the RTP session may send.
+        volatile boolean keyed;
 
         TransportRuntime(String id, IceAgent ice, DtlsTransport dtls, SrtpTransport srtp) {
             this.id = id;
@@ -291,73 +295,41 @@ final class TransportBackend implements PeerBackend {
                 stopSection(mid);
             }
         }
-        for (var media : outcome.media()) {
-            var runtime = transports.get(media.transportId());
-            if (runtime != null && runtime.session != null) {
-                wireSending(runtime, media);
-                wireReceiving(runtime, media);
-            }
-        }
         for (var runtime : transports.values()) {
-            updateRoutes(runtime);
+            wire(runtime);
         }
     }
 
-    /// Creates the RTP session and the SCTP association a transport needs, once, and starts its connection.
+    /// Builds the RTP session of a keyed transport when it has none, then wires the streams of the last negotiation
+    /// to it; does nothing before the DTLS handshake keys SRTP.
+    private void wire(TransportRuntime runtime) {
+        var outcome = negotiated;
+        if (outcome == null || !runtime.keyed || closed) {
+            return;
+        }
+        runtime.wiring.lock();
+        try {
+            var media = outcome.media().stream().filter(section -> section.transportId().equals(runtime.id))
+                    .toList();
+            if (media.isEmpty()) {
+                return;
+            }
+            if (runtime.session == null) {
+                buildSession(runtime, media);
+            }
+            for (var section : media) {
+                wireSending(runtime, section);
+                wireReceiving(runtime, section);
+            }
+            updateRoutes(runtime);
+        } finally {
+            runtime.wiring.unlock();
+        }
+    }
+
+    /// Creates the SCTP association a transport needs, once, and starts its connection.
     private void prepare(TransportRuntime runtime, Negotiated.Transport transport, Negotiated outcome) {
         var media = outcome.media().stream().filter(section -> section.transportId().equals(transport.id())).toList();
-        if (runtime.session == null && !media.isEmpty()) {
-            var extensions = new HashMap<Integer, URI>();
-            media.forEach(section -> extensions.putAll(section.extensions()));
-            runtime.extensions = HeaderExtensionMap.of(extensions).withAllowMixed(true);
-            var congestion = CongestionController.gcc(CongestionConfig.defaults()
-                    .withBitrates(configuration.minBitrate(), configuration.startBitrate(), configuration.maxBitrate())
-                    .withClock(configuration.clock())
-                    .withThreadFactory(configuration.threadFactory()));
-            congestion.setTargetListener(target -> allocate(runtime, target));
-            runtime.congestion = congestion;
-            var reducedSize = media.stream().allMatch(Negotiated.Media::reducedSizeRtcp);
-            var webrtc = RtcpConfig.webrtc();
-            var rtcp = new RtcpConfig(webrtc.avpf(), reducedSize, webrtc.extendedReports(), webrtc.minimumInterval(),
-                    webrtc.trrInterval(), webrtc.sessionBandwidthBps());
-            var holder = new RtpSession[1];
-            var transportCc = media.stream().anyMatch(section -> hasFeedback(section, "transport-cc"));
-            var remb = !transportCc && media.stream().anyMatch(section -> hasFeedback(section, "goog-remb"));
-            var session = RtpSession.builder(runtime.srtp)
-                    .clock(configuration.clock())
-                    .scheduler(congestion.pacer())
-                    .feedbackObserver(congestion)
-                    .arrivalObserver(arrival -> {
-                        var feedback = runtime.feedback;
-                        if (feedback != null && arrival.transportSequence().isPresent()) {
-                            feedback.onPacketReceived(arrival.transportSequence().getAsInt(), arrival.ssrc(),
-                                    arrival.arrivalNanos());
-                        }
-                        var generator = runtime.remb;
-                        if (generator != null && arrival.absSendTime().isPresent()) {
-                            generator.onPacketReceived(arrival.ssrc(), arrival.absSendTime().getAsInt(),
-                                    arrival.sizeBytes(), arrival.arrivalNanos());
-                        }
-                    })
-                    .rtcp(rtcp)
-                    .cname(media.getFirst().cname())
-                    .extensions(runtime.extensions)
-                    .threadFactory(configuration.threadFactory())
-                    .build();
-            holder[0] = session;
-            runtime.session = session;
-            if (transportCc) {
-                var generator = TransportFeedbackGenerator.create(session.localSsrc(), configuration.clock(),
-                        packet -> sendRtcp(holder[0], packet));
-                generator.start(configuration.threadFactory());
-                runtime.feedback = generator;
-            } else if (remb) {
-                var generator = RembGenerator.create(session.localSsrc(), configuration.clock(),
-                        packet -> sendRtcp(holder[0], packet));
-                generator.start(configuration.threadFactory());
-                runtime.remb = generator;
-            }
-        }
         var data = outcome.data().filter(section -> section.transportId().equals(transport.id()));
         if (data.isPresent()) {
             sctp();
@@ -367,6 +339,60 @@ final class TransportBackend implements PeerBackend {
             var thread = configuration.threadFactory().newThread(() -> connect(runtime, transport, data, hasMedia));
             runtime.connector = thread;
             thread.start();
+        }
+    }
+
+    /// Creates the congestion controller, the RTP session and its feedback generators of a keyed transport.
+    private void buildSession(TransportRuntime runtime, List<Negotiated.Media> media) {
+        var extensions = new HashMap<Integer, URI>();
+        media.forEach(section -> extensions.putAll(section.extensions()));
+        runtime.extensions = HeaderExtensionMap.of(extensions).withAllowMixed(true);
+        var congestion = CongestionController.gcc(CongestionConfig.defaults()
+                .withBitrates(configuration.minBitrate(), configuration.startBitrate(), configuration.maxBitrate())
+                .withClock(configuration.clock())
+                .withThreadFactory(configuration.threadFactory()));
+        congestion.setTargetListener(target -> allocate(runtime, target));
+        runtime.congestion = congestion;
+        var reducedSize = media.stream().allMatch(Negotiated.Media::reducedSizeRtcp);
+        var webrtc = RtcpConfig.webrtc();
+        var rtcp = new RtcpConfig(webrtc.avpf(), reducedSize, webrtc.extendedReports(), webrtc.minimumInterval(),
+                webrtc.trrInterval(), webrtc.sessionBandwidthBps());
+        var holder = new RtpSession[1];
+        var transportCc = media.stream().anyMatch(section -> hasFeedback(section, "transport-cc"));
+        var remb = !transportCc && media.stream().anyMatch(section -> hasFeedback(section, "goog-remb"));
+        var session = RtpSession.builder(runtime.srtp)
+                .clock(configuration.clock())
+                .scheduler(congestion.pacer())
+                .feedbackObserver(congestion)
+                .arrivalObserver(arrival -> {
+                    var feedback = runtime.feedback;
+                    if (feedback != null && arrival.transportSequence().isPresent()) {
+                        feedback.onPacketReceived(arrival.transportSequence().getAsInt(), arrival.ssrc(),
+                                arrival.arrivalNanos());
+                    }
+                    var generator = runtime.remb;
+                    if (generator != null && arrival.absSendTime().isPresent()) {
+                        generator.onPacketReceived(arrival.ssrc(), arrival.absSendTime().getAsInt(),
+                                arrival.sizeBytes(), arrival.arrivalNanos());
+                    }
+                })
+                .rtcp(rtcp)
+                .cname(media.getFirst().cname())
+                .extensions(runtime.extensions)
+                .threadFactory(configuration.threadFactory())
+                .build();
+        holder[0] = session;
+        runtime.session = session;
+        if (transportCc) {
+            var generator = TransportFeedbackGenerator.create(session.localSsrc(), configuration.clock(),
+                    packet -> sendRtcp(holder[0], packet));
+            generator.start(configuration.threadFactory());
+            runtime.feedback = generator;
+        } else if (remb) {
+            var generator = RembGenerator.create(session.localSsrc(), configuration.clock(),
+                    packet -> sendRtcp(holder[0], packet));
+            generator.start(configuration.threadFactory());
+            runtime.remb = generator;
         }
     }
 
@@ -399,9 +425,13 @@ final class TransportBackend implements PeerBackend {
             }
             if (hasMedia) {
                 runtime.dtls.handshake(transport.dtlsRole(), fingerprints, configuration.handshakeTimeout());
+                runtime.keyed = true;
+                wire(runtime);
             } else {
                 runtime.dtls.handshakeWithoutSrtp(transport.dtlsRole(), fingerprints,
                         configuration.handshakeTimeout());
+                runtime.keyed = runtime.dtls.srtpKeys().isPresent();
+                wire(runtime);
             }
             if (data.isPresent()) {
                 var association = sctp();

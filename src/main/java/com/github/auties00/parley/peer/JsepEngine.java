@@ -966,11 +966,13 @@ final class JsepEngine {
             startGathering(restart);
             return Optional.empty();
         }
+        var restart = localIce != null && !localIce.equals(credentials);
         localIce = credentials;
         var offer = pendingRemote.sdp();
         if (type == JsepType.PRANSWER) {
             pendingLocal = new Description(JsepType.PRANSWER, parsed);
             var result = negotiate(offer, parsed, false);
+            startGathering(restart);
             setState(SignalingState.HAVE_LOCAL_PRANSWER);
             return Optional.of(result);
         }
@@ -979,6 +981,7 @@ final class JsepEngine {
         pendingLocal = null;
         pendingRemote = null;
         var result = negotiate(offer, parsed, false);
+        startGathering(restart);
         finishNegotiation(result);
         setState(SignalingState.STABLE);
         return Optional.of(result);
