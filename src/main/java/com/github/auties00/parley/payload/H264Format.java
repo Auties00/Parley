@@ -71,8 +71,8 @@ public record H264Format(Codec codec) implements PayloadFormat {
         return VideoDepacketizer.withDescriptor(new H264Depacketizer(spropParameterSets()), config);
     }
 
-    /// {@return whether the payload carries an IDR slice (NAL unit type 5): a single NAL unit, any unit of a STAP-A,
-    /// or any fragment of an FU-A}
+    /// {@return whether the payload carries an IDR slice or a sequence parameter set (NAL unit types 5 and 7), the
+    /// units a keyframe starts with: as a single NAL unit, any unit of a STAP-A, or any fragment of an FU-A}
     ///
     /// @param payload the payload
     @Override
@@ -82,11 +82,12 @@ public record H264Format(Codec codec) implements PayloadFormat {
         }
         var start = payload.position();
         var type = payload.get(start) & 0x1F;
-        if (type == 5) {
+        if (type == 5 || type == 7) {
             return true;
         }
         if (type == H264Packetizer.FU_A) {
-            return payload.remaining() >= 2 && (payload.get(start + 1) & 0x1F) == 5;
+            return payload.remaining() >= 2 && ((payload.get(start + 1) & 0x1F) == 5
+                    || (payload.get(start + 1) & 0x1F) == 7);
         }
         if (type == H264Packetizer.STAP_A) {
             var offset = start + 1;
@@ -95,7 +96,8 @@ public record H264Format(Codec codec) implements PayloadFormat {
                 if (size == 0 || offset + 2 + size > payload.limit()) {
                     return false;
                 }
-                if ((payload.get(offset + 2) & 0x1F) == 5) {
+                var unit = payload.get(offset + 2) & 0x1F;
+                if (unit == 5 || unit == 7) {
                     return true;
                 }
                 offset += 2 + size;

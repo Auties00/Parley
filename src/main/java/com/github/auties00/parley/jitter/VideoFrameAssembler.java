@@ -130,9 +130,11 @@ public final class VideoFrameAssembler implements AutoCloseable {
     /// The highest unwrapped sequence number seen, or `-1`.
     private long highestSequence = -1;
 
-    /// The sequence number below which packets are obsolete: the first one of the stream, then the first one of the
-    /// last released frame; `-1` before the first packet.
+    /// The first sequence number of the last released frame, below which packets are obsolete, or `-1`.
     private long floorSequence = -1;
+
+    /// The lowest sequence number seen since the stream started, the start of the stream's first frame.
+    private long lowestSequence = Long.MAX_VALUE;
 
     /// The id of the last released frame, or `Long.MIN_VALUE`.
     private long lastReleasedId = Long.MIN_VALUE;
@@ -277,9 +279,6 @@ public final class VideoFrameAssembler implements AutoCloseable {
                 return;
             }
             var sequence = sequences.unwrap(packet.sequence());
-            if (floorSequence < 0) {
-                floorSequence = sequence;
-            }
             if (sequence < floorSequence || packets.containsKey(sequence)) {
                 packetsDiscarded++;
                 return;
@@ -290,7 +289,6 @@ public final class VideoFrameAssembler implements AutoCloseable {
             } else if (highestSequence >= 0 && sequence > highestSequence + 1) {
                 if (sequence - highestSequence > MAX_GAP) {
                     restart();
-                    floorSequence = sequence;
                 } else {
                     for (var gap = highestSequence + 1; gap < sequence; gap++) {
                         missing.put(gap, new Missing(now));
@@ -299,6 +297,7 @@ public final class VideoFrameAssembler implements AutoCloseable {
             }
             lost.remove(sequence);
             highestSequence = Math.max(highestSequence, sequence);
+            lowestSequence = Math.min(lowestSequence, sequence);
             packets.put(sequence, new Slot(packet.copy(), arrivalNanos, boundaries));
             if (packets.size() > config.maxPackets()) {
                 while (packets.size() > config.maxPackets() / 2) {
@@ -463,6 +462,7 @@ public final class VideoFrameAssembler implements AutoCloseable {
         frameEnds.clear();
         pending.clear();
         floorSequence = -1;
+        lowestSequence = Long.MAX_VALUE;
         keyframeNeeded = true;
     }
 
@@ -497,7 +497,8 @@ public final class VideoFrameAssembler implements AutoCloseable {
             var previous = packets.get(start - 1);
             if (previous == null) {
                 var boundary = frameEnds.contains(start - 1)
-                        || (start - 1 < floorSequence || lost.contains(start - 1)) && boundaries.frameStart();
+                        || (start - 1 < floorSequence || start == lowestSequence || lost.contains(start - 1))
+                        && boundaries.frameStart();
                 if (boundary && !boundaries.explicitStart()) {
                     break;
                 }
@@ -579,15 +580,20 @@ public final class VideoFrameAssembler implements AutoCloseable {
             var sequenceNumbers = List.copyOf(retransmit);
             actions.add(() -> feedback.requestRetransmission(sequenceNumbers));
         }
+        release(now);
+        var expired = false;
         for (var iterator = pending.values().iterator(); iterator.hasNext(); ) {
             var frame = iterator.next();
             if (now - frame.completed() > budget && !decodable(frame)) {
                 iterator.remove();
                 framesDropped++;
                 keyframeNeeded = true;
+                expired = true;
             }
         }
-        release(now);
+        if (expired) {
+            release(now);
+        }
         if (keyframeNeeded && (lastKeyframeRequest == Long.MIN_VALUE
                 || now - lastKeyframeRequest >= config.keyframeRequestInterval().toNanos())) {
             keyframeNeeded = false;

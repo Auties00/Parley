@@ -30,15 +30,9 @@ public record H264ProfileLevelId(Profile profile, Level level) {
     ///
     /// @param profile the profile
     /// @param level   the level
-    /// @throws IllegalArgumentException if `level` is [Level#LEVEL_1B] and `profile` is not Constrained Baseline,
-    ///                                  Baseline or Main, the only profiles that encode level `1b`
     public H264ProfileLevelId {
         Objects.requireNonNull(profile, "profile cannot be null");
         Objects.requireNonNull(level, "level cannot be null");
-        if (level == Level.LEVEL_1B && profile != Profile.CONSTRAINED_BASELINE && profile != Profile.BASELINE
-                && profile != Profile.MAIN) {
-            throw new IllegalArgumentException("level 1b cannot be encoded for profile " + profile);
-        }
     }
 
     /// Parses a `profile-level-id` value.
@@ -62,12 +56,7 @@ public record H264ProfileLevelId(Profile profile, Level level) {
         }
         for (var pattern : Profile.PATTERNS) {
             if (pattern.matches(profileIdc, profileIop)) {
-                var profile = pattern.profile();
-                if (level.get() == Level.LEVEL_1B && profile != Profile.CONSTRAINED_BASELINE
-                        && profile != Profile.BASELINE && profile != Profile.MAIN) {
-                    return Optional.of(new H264ProfileLevelId(profile, Level.LEVEL_1_1));
-                }
-                return Optional.of(new H264ProfileLevelId(profile, level.get()));
+                return Optional.of(new H264ProfileLevelId(pattern.profile(), level.get()));
             }
         }
         return Optional.empty();
@@ -83,14 +72,25 @@ public record H264ProfileLevelId(Profile profile, Level level) {
     }
 
     /// {@return the `profile-level-id` value, six lower-case hexadecimal digits}
+    ///
+    /// Level 1b is written as `level_idc` 11 with `constraint_set3_flag` for the Baseline and Main profiles, and as
+    /// `level_idc` 9 for the others.
     @Override
     public String toString() {
         if (level == Level.LEVEL_1B) {
-            return switch (profile) {
-                case CONSTRAINED_BASELINE -> "42f00b";
-                case BASELINE -> "42100b";
-                default -> "4d100b";
-            };
+            switch (profile) {
+                case CONSTRAINED_BASELINE -> {
+                    return "42f00b";
+                }
+                case BASELINE -> {
+                    return "42100b";
+                }
+                case MAIN -> {
+                    return "4d100b";
+                }
+                default -> {
+                }
+            }
         }
         var prefix = switch (profile) {
             case CONSTRAINED_BASELINE -> "42e0";
@@ -100,7 +100,7 @@ public record H264ProfileLevelId(Profile profile, Level level) {
             case HIGH -> "6400";
             case PREDICTIVE_HIGH_444 -> "f400";
         };
-        return prefix + HexFormat.of().toHexDigits((byte) level.idc());
+        return prefix + HexFormat.of().toHexDigits((byte) (level == Level.LEVEL_1B ? 9 : level.idc()));
     }
 
     /// The H.264 profiles WebRTC negotiates.

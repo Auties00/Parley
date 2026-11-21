@@ -75,8 +75,9 @@ public record H265Format(Codec codec) implements PayloadFormat {
         return VideoDepacketizer.withDescriptor(new H265Depacketizer(spropParameterSets()), config);
     }
 
-    /// {@return whether the payload carries an IRAP slice (NAL unit types `16..23`): a single NAL unit, any unit of an
-    /// aggregation packet, or any fragment of a fragmentation unit}
+    /// {@return whether the payload carries an IRAP slice or a sequence parameter set (NAL unit types `16..23` and
+    /// `33`), the units a keyframe starts with: as a single NAL unit, any unit of an aggregation packet, or any
+    /// fragment of a fragmentation unit}
     ///
     /// @param payload the payload
     @Override
@@ -115,9 +116,9 @@ public record H265Format(Codec codec) implements PayloadFormat {
         return OptionalInt.empty();
     }
 
-    /// {@return whether a type is an IRAP picture's slice}
+    /// {@return whether a type is an IRAP picture's slice or a sequence parameter set}
     private static boolean isIrap(int type) {
-        return type >= 16 && type <= 23;
+        return type >= 16 && type <= 23 || type == 33;
     }
 
     /// {@return a numeric format parameter, or a default}

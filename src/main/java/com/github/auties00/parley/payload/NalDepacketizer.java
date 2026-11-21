@@ -108,7 +108,7 @@ abstract sealed class NalDepacketizer implements Depacketizer permits H264Depack
                 case Unit.Fragment fragment -> fragmentStart(fragment);
             };
             var type = type(head);
-            keyframe |= isRandomAccess(type);
+            keyframe |= isRandomAccess(type) || type == spsType();
             temporal = temporalId(head);
             if (i == 0) {
                 start = switch (units.get(i)) {
