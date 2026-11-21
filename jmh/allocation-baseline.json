@@ -7,7 +7,7 @@
   "com.github.auties00.parley.bytes.ByteKernelsBenchmark.xorArray[kernels=vector]": 0.0,
   "com.github.auties00.parley.bytes.ByteKernelsBenchmark.xorReadOnlyBuffer[kernels=bytewise]": 0.0,
   "com.github.auties00.parley.bytes.ByteKernelsBenchmark.xorReadOnlyBuffer[kernels=scalar]": 0.0,
-  "com.github.auties00.parley.bytes.ByteKernelsBenchmark.xorReadOnlyBuffer[kernels=vector]": 0.0,
+  "com.github.auties00.parley.bytes.ByteKernelsBenchmark.xorReadOnlyBuffer[kernels=vector]": 72.0,
   "com.github.auties00.parley.cc.GccBenchmark.feedback": 5000.5,
   "com.github.auties00.parley.cc.PacerBenchmark.scheduleAndSend": 104.0,
   "com.github.auties00.parley.dtls.DtlsRecordBenchmark.encrypt": 2192.0,
