@@ -30,6 +30,7 @@ import java.util.OptionalLong;
 import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.locks.Condition;
 import java.util.concurrent.locks.ReentrantLock;
+import java.util.function.BiConsumer;
 import java.util.function.Supplier;
 
 /// The SCTP association of a peer connection, run over the application data of its DTLS transport, and the data
@@ -532,6 +533,11 @@ public final class SctpTransport implements AutoCloseable {
     /// {@return the factory of the threads the transport and its channels start}
     ThreadFactory threadFactory() {
         return config.threadFactory();
+    }
+
+    /// {@return the listener told of every channel's events}
+    BiConsumer<? super DataChannel, ? super DataChannelEvent> channelEventListener() {
+        return config.channelEventListener();
     }
 
     /// {@return a channel of this transport, with its bounds from the configuration}

@@ -7,6 +7,7 @@ import com.github.auties00.parley.ice.IcePath.TcpPassivePath;
 import com.github.auties00.parley.ice.IcePath.UdpPath;
 import com.github.auties00.parley.mdns.MdnsResolver;
 import com.github.auties00.parley.mdns.MdnsResponder;
+import com.github.auties00.parley.net.DatagramEndpoint;
 import com.github.auties00.parley.net.MonotonicClock;
 import com.github.auties00.parley.net.NetworkInterfaceAddress;
 import com.github.auties00.parley.net.NetworkStack;
@@ -62,6 +63,7 @@ import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.locks.Condition;
 import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.Consumer;
@@ -667,14 +669,29 @@ public final class IceAgent implements IceTransport {
         if (dscp < 0 || dscp > 63) {
             throw new IllegalArgumentException("dscp must be in 0..63: " + dscp);
         }
+        List<DatagramEndpoint> endpoints;
         lock.lock();
         try {
             trafficClass = dscp;
-            // TODO: apply dscp to every host UDP endpoint (and to those bound later in gatherHosts) through
-            //  DatagramEndpoint.setTrafficClass, which the net package adds; until then nothing is marked.
-            return false;
+            endpoints = resources.stream().filter(DatagramEndpoint.class::isInstance)
+                    .map(DatagramEndpoint.class::cast).toList();
         } finally {
             lock.unlock();
+        }
+        var accepted = true;
+        for (var endpoint : endpoints) {
+            accepted &= markQuietly(endpoint, dscp);
+        }
+        return accepted;
+    }
+
+    /// Sets the DSCP value of one endpoint; a platform refusal is reported as `false`, never thrown.
+    private static boolean markQuietly(DatagramEndpoint endpoint, int dscp) {
+        try {
+            return endpoint.setTrafficClass(dscp);
+        } catch (RuntimeException exception) {
+            LOGGER.log(Level.DEBUG, "the traffic class could not be set: " + exception);
+            return false;
         }
     }
 
@@ -888,6 +905,16 @@ public final class IceAgent implements IceTransport {
                     if (!registerResource(endpoint)) {
                         return;
                     }
+                    int dscp;
+                    lock.lock();
+                    try {
+                        dscp = trafficClass;
+                    } finally {
+                        lock.unlock();
+                    }
+                    if (dscp != 0) {
+                        markQuietly(endpoint, dscp);
+                    }
                     addLocal(host, signaledHost(host));
                     udpBases.add(host);
                     stack.threadFactory().newThread(() -> readUdp(host, endpoint)).start();
@@ -1041,7 +1068,14 @@ public final class IceAgent implements IceTransport {
                 client.close();
                 return;
             }
-            var options = family == StunAddressFamily.IPV6 ? TurnAllocationOptions.IPV6 : TurnAllocationOptions.IPV4;
+            var relayHolder = new AtomicReference<LocalCandidate>();
+            var options = (family == StunAddressFamily.IPV6 ? TurnAllocationOptions.IPV6 : TurnAllocationOptions.IPV4)
+                    .receiver((peer, data, arrival) -> {
+                        var candidate = relayHolder.get();
+                        if (candidate != null) {
+                            onPacket(candidate, null, data, peer, arrival);
+                        }
+                    });
             var allocation = client.allocate(options, timers.gatherTimeout());
             var relayed = allocation.relayedAddress();
             var relayProtocol = switch (turnServer.transport()) {
@@ -1053,7 +1087,7 @@ public final class IceAgent implements IceTransport {
                     IceProtocol.UDP, Optional.empty(), IceCandidate.priority(IceCandidateType.RELAY.typePreference(),
                     relayLocalPreference(index, family, relayProtocol), COMPONENT),
                     foundation("relay", relayed.getAddress(), turnServer.host() + "/" + turnServer.transport()));
-            allocation.setReceiver((peer, data, arrival) -> onPacket(relay, null, data, peer, arrival));
+            relayHolder.set(relay);
             var related = allocation.mappedAddress().map(mapped -> relatedAddress(mapped, relayed));
             var signaled = new IceCandidate(relay.foundation, COMPONENT, IceProtocol.UDP, relay.priority,
                     IceCandidate.hostString(relayed), relayed.getPort(), IceCandidateType.RELAY, Optional.empty(),

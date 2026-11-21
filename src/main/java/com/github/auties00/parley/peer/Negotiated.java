@@ -93,6 +93,17 @@ record Negotiated(boolean offerer, List<Transport> transports, List<Media> media
     /// @param rtxSsrc  the retransmission source, when RTX is negotiated
     /// @param encoding the encoding parameters
     record SendLayer(Optional<String> rid, long ssrc, OptionalLong rtxSsrc, Encoding encoding) {
+        /// {@return this layer with `oldSsrc` replaced by `newSsrc` where it is the media or the retransmission
+        /// source, or this layer when it uses neither}
+        SendLayer withReplacedSsrc(long oldSsrc, long newSsrc) {
+            if (ssrc == oldSsrc) {
+                return new SendLayer(rid, newSsrc, rtxSsrc, encoding);
+            }
+            if (rtxSsrc.isPresent() && rtxSsrc.getAsLong() == oldSsrc) {
+                return new SendLayer(rid, ssrc, OptionalLong.of(newSsrc), encoding);
+            }
+            return this;
+        }
     }
 
     /// One remote stream the peer announced.
@@ -159,8 +170,9 @@ record Negotiated(boolean offerer, List<Transport> transports, List<Media> media
     /// @param localPort            the local SCTP port
     /// @param remotePort           the remote SCTP port
     /// @param localMaxMessageSize  the largest message this side accepts
-    /// @param remoteMaxMessageSize the largest message the peer accepts, `0` for no limit
+    /// @param remoteMaxMessageSize the peer's `a=max-message-size`, `0` for no limit; empty when the section has none,
+    ///                             which RFC 8841 reads as 64 KiB
     record Data(String mid, String transportId, int localPort, int remotePort, long localMaxMessageSize,
-                long remoteMaxMessageSize) {
+                OptionalLong remoteMaxMessageSize) {
     }
 }

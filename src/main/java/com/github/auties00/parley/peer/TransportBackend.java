@@ -3,14 +3,15 @@ package com.github.auties00.parley.peer;
 import com.github.auties00.parley.cc.AllocationKey;
 import com.github.auties00.parley.cc.BitrateAllocator;
 import com.github.auties00.parley.cc.CongestionConfig;
+import com.github.auties00.parley.cc.CongestionControlFeedbackGenerator;
 import com.github.auties00.parley.cc.CongestionController;
 import com.github.auties00.parley.cc.EncodingDemand;
 import com.github.auties00.parley.cc.RembGenerator;
 import com.github.auties00.parley.cc.TargetBitrate;
 import com.github.auties00.parley.cc.TransportFeedbackGenerator;
 import com.github.auties00.parley.datachannel.DataChannel;
+import com.github.auties00.parley.datachannel.DataChannelEvent;
 import com.github.auties00.parley.datachannel.DataChannelInit;
-import com.github.auties00.parley.datachannel.DataChannelState;
 import com.github.auties00.parley.datachannel.SctpConfig;
 import com.github.auties00.parley.datachannel.SctpTransport;
 import com.github.auties00.parley.datachannel.SctpTransportState;
@@ -23,15 +24,27 @@ import com.github.auties00.parley.dtls.DtlsTransport;
 import com.github.auties00.parley.ice.IceAgent;
 import com.github.auties00.parley.ice.IceCandidate;
 import com.github.auties00.parley.ice.IceEvent;
+import com.github.auties00.parley.ice.IceException;
 import com.github.auties00.parley.ice.IceParameters;
 import com.github.auties00.parley.jitter.AudioPlayoutBuffer;
 import com.github.auties00.parley.jitter.AudioPlayoutConfig;
 import com.github.auties00.parley.jitter.FeedbackSink;
+import com.github.auties00.parley.jitter.SyncGroup;
 import com.github.auties00.parley.jitter.VideoAssemblerConfig;
 import com.github.auties00.parley.jitter.VideoFrameAssembler;
+import com.github.auties00.parley.media.AudioFrameMetadata;
+import com.github.auties00.parley.media.Av1FrameMetadata;
 import com.github.auties00.parley.media.Codec;
 import com.github.auties00.parley.media.EncodedFrame;
+import com.github.auties00.parley.media.FrameMetadata;
+import com.github.auties00.parley.media.GenericFrameMetadata;
+import com.github.auties00.parley.media.H264FrameMetadata;
+import com.github.auties00.parley.media.H265FrameMetadata;
 import com.github.auties00.parley.media.MediaKind;
+import com.github.auties00.parley.media.Priority;
+import com.github.auties00.parley.media.Resolution;
+import com.github.auties00.parley.media.Vp8FrameMetadata;
+import com.github.auties00.parley.media.Vp9FrameMetadata;
 import com.github.auties00.parley.net.DatagramTransport;
 import com.github.auties00.parley.net.NetworkStack;
 import com.github.auties00.parley.net.PacketReceiver;
@@ -43,10 +56,12 @@ import com.github.auties00.parley.payload.PayloadFormat;
 import com.github.auties00.parley.payload.PayloadFormatException;
 import com.github.auties00.parley.payload.Vp8PayloadRewriter;
 import com.github.auties00.parley.payload.Vp9PayloadRewriter;
+import com.github.auties00.parley.rtp.RtpFormatException;
 import com.github.auties00.parley.rtp.RtpPacket;
 import com.github.auties00.parley.rtp.extension.HeaderExtensionMap;
 import com.github.auties00.parley.rtp.rtcp.Bye;
 import com.github.auties00.parley.rtp.rtcp.RtcpPacket;
+import com.github.auties00.parley.rtp.rtcp.SenderReport;
 import com.github.auties00.parley.rtp.session.FecConfig;
 import com.github.auties00.parley.rtp.session.FeedbackMechanism;
 import com.github.auties00.parley.rtp.session.KeyframeMethod;
@@ -59,8 +74,10 @@ import com.github.auties00.parley.rtp.session.RtpRoutingTable;
 import com.github.auties00.parley.rtp.session.RtpSendStream;
 import com.github.auties00.parley.rtp.session.RtpSession;
 import com.github.auties00.parley.rtp.session.SendStreamConfig;
+import com.github.auties00.parley.rtp.session.SsrcChange;
 import com.github.auties00.parley.sdp.SdpAttribute;
 import com.github.auties00.parley.stats.RtcStats;
+import com.github.auties00.parley.transport.SrtpOptions;
 import com.github.auties00.parley.transport.SrtpTransport;
 
 import java.io.IOException;
@@ -137,8 +154,10 @@ final class TransportBackend implements PeerBackend {
     private final DeferredDatagramTransport dataPath = new DeferredDatagramTransport();
     /// The data channels, opened locally or by the peer.
     private final List<DataChannel> channels = new CopyOnWriteArrayList<>();
-    /// What the statistics counted of each channel's life: whether it was seen open and closed.
-    private final Map<DataChannel, ChannelCount> channelCounts = new ConcurrentHashMap<>();
+    /// The data channels counted as opened and not yet as closed.
+    private final Set<DataChannel> openChannels = ConcurrentHashMap.newKeySet();
+    /// The A/V synchronization groups of the received streams, by remote `a=msid` stream id.
+    private final Map<String, SyncGroup> syncGroups = new ConcurrentHashMap<>();
     /// The SCTP association, or `null` before the first data channel or data section.
     private volatile SctpTransport sctp;
     /// The association whose start was issued; guarded by [#dataLock].
@@ -158,12 +177,18 @@ final class TransportBackend implements PeerBackend {
         final String id;
         /// The ICE agent.
         final IceAgent ice;
-        /// The DTLS transport over the agent.
-        final DtlsTransport dtls;
-        /// The SRTP transport over the DTLS transport.
-        final SrtpTransport srtp;
+        /// The DTLS transport over the agent; replaced when the peer restarts DTLS.
+        volatile DtlsTransport dtls;
+        /// The SRTP transport over the DTLS transport, created once the handshake keyed it with the negotiated
+        /// options; `null` before.
+        volatile SrtpTransport srtp;
         /// The application's view of the DTLS and ICE transports.
         final PeerDtlsTransportView view;
+        /// The remote parameters the current DTLS handshake was started with, or `null` before the first one;
+        /// guarded by [#wiring].
+        HandshakeParameters handshake;
+        /// The DSCP value applied to the agent's sockets, or `-1` before the first.
+        volatile int trafficClass = -1;
         /// The remote candidates handed to the agent.
         final Set<String> remoteCandidates = ConcurrentHashMap.newKeySet();
         /// Serializes the creation of the RTP session with the wiring of streams to it, and with [#closed].
@@ -176,6 +201,8 @@ final class TransportBackend implements PeerBackend {
         volatile TransportFeedbackGenerator feedback;
         /// The REMB generator of the session, when goog-remb is negotiated without transport-cc.
         volatile RembGenerator remb;
+        /// The RFC 8888 feedback generator of the session, when `ack ccfb` is negotiated.
+        volatile CongestionControlFeedbackGenerator ccfb;
         /// The extension map of the session.
         volatile HeaderExtensionMap extensions = HeaderExtensionMap.empty();
         /// The thread connecting ICE and DTLS, or `null`.
@@ -187,13 +214,26 @@ final class TransportBackend implements PeerBackend {
         /// Whether the transport was closed; written under [#wiring].
         volatile boolean closed;
 
-        TransportRuntime(String id, IceAgent ice, DtlsTransport dtls, SrtpTransport srtp,
-                         PeerDtlsTransportView view) {
+        TransportRuntime(String id, IceAgent ice, DtlsTransport dtls, PeerDtlsTransportView view) {
             this.id = id;
             this.ice = ice;
             this.dtls = dtls;
-            this.srtp = srtp;
             this.view = view;
+        }
+    }
+
+    /// What decides whether a negotiation restarts a transport's DTLS association: the peer's `a=tls-id`, its
+    /// fingerprints and the DTLS role.
+    ///
+    /// @param remoteTlsId        the remote `a=tls-id`, if any
+    /// @param remoteFingerprints the remote fingerprints
+    /// @param role               this side's DTLS role
+    private record HandshakeParameters(Optional<String> remoteTlsId, List<SdpAttribute.Fingerprint> remoteFingerprints,
+                                       DtlsRole role) {
+        /// {@return the parameters a negotiated transport names}
+        static HandshakeParameters of(Negotiated.Transport transport) {
+            return new HandshakeParameters(transport.remoteTlsId(), transport.remoteFingerprints(),
+                    transport.dtlsRole());
         }
     }
 
@@ -221,17 +261,10 @@ final class TransportBackend implements PeerBackend {
     /// @param assembler   the video frame assembler, or `null`
     /// @param payloadType the first negotiated payload type
     /// @param feedback    the RTCP feedback the peer accepts for the stream's codec
+    /// @param syncGroup   the remote `a=msid` stream id whose [SyncGroup] the jitter buffer joined, if any
     record ReceiverBinding(String mid, String transportId, MediaKind kind, Optional<String> rid, RtpReceiveStream stream,
                            RtpReceiver receiver, AudioPlayoutBuffer playout, VideoFrameAssembler assembler,
-                           int payloadType, Set<FeedbackMechanism> feedback) {
-    }
-
-    /// What the statistics counted of one data channel.
-    private static final class ChannelCount {
-        /// Whether the channel was counted as opened.
-        boolean opened;
-        /// Whether the channel was counted as closed.
-        boolean closed;
+                           int payloadType, Set<FeedbackMechanism> feedback, Optional<String> syncGroup) {
     }
 
     /// Creates the backend of a connection.
@@ -293,13 +326,22 @@ final class TransportBackend implements PeerBackend {
                 .withThreadFactory(configuration.threadFactory()));
         iceView[0] = new PeerIceTransportView(agent);
         var view = new PeerDtlsTransportView(dtls, iceView[0]);
-        dtls.setStateListener(state -> {
-            view.publish(state);
-            listener.onDtlsState(transportId, state);
-        });
-        transports.put(transportId, new TransportRuntime(transportId, agent, dtls, SrtpTransport.dtlsSrtp(dtls),
-                view));
+        var runtime = new TransportRuntime(transportId, agent, dtls, view);
+        listenTo(runtime, dtls);
+        transports.put(transportId, runtime);
         agent.gather();
+    }
+
+    /// Reports the state changes of a transport's DTLS association while it is the transport's current one, so the
+    /// closing of an association a restart replaced is not mistaken for the transport's.
+    private void listenTo(TransportRuntime runtime, DtlsTransport dtls) {
+        dtls.setStateListener(state -> {
+            if (runtime.dtls != dtls) {
+                return;
+            }
+            runtime.view.publish(state);
+            listener.onDtlsState(runtime.id, state);
+        });
     }
 
     /// Forwards an ICE event to the connection and to the transport's view.
@@ -358,9 +400,9 @@ final class TransportBackend implements PeerBackend {
             if (transport.remoteComplete()) {
                 runtime.ice.endOfRemoteCandidates();
             }
-            // TODO: when the negotiation reports a DTLS restart for the transport (new remote tls-id, fingerprint
-            //  set or setup role), restart its DtlsTransport, rekey SRTP and restart SCTP on it; until then a
-            //  restarted peer is not followed.
+            if (transport.dtlsRestart()) {
+                restartDtls(runtime, transport);
+            }
             prepare(runtime, outcome);
         }
         if (finalAnswer) {
@@ -376,7 +418,159 @@ final class TransportBackend implements PeerBackend {
         }
         for (var runtime : transports.values()) {
             wire(runtime);
+            applyTrafficClass(runtime);
         }
+    }
+
+    /// Replaces a transport's DTLS association with a new one, as RFC 8842 requires when the peer's `a=tls-id`,
+    /// fingerprints or the DTLS role change: the media streams and the SCTP association of the transport are torn
+    /// down, and a new connector handshakes again over the same ICE agent, keying a new SRTP transport and starting
+    /// a new association. Does nothing when the handshake already running or done used the same parameters.
+    ///
+    /// @spec https://www.rfc-editor.org/rfc/rfc8842.html RFC 8842: Session Description Protocol (SDP) Offer/Answer Considerations for Datagram Transport Layer Security (DTLS) and Transport Layer Security (TLS)
+    private void restartDtls(TransportRuntime runtime, Negotiated.Transport transport) {
+        DtlsTransport replacement;
+        Thread connector;
+        runtime.wiring.lock();
+        try {
+            if (runtime.closed || closed || runtime.handshake == null
+                    || runtime.handshake.equals(HandshakeParameters.of(transport))) {
+                return;
+            }
+            runtime.handshake = null;
+            runtime.keyed = false;
+            runtime.dtlsConnected = false;
+            detachMedia(runtime);
+            replacement = runtime.dtls.restart();
+            runtime.dtls = replacement;
+            runtime.view.replace(replacement);
+            listenTo(runtime, replacement);
+            connector = runtime.connector;
+            runtime.connector = null;
+        } finally {
+            runtime.wiring.unlock();
+        }
+        if (connector != null) {
+            connector.interrupt();
+        }
+        restartSctp(runtime);
+        runtime.view.publish(replacement.state());
+        listener.onDtlsState(runtime.id, replacement.state());
+    }
+
+    /// Removes the send and receive streams of a transport and closes its RTP session, feedback generators,
+    /// congestion controller and SRTP transport, so the next wiring builds them anew; the caller holds the
+    /// transport's wiring lock.
+    private void detachMedia(TransportRuntime runtime) {
+        for (var entry : List.copyOf(senders.entrySet())) {
+            if (entry.getValue().transportId().equals(runtime.id)) {
+                senders.remove(entry.getKey());
+                entry.getKey().stopSending();
+            }
+        }
+        for (var entry : List.copyOf(receivers.entrySet())) {
+            if (entry.getValue().transportId().equals(runtime.id)) {
+                receivers.remove(entry.getKey());
+                closeJitter(entry.getValue());
+            }
+        }
+        closeQuietly(runtime.feedback, runtime.remb, runtime.ccfb, runtime.session, runtime.congestion,
+                runtime.srtp);
+        runtime.feedback = null;
+        runtime.remb = null;
+        runtime.ccfb = null;
+        runtime.session = null;
+        runtime.congestion = null;
+        runtime.srtp = null;
+        runtime.extensions = HeaderExtensionMap.empty();
+    }
+
+    /// Closes the SCTP association when it runs over `runtime`, so the next negotiation or handshake starts a new
+    /// one over the transport's new DTLS association.
+    private void restartSctp(TransportRuntime runtime) {
+        SctpTransport previous;
+        dataLock.lock();
+        try {
+            if (!runtime.id.equals(dataTransportId) || startedAssociation == null) {
+                return;
+            }
+            previous = startedAssociation;
+            startedAssociation = null;
+            sctp = null;
+            dataTransportId = null;
+        } finally {
+            dataLock.unlock();
+        }
+        try {
+            previous.close();
+        } catch (RuntimeException exception) {
+            LOGGER.log(Level.DEBUG, "the SCTP association failed to close: " + exception);
+        }
+    }
+
+    /// Closes each of `closeables` on its own, skipping `null`s; never throws.
+    private static void closeQuietly(AutoCloseable... closeables) {
+        for (var closeable : closeables) {
+            if (closeable == null) {
+                continue;
+            }
+            try {
+                closeable.close();
+            } catch (Exception exception) {
+                LOGGER.log(Level.DEBUG, "a transport layer failed to close: " + exception);
+            }
+        }
+    }
+
+    /// Marks the sockets of a transport with the RFC 8837 DSCP value of its highest-priority flow, when it changed.
+    ///
+    /// @implNote This implementation marks every packet of a transport alike: the transport sends through one socket
+    /// per candidate, shared by every flow BUNDLE puts on it, so the flow with the highest `networkPriority` decides
+    /// (audio before video at equal priority, data channels last).
+    /// @spec https://www.rfc-editor.org/rfc/rfc8837.html RFC 8837: Differentiated Services Code Point (DSCP) Packet Markings for WebRTC QoS
+    private void applyTrafficClass(TransportRuntime runtime) {
+        var outcome = negotiated;
+        if (outcome == null || closed || runtime.closed) {
+            return;
+        }
+        var best = -1;
+        var dscp = 0;
+        for (var media : outcome.media()) {
+            if (!media.transportId().equals(runtime.id) || !media.direction().sends()) {
+                continue;
+            }
+            var layers = media.transceiver().sender().currentLayers();
+            for (var layer : layers.isEmpty() ? media.sendLayers() : layers) {
+                var priority = layer.encoding().networkPriority();
+                var rank = priority.ordinal() * 3 + (media.kind() == MediaKind.AUDIO ? 2 : 1);
+                if (rank > best) {
+                    best = rank;
+                    dscp = dscpOf(Optional.of(media.kind()), priority);
+                }
+            }
+        }
+        if (best < 0 && outcome.data().filter(data -> data.transportId().equals(runtime.id)).isPresent()) {
+            dscp = dscpOf(Optional.empty(), Priority.LOW);
+        }
+        if (runtime.trafficClass == dscp) {
+            return;
+        }
+        runtime.trafficClass = dscp;
+        if (!runtime.ice.setTrafficClass(dscp) && dscp != 0) {
+            LOGGER.log(Level.DEBUG, "the platform did not mark transport " + runtime.id + " with DSCP " + dscp);
+        }
+    }
+
+    /// {@return the RFC 8837 DSCP value of a flow of `kind`, or of data channels when `kind` is empty}
+    private static int dscpOf(Optional<MediaKind> kind, Priority priority) {
+        var audio = kind.filter(MediaKind.AUDIO::equals).isPresent();
+        var video = kind.filter(MediaKind.VIDEO::equals).isPresent();
+        return switch (priority) {
+            case VERY_LOW -> 8;
+            case LOW -> 0;
+            case MEDIUM -> audio ? 46 : video ? 36 : 10;
+            case HIGH -> audio ? 46 : video ? 34 : 18;
+        };
     }
 
     /// Creates the SCTP association a data section needs, starts the transport's connector once, and starts SCTP
@@ -430,21 +624,21 @@ final class TransportBackend implements PeerBackend {
         media.forEach(section -> extensions.putAll(section.extensions()));
         runtime.extensions = HeaderExtensionMap.of(extensions).withAllowMixed(true);
         var bitrates = configuration.bitrates();
-        // TODO: map a pacer failure to PeerConnectionState.FAILED once the congestion config takes a pacer failure
-        //  listener, and pass the target listener through the config instead of the setter.
         var congestion = CongestionController.gcc(CongestionConfig.defaults()
                 .withBitrates(bitrates.minBps(), bitrates.startBps(), bitrates.maxBps())
                 .withClock(configuration.clock())
-                .withThreadFactory(configuration.threadFactory()));
-        congestion.setTargetListener(target -> allocate(runtime, target));
+                .withThreadFactory(configuration.threadFactory())
+                .withTargetListener(target -> allocate(runtime, target))
+                .withFailureListener(cause -> onPacerFailed(runtime, cause)));
         runtime.congestion = congestion;
         var reducedSize = media.stream().allMatch(Negotiated.Media::reducedSizeRtcp);
         var webrtc = RtcpConfig.webrtc();
         var rtcp = new RtcpConfig(webrtc.avpf(), reducedSize, webrtc.extendedReports(), webrtc.minimumInterval(),
                 webrtc.trrInterval(), webrtc.sessionBandwidthBps());
         var holder = new RtpSession[1];
-        var transportCc = media.stream().anyMatch(section -> hasFeedback(section, "transport-cc"));
-        var remb = !transportCc && media.stream().anyMatch(section -> hasFeedback(section, "goog-remb"));
+        var ccfb = media.stream().anyMatch(Negotiated.Media::congestionControlFeedback);
+        var transportCc = !ccfb && media.stream().anyMatch(section -> hasFeedback(section, "transport-cc"));
+        var remb = !ccfb && !transportCc && media.stream().anyMatch(section -> hasFeedback(section, "goog-remb"));
         var session = RtpSession.builder(runtime.srtp)
                 .clock(configuration.clock())
                 .scheduler(congestion.pacer())
@@ -453,7 +647,11 @@ final class TransportBackend implements PeerBackend {
                     var feedback = runtime.feedback;
                     if (feedback != null && arrival.transportSequence().isPresent()) {
                         feedback.onPacketReceived(arrival.transportSequence().getAsInt(), arrival.ssrc(),
-                                arrival.arrivalNanos());
+                                arrival.sizeBytes(), arrival.arrivalNanos());
+                    }
+                    var congestionFeedback = runtime.ccfb;
+                    if (congestionFeedback != null) {
+                        congestionFeedback.onPacketReceived(arrival.ssrc(), arrival.sequence(), arrival.arrivalNanos());
                     }
                     var generator = runtime.remb;
                     if (generator != null && arrival.absSendTime().isPresent()) {
@@ -461,16 +659,21 @@ final class TransportBackend implements PeerBackend {
                                 arrival.sizeBytes(), arrival.arrivalNanos());
                     }
                 })
+                .rtcpListener(packet -> onRtcp(runtime, packet))
+                .ssrcChangedListener(change -> onSsrcChanged(runtime, change))
                 .rtcp(rtcp)
                 .cname(media.getFirst().cname())
                 .extensions(runtime.extensions)
                 .threadFactory(configuration.threadFactory())
                 .build();
         holder[0] = session;
-        // TODO: move the RTCP listener into the session's builder once it takes one.
-        session.setRtcpListener(packet -> onRtcp(runtime, packet));
         runtime.session = session;
-        if (transportCc) {
+        if (ccfb) {
+            var generator = CongestionControlFeedbackGenerator.create(session.localSsrc(), configuration.clock(),
+                    packet -> sendRtcp(holder[0], packet));
+            generator.start(configuration.threadFactory());
+            runtime.ccfb = generator;
+        } else if (transportCc) {
             var generator = TransportFeedbackGenerator.create(session.localSsrc(), configuration.clock(),
                     packet -> sendRtcp(holder[0], packet));
             generator.start(configuration.threadFactory());
@@ -483,20 +686,75 @@ final class TransportBackend implements PeerBackend {
         }
     }
 
-    /// Mutes the remote tracks whose sources the peer said goodbye to.
+    /// Mutes the remote tracks whose sources the peer said goodbye to, and hands each sender report's clock mapping
+    /// to the jitter buffer of its stream, which dates captured media by it.
     private void onRtcp(TransportRuntime runtime, RtcpPacket packet) {
-        if (!(packet instanceof Bye bye)) {
-            return;
+        switch (packet) {
+            case Bye bye -> {
+                for (var binding : receivers.values()) {
+                    if (!binding.transportId().equals(runtime.id)) {
+                        continue;
+                    }
+                    var ssrc = binding.stream().statistics().ssrc();
+                    if (ssrc.isPresent() && bye.ssrcs().contains(ssrc.getAsLong())) {
+                        binding.receiver().track().mute();
+                    }
+                }
+            }
+            case SenderReport report -> {
+                for (var binding : receivers.values()) {
+                    if (!binding.transportId().equals(runtime.id)) {
+                        continue;
+                    }
+                    var ssrc = binding.stream().statistics().ssrc();
+                    if (ssrc.isEmpty() || ssrc.getAsLong() != report.ssrc()) {
+                        continue;
+                    }
+                    binding.stream().senderClock().ifPresent(mapping -> {
+                        if (binding.playout() != null) {
+                            binding.playout().setSenderClock(mapping);
+                        }
+                        if (binding.assembler() != null) {
+                            binding.assembler().setSenderClock(mapping);
+                        }
+                    });
+                }
+            }
+            default -> {
+            }
         }
-        for (var binding : receivers.values()) {
+    }
+
+    /// Moves a sender's layer to the SSRC the RTP session picked after an RFC 3550 collision, so the next offer
+    /// announces it, and asks for that offer with `negotiationneeded`.
+    ///
+    /// @spec https://www.rfc-editor.org/rfc/rfc3550.html#section-8.2 RFC 3550 section 8.2: Collision Resolution and Loop Detection
+    private void onSsrcChanged(TransportRuntime runtime, SsrcChange change) {
+        for (var entry : senders.entrySet()) {
+            var binding = entry.getValue();
             if (!binding.transportId().equals(runtime.id)) {
                 continue;
             }
-            var ssrc = binding.stream().statistics().ssrc();
-            if (ssrc.isPresent() && bye.ssrcs().contains(ssrc.getAsLong())) {
-                binding.receiver().track().mute();
+            var updated = binding.layers().stream().map(layer -> layer.withReplacedSsrc(change.oldSsrc(),
+                    change.newSsrc())).toList();
+            if (updated.equals(binding.layers())) {
+                continue;
             }
+            senders.replace(entry.getKey(), binding, new SenderBinding(binding.mid(), binding.transportId(),
+                    binding.kind(), binding.payloadType(), binding.streams(), updated));
+            var sender = entry.getKey();
+            configuration.threadFactory().newThread(() -> listener.onSsrcChanged(sender, change.oldSsrc(),
+                    change.newSsrc())).start();
         }
+    }
+
+    /// Fails the connection when a transport's pacer stopped, since none of its media can leave any more.
+    private void onPacerFailed(TransportRuntime runtime, Throwable cause) {
+        if (closed || runtime.closed) {
+            return;
+        }
+        LOGGER.log(Level.WARNING, "the pacer of transport " + runtime.id + " failed", cause);
+        configuration.threadFactory().newThread(() -> listener.onTransportFailed(runtime.id)).start();
     }
 
     /// {@return whether a section negotiated a feedback mechanism on its first codec}
@@ -519,45 +777,61 @@ final class TransportBackend implements PeerBackend {
 
     /// Waits for ICE, then runs the DTLS handshake with the transport's current negotiation, wires the media and
     /// starts SCTP if a data section is negotiated.
+    ///
+    /// A restart replaces the transport's DTLS association while this runs: the connector of the replaced one then
+    /// ends quietly, and the restart's own connector handshakes over the new one.
     private void connect(TransportRuntime runtime) {
+        var dtls = runtime.dtls;
         try {
-            // TODO: treat a false return as a handshake timeout failure once awaitConnected reports the timeout by
-            //  its result instead of an exception.
-            runtime.ice.awaitConnected(configuration.handshakeTimeout());
+            if (!runtime.ice.awaitConnected(configuration.handshakeTimeout())) {
+                throw new IceException("ICE did not connect within " + configuration.handshakeTimeout());
+            }
             var transport = currentTransport(runtime.id).orElseThrow(() -> new ClosedChannelException());
-            var fingerprints = new ArrayList<DtlsFingerprint>();
-            for (var fingerprint : transport.remoteFingerprints()) {
-                // TODO: use DtlsFingerprint.tryParse once it exists.
-                var value = fingerprint.attributeValue();
-                if (value.isEmpty()) {
-                    continue;
-                }
-                try {
-                    fingerprints.add(DtlsFingerprint.parse(value.get()));
-                } catch (IllegalArgumentException exception) {
-                    LOGGER.log(Level.DEBUG, "an unsupported remote fingerprint was skipped");
-                }
-            }
+            var fingerprints = transport.remoteFingerprints().stream()
+                    .flatMap(fingerprint -> fingerprint.attributeValue().stream())
+                    .flatMap(value -> DtlsFingerprint.tryParse(value).stream())
+                    .toList();
             var outcome = negotiated;
-            var hasMedia = outcome != null && outcome.media().stream()
-                    .anyMatch(section -> section.transportId().equals(runtime.id));
-            if (hasMedia) {
-                runtime.dtls.handshake(transport.dtlsRole(), fingerprints, configuration.handshakeTimeout());
-                runtime.keyed = true;
-            } else {
-                runtime.dtls.handshakeWithoutSrtp(transport.dtlsRole(), fingerprints,
-                        configuration.handshakeTimeout());
-                runtime.keyed = runtime.dtls.srtpKeys().isPresent();
+            var media = outcome == null ? List.<Negotiated.Media>of() : outcome.media().stream()
+                    .filter(section -> section.transportId().equals(runtime.id)).toList();
+            runtime.wiring.lock();
+            try {
+                if (runtime.dtls != dtls || runtime.closed) {
+                    return;
+                }
+                runtime.handshake = HandshakeParameters.of(transport);
+            } finally {
+                runtime.wiring.unlock();
             }
-            runtime.dtlsConnected = true;
+            if (!media.isEmpty()) {
+                dtls.handshake(transport.dtlsRole(), fingerprints, configuration.handshakeTimeout());
+            } else {
+                dtls.handshakeWithoutSrtp(transport.dtlsRole(), fingerprints, configuration.handshakeTimeout());
+            }
+            runtime.wiring.lock();
+            try {
+                if (runtime.dtls != dtls || runtime.closed) {
+                    return;
+                }
+                if (dtls.srtpKeys().isPresent()) {
+                    var cryptex = !media.isEmpty() && media.stream().allMatch(Negotiated.Media::cryptex);
+                    runtime.srtp = SrtpTransport.dtlsSrtp(dtls, SrtpOptions.DEFAULT.withCryptex(cryptex));
+                    runtime.keyed = true;
+                }
+                runtime.dtlsConnected = true;
+            } finally {
+                runtime.wiring.unlock();
+            }
             wire(runtime);
             startSctpIfReady(runtime);
         } catch (InterruptedException exception) {
-            Thread.currentThread().interrupt();
+            if (runtime.dtls == dtls) {
+                Thread.currentThread().interrupt();
+            }
         } catch (IOException | RuntimeException exception) {
-            if (closed || runtime.closed) {
+            if (closed || runtime.closed || runtime.dtls != dtls) {
                 LOGGER.log(Level.DEBUG, "transport " + runtime.id + " ended while connecting: " + exception);
-            } else if (runtime.dtls.state() != DtlsState.CONNECTED) {
+            } else if (dtls.state() != DtlsState.CONNECTED) {
                 LOGGER.log(Level.DEBUG, "transport " + runtime.id + " failed: " + exception);
                 runtime.view.publish(DtlsState.FAILED);
                 listener.onDtlsState(runtime.id, DtlsState.FAILED);
@@ -611,13 +885,10 @@ final class TransportBackend implements PeerBackend {
     private void runSctp(TransportRuntime runtime, SctpTransport association, Negotiated.Data data, DtlsRole role) {
         try {
             dataPath.attach(runtime.dtls.applicationData());
-            // TODO: pass the remote max message size as an OptionalLong once SctpTransport.start takes one.
             association.start(role, data.remotePort(), data.remoteMaxMessageSize(), configuration.handshakeTimeout());
-            countChannels();
             while (!closed) {
                 var channel = association.acceptDataChannel();
                 channels.add(channel);
-                countChannels();
                 listener.onDataChannel(channel);
             }
         } catch (InterruptedException exception) {
@@ -628,8 +899,6 @@ final class TransportBackend implements PeerBackend {
             } else {
                 LOGGER.log(Level.WARNING, "the SCTP association failed: " + exception);
             }
-        } finally {
-            countChannels();
         }
     }
 
@@ -654,48 +923,31 @@ final class TransportBackend implements PeerBackend {
             current = SctpTransport.overDatagrams(dataPath, SctpConfig.defaults()
                     .withLocalPort(JsepEngine.SCTP_PORT)
                     .withMaxMessageSize(JsepEngine.MAX_MESSAGE_SIZE)
-                    .withThreadFactory(configuration.threadFactory()));
+                    .withThreadFactory(configuration.threadFactory())
+                    .withChannelEventListener(this::onChannelEvent));
             sctp = current;
         }
         return current;
     }
 
-    /// Counts the data channels that opened or closed since the last count.
+    /// Counts a data channel that opened, or one that was open and closed, for the connection's statistics.
     ///
-    // TODO: count each transition as it happens from DataChannel.events() once data channels raise events; a
-    //  channel that opens and closes between two counts without carrying a message is not counted as opened.
-    private void countChannels() {
-        for (var channel : channels) {
-            var count = channelCounts.computeIfAbsent(channel, ignored -> new ChannelCount());
-            boolean opened = false;
-            boolean closedNow = false;
-            synchronized (count) {
-                var state = channel.readyState();
-                if (!count.opened && (state == DataChannelState.OPEN || wasOpen(channel, state))) {
-                    count.opened = true;
-                    opened = true;
-                }
-                if (count.opened && !count.closed && state == DataChannelState.CLOSED) {
-                    count.closed = true;
-                    closedNow = true;
+    /// Runs with the channel's lock held, on whichever thread changed its state, so it only counts.
+    private void onChannelEvent(DataChannel channel, DataChannelEvent event) {
+        switch (event) {
+            case DataChannelEvent.Opened _ -> {
+                if (openChannels.add(channel)) {
+                    listener.onDataChannelOpened();
                 }
             }
-            if (opened) {
-                listener.onDataChannelOpened();
+            case DataChannelEvent.Closed _ -> {
+                if (openChannels.remove(channel)) {
+                    listener.onDataChannelClosed();
+                }
             }
-            if (closedNow) {
-                listener.onDataChannelClosed();
+            default -> {
             }
         }
-    }
-
-    /// {@return whether a channel no longer open carried traffic, so it was open}
-    private static boolean wasOpen(DataChannel channel, DataChannelState state) {
-        if (state != DataChannelState.CLOSING && state != DataChannelState.CLOSED) {
-            return false;
-        }
-        var statistics = channel.statistics();
-        return statistics.messagesSent() > 0 || statistics.messagesReceived() > 0;
     }
 
     /// Creates the send streams of a section and wires its sender to them; the caller holds the wiring lock.
@@ -728,7 +980,9 @@ final class TransportBackend implements PeerBackend {
             var builder = SendStreamConfig.builder(media.mid(), layer.ssrc(), codec.payloadType(),
                     codec.codec().clockRate())
                     .extensions(runtime.extensions)
-                    .feedback(feedbackOf(codec));
+                    .feedback(feedbackOf(codec))
+                    .keyframeRequestListener(request -> sender.track()
+                            .ifPresent(track -> track.requestKeyframe(layer.rid())));
             layer.rid().ifPresent(builder::rid);
             if (codec.rtxPayloadType().isPresent() && layer.rtxSsrc().isPresent()) {
                 builder.rtx(layer.rtxSsrc().getAsLong(), codec.rtxPayloadType().getAsInt());
@@ -741,14 +995,11 @@ final class TransportBackend implements PeerBackend {
                         media.ulpfecPayloadType().getAsInt(), 10));
             }
             var stream = session.createSendStream(builder.build());
-            // TODO: register the key frame request listener through SendStreamConfig once it takes one.
-            stream.setKeyframeRequestListener(request -> sender.track()
-                    .ifPresent(track -> track.requestKeyframe(layer.rid())));
             streams.put(layer.rid().orElse(""), stream);
         }
         senders.put(sender, new SenderBinding(media.mid(), media.transportId(), media.kind(), codec.payloadType(),
                 Map.copyOf(streams), media.sendLayers()));
-        var pipeline = new SendPipeline(sender, media, codec, Map.copyOf(streams));
+        var pipeline = new SendPipeline(sender, media, runtime.extensions, Map.copyOf(streams));
         sender.setPipeline(pipeline, media.sendLayers());
         var dtmf = sender.dtmf();
         if (dtmf.isPresent()) {
@@ -789,34 +1040,38 @@ final class TransportBackend implements PeerBackend {
     }
 
     /// The pipeline of a negotiated sender: packetizes written frames, or forwards packets, onto its send streams.
+    ///
+    /// Each layer sends the codec its encoding's `codec` member names, or the first negotiated codec without one.
     private final class SendPipeline implements FrameSink {
-        /// The sender, whose current encodings decide which layers are active.
+        /// The sender, whose current encodings decide which layers are active and which codec each sends.
         private final RtpSender sender;
         /// The negotiated section.
         private final Negotiated.Media media;
         /// The send streams by RTP stream id.
         private final Map<String, RtpSendStream> streams;
-        /// The packetizers by RTP stream id.
-        private final Map<String, Packetizer> packetizers = new HashMap<>();
+        /// The packetizers by RTP stream id and payload type.
+        private final Map<String, Packetizer> packetizers = new ConcurrentHashMap<>();
         /// The forwarders by RTP stream id, created on the first forwarded packet.
         private final Map<String, Forwarder> forwarders = new ConcurrentHashMap<>();
         /// The scheduling priority of the section's packets.
         private final OutgoingPacketScheduler.Priority priority;
         /// The RTP stream id of the first layer (`""` without simulcast).
         private final String first;
+        /// Whether the dependency descriptor extension is negotiated, which AV1 packetizers then write.
+        private final boolean dependencyDescriptor;
         /// The RTP timestamp of the last frame sent, which DTMF events continue from.
         private final AtomicLong lastTimestamp = new AtomicLong();
 
-        SendPipeline(RtpSender sender, Negotiated.Media media, Negotiated.CodecEntry codec,
+        SendPipeline(RtpSender sender, Negotiated.Media media, HeaderExtensionMap extensions,
                      Map<String, RtpSendStream> streams) {
             this.sender = sender;
             this.media = media;
             this.streams = streams;
-            var format = PayloadFormat.of(codec.codec());
-            streams.keySet().forEach(rid -> packetizers.put(rid, format.packetizer(PacketizerConfig.defaults())));
             this.priority = media.kind() == MediaKind.AUDIO ? OutgoingPacketScheduler.Priority.AUDIO
                     : OutgoingPacketScheduler.Priority.VIDEO;
             this.first = media.sendLayers().getFirst().rid().orElse("");
+            this.dependencyDescriptor = media.extensions().containsValue(CodecCatalog.DEPENDENCY_DESCRIPTOR)
+                    && extensions.idOf(CodecCatalog.DEPENDENCY_DESCRIPTOR).isPresent();
         }
 
         @Override
@@ -826,7 +1081,9 @@ final class TransportBackend implements PeerBackend {
             if (stream == null || !sender.isLayerActive(key)) {
                 return false;
             }
-            var packetizer = packetizers.get(key);
+            var codec = codecOf(key);
+            var packetizer = packetizers.computeIfAbsent(key + "/" + codec.payloadType(),
+                    ignored -> newPacketizer(codec.codec()));
             try {
                 var payloads = new ArrayList<RtpSendStream.Payload>();
                 synchronized (packetizer) {
@@ -837,13 +1094,47 @@ final class TransportBackend implements PeerBackend {
                 }
                 if (!payloads.isEmpty()) {
                     lastTimestamp.set(frame.rtpTimestamp());
-                    stream.send(payloads, frame.rtpTimestamp(), priority);
+                    if (codec.payloadType() == stream.config().payloadType()) {
+                        var resolution = resolutionOf(frame.metadata());
+                        stream.send(payloads, frame.rtpTimestamp(), priority, new RtpSendStream.FrameInfo(
+                                frame.keyframe(), resolution.map(size -> OptionalInt.of(size.width()))
+                                .orElseGet(OptionalInt::empty), resolution.map(size -> OptionalInt.of(size.height()))
+                                .orElseGet(OptionalInt::empty)));
+                    } else {
+                        stream.sendWithPayloadType(codec.payloadType(), payloads, frame.rtpTimestamp(), priority);
+                    }
                 }
                 return true;
             } catch (IOException | RuntimeException exception) {
                 LOGGER.log(Level.DEBUG, "a frame could not be sent: " + exception);
                 return true;
             }
+        }
+
+        /// {@return the negotiated codec the layer named `key` sends: the one its encoding's `codec` member names,
+        /// or the first negotiated codec}
+        private Negotiated.CodecEntry codecOf(String key) {
+            for (var layer : sender.currentLayers()) {
+                if (!layer.rid().orElse("").equals(key) || layer.encoding().codec().isEmpty()) {
+                    continue;
+                }
+                var wanted = layer.encoding().codec().get();
+                for (var entry : media.codecs()) {
+                    if (CodecCatalog.matches(entry.codec(), wanted)) {
+                        return entry;
+                    }
+                }
+            }
+            return media.codecs().getFirst();
+        }
+
+        /// {@return a packetizer for `codec`, writing the AV1 dependency descriptor when it is negotiated}
+        private Packetizer newPacketizer(Codec codec) {
+            var config = PacketizerConfig.defaults();
+            if (dependencyDescriptor && codec.name().equalsIgnoreCase("AV1")) {
+                config = config.withDependencyDescriptor(true);
+            }
+            return PayloadFormat.of(codec).packetizer(config);
         }
 
         @Override
@@ -853,8 +1144,7 @@ final class TransportBackend implements PeerBackend {
             if (stream == null || !sender.isLayerActive(key)) {
                 return false;
             }
-            var forwarder = forwarders.computeIfAbsent(key, ignored -> new Forwarder(sender, key, stream, media,
-                    priority));
+            var forwarder = forwarders.computeIfAbsent(key, ignored -> new Forwarder(sender, key, stream, media));
             return forwarder.forward(packet);
         }
 
@@ -864,16 +1154,27 @@ final class TransportBackend implements PeerBackend {
         }
     }
 
-    /// Forwards packets of any source onto one send stream, keeping its timestamp line continuous across source
-    /// switches.
+    /// {@return the picture size a frame's metadata carries, if any}
+    private static Optional<Resolution> resolutionOf(FrameMetadata metadata) {
+        return switch (metadata) {
+            case Vp8FrameMetadata vp8 -> vp8.resolution();
+            case Vp9FrameMetadata vp9 -> vp9.resolution();
+            case H264FrameMetadata h264 -> h264.resolution();
+            case H265FrameMetadata h265 -> h265.resolution();
+            case Av1FrameMetadata av1 -> av1.resolution();
+            case GenericFrameMetadata generic -> generic.resolution();
+            case AudioFrameMetadata ignored -> Optional.empty();
+        };
+    }
+
+    /// Forwards packets of any source onto one send stream through [RtpSendStream#forward], which continues the
+    /// stream's own sequence and timestamp spaces across sources.
     ///
-    /// The stream assigns its own SSRC and sequence numbers; this class maps the payload type by codec, the header
-    /// extensions by URI, rebases the RTP timestamp of each source onto the stream's line, renumbers the VP8 and VP9
-    /// picture ids so they continue across sources, and holds back a new source until a packet a decoder can start
-    /// on, asking the track for a key frame meanwhile.
+    /// This class maps the payload type by codec and the header extensions by URI, renumbers the VP8 and VP9 picture
+    /// ids so they continue across sources, and holds back a new source until a packet a decoder can start on,
+    /// asking the track for a key frame meanwhile.
     ///
-    // TODO: send through RtpSendStream.forward once it exists, and carry the AV1 dependency descriptor's frame
-    //  numbers across source switches.
+    // TODO: carry the AV1 dependency descriptor's frame numbers across source switches.
     private final class Forwarder {
         /// The sender whose track is asked for key frames.
         private final RtpSender sender;
@@ -883,28 +1184,18 @@ final class TransportBackend implements PeerBackend {
         private final RtpSendStream stream;
         /// The negotiated section, for payload types and extension ids.
         private final Negotiated.Media media;
-        /// The scheduling priority.
-        private final OutgoingPacketScheduler.Priority priority;
         /// The source currently forwarded, or `-1`.
         private long source = -1;
-        /// The offset added to the current source's timestamps.
-        private long offset;
-        /// The last output timestamp, or `-1` before the first packet.
-        private long lastOutput = -1;
-        /// When the last packet was sent, in the configured clock.
-        private long lastNanos;
         /// The VP8 picture id rewriter, created for a VP8 stream.
         private Vp8PayloadRewriter vp8;
         /// The VP9 picture id rewriter, created for a VP9 stream.
         private Vp9PayloadRewriter vp9;
 
-        Forwarder(RtpSender sender, String rid, RtpSendStream stream, Negotiated.Media media,
-                  OutgoingPacketScheduler.Priority priority) {
+        Forwarder(RtpSender sender, String rid, RtpSendStream stream, Negotiated.Media media) {
             this.sender = sender;
             this.rid = rid;
             this.stream = stream;
             this.media = media;
-            this.priority = priority;
         }
 
         /// {@return whether the packet was sent, or held back for a switch point}
@@ -915,16 +1206,13 @@ final class TransportBackend implements PeerBackend {
                 return false;
             }
             var entry = codec.get();
-            var now = configuration.clock().nanos();
+            var switchPoint = media.kind() != MediaKind.VIDEO || isSwitchPoint(entry.codec(), packet);
             if (packet.ssrc() != source) {
-                if (media.kind() == MediaKind.VIDEO && !isSwitchPoint(entry.codec(), packet)) {
+                if (!switchPoint) {
                     sender.track().ifPresent(track -> track.requestKeyframe(rid.isEmpty()
                             ? Optional.empty() : Optional.of(rid)));
                     return false;
                 }
-                var next = lastOutput < 0 ? packet.timestamp()
-                        : (lastOutput + Math.max(1, (now - lastNanos) * entry.codec().clockRate() / 1_000_000_000L));
-                offset = next - packet.timestamp();
                 if (source != -1) {
                     if (vp8 != null) {
                         vp8.switchSource();
@@ -935,49 +1223,48 @@ final class TransportBackend implements PeerBackend {
                 }
                 source = packet.ssrc();
             }
-            var timestamp = (packet.timestamp() + offset) & 0xFFFF_FFFFL;
-            lastOutput = timestamp;
-            lastNanos = now;
-            ByteBuffer body;
+            RtpPacket output;
             try {
-                body = rewritePayload(entry.codec(), packet.payload());
-            } catch (PayloadFormatException exception) {
+                output = rewritePayload(entry.codec(), packet);
+            } catch (PayloadFormatException | RuntimeException exception) {
                 LOGGER.log(Level.DEBUG, "a malformed forwarded payload was dropped: " + exception);
                 return true;
             }
-            var payload = new RtpSendStream.Payload(body, packet.marker(), extensionsOf(forwarded));
             try {
-                if (entry.payloadType() == stream.config().payloadType()) {
-                    stream.send(List.of(payload), timestamp, priority);
-                } else {
-                    stream.sendWithPayloadType(entry.payloadType(), List.of(payload), timestamp, priority);
-                }
+                stream.forward(output, entry.payloadType(), extensionsOf(forwarded), switchPoint,
+                        configuration.clock().nanos());
             } catch (IOException | RuntimeException exception) {
                 LOGGER.log(Level.DEBUG, "a forwarded packet could not be sent: " + exception);
             }
             return true;
         }
 
-        /// {@return the payload to send: a rewritten copy for VP8 and VP9, whose picture ids continue across sources,
-        /// the packet's own bytes otherwise}
-        private ByteBuffer rewritePayload(Codec codec, ByteBuffer payload) throws PayloadFormatException {
+        /// {@return the packet to send: a copy whose VP8 or VP9 picture ids continue across sources, the packet
+        /// itself for any other codec}
+        private RtpPacket rewritePayload(Codec codec, RtpPacket packet) throws PayloadFormatException {
             var name = codec.name().toLowerCase(java.util.Locale.ROOT);
             if (!name.equals("vp8") && !name.equals("vp9")) {
-                return payload;
+                return packet;
             }
-            var copy = ByteBuffer.allocate(payload.remaining()).put(payload.duplicate()).flip();
+            var bytes = ByteBuffer.allocate(packet.length()).put(packet.buffer().duplicate()).flip();
+            var payload = bytes.duplicate().position(packet.headerLength())
+                    .limit(packet.length() - packet.paddingLength()).slice();
             if (name.equals("vp8")) {
                 if (vp8 == null) {
                     vp8 = new Vp8PayloadRewriter();
                 }
-                vp8.rewrite(copy);
+                vp8.rewrite(payload);
             } else {
                 if (vp9 == null) {
                     vp9 = new Vp9PayloadRewriter();
                 }
-                vp9.rewrite(copy);
+                vp9.rewrite(payload);
             }
-            return copy;
+            try {
+                return RtpPacket.parse(bytes);
+            } catch (RtpFormatException exception) {
+                throw new PayloadFormatException("the rewritten packet does not parse", exception);
+            }
         }
 
         /// {@return the negotiated codec entry a forwarded packet maps to, or an empty optional to drop it}
@@ -1065,7 +1352,6 @@ final class TransportBackend implements PeerBackend {
         var clock = configuration.clock();
         var audioLevelId = runtime.extensions.idOf(CodecCatalog.AUDIO_LEVEL);
         var feedback = feedbackOf(codec);
-        // TODO: take the mode from the transceiver's init (remoteTrackMode) once TransceiverInit carries it.
         if (track.mode() == RemoteTrackMode.RAW_PACKETS) {
             var codecs = new HashMap<Integer, Codec>();
             media.codecs().forEach(entry -> codecs.put(entry.payloadType(), entry.codec()));
@@ -1077,16 +1363,17 @@ final class TransportBackend implements PeerBackend {
                         Optional.ofNullable(codecs.get(packet.payloadType())), extensions));
             });
             return new ReceiverBinding(media.mid(), media.transportId(), media.kind(), layer.rid(), stream, receiver,
-                    null, null, codec.payloadType(), feedback);
+                    null, null, codec.payloadType(), feedback, Optional.empty());
         }
         var format = PayloadFormat.of(codec.codec());
         var depacketizer = depacketizerConfig(runtime.extensions);
+        var syncGroup = media.remoteStreams().stream().filter(id -> !id.equals("-")).findFirst();
         if (media.kind() == MediaKind.AUDIO) {
-            // TODO: group playout and assembly per a=msid stream id for A/V sync once jitter.SyncGroup exists.
-            var buffer = AudioPlayoutBuffer.create(format, codec.codec().clockRate(), AudioPlayoutConfig.defaults()
-                    .withClock(clock)
-                    .withJitterBufferTarget(receiver.jitterBufferTarget())
-                    .withDepacketizer(depacketizer));
+            var playoutConfig = AudioPlayoutConfig.defaults().withClock(clock).withDepacketizer(depacketizer);
+            var jitterTarget = receiver.jitterBufferTarget();
+            var buffer = AudioPlayoutBuffer.create(format, codec.codec().clockRate(), jitterTarget.isPresent()
+                    ? playoutConfig.withJitterBufferTarget(jitterTarget.get()) : playoutConfig);
+            syncGroup.ifPresent(id -> syncGroups.computeIfAbsent(id, ignored -> SyncGroup.create()).add(buffer));
             stream.setPacketReceiver(packet -> {
                 track.received();
                 if (packet.payloadType() != codec.payloadType()) {
@@ -1107,7 +1394,7 @@ final class TransportBackend implements PeerBackend {
                 }
             }).start();
             return new ReceiverBinding(media.mid(), media.transportId(), media.kind(), layer.rid(), stream, receiver,
-                    buffer, null, codec.payloadType(), feedback);
+                    buffer, null, codec.payloadType(), feedback, syncGroup);
         }
         var assembler = VideoFrameAssembler.create(format, VideoAssemblerConfig.defaults()
                 .withClock(clock)
@@ -1131,6 +1418,7 @@ final class TransportBackend implements PeerBackend {
                 }
             }
         });
+        syncGroup.ifPresent(id -> syncGroups.computeIfAbsent(id, ignored -> SyncGroup.create()).add(assembler));
         stream.setPacketReceiver(packet -> {
             record(receiver, packet, audioLevelId);
             track.received();
@@ -1148,12 +1436,12 @@ final class TransportBackend implements PeerBackend {
             }
         }).start();
         return new ReceiverBinding(media.mid(), media.transportId(), media.kind(), layer.rid(), stream, receiver, null,
-                assembler, codec.payloadType(), feedback);
+                assembler, codec.payloadType(), feedback, syncGroup);
     }
 
     /// {@return the depacketizer settings for the negotiated extension ids}
     private static DepacketizerConfig depacketizerConfig(HeaderExtensionMap extensions) {
-        var config = new DepacketizerConfig(OptionalInt.empty(), OptionalInt.empty());
+        var config = DepacketizerConfig.none();
         var audioLevel = extensions.idOf(CodecCatalog.AUDIO_LEVEL);
         if (audioLevel.isPresent()) {
             config = config.withAudioLevelExtensionId(audioLevel.getAsInt());
@@ -1161,6 +1449,14 @@ final class TransportBackend implements PeerBackend {
         var dependencyDescriptor = extensions.idOf(CodecCatalog.DEPENDENCY_DESCRIPTOR);
         if (dependencyDescriptor.isPresent()) {
             config = config.withDependencyDescriptorExtensionId(dependencyDescriptor.getAsInt());
+        }
+        var absCaptureTime = extensions.idOf(CodecCatalog.ABS_CAPTURE_TIME);
+        if (absCaptureTime.isPresent()) {
+            config = config.withAbsCaptureTimeExtensionId(absCaptureTime.getAsInt());
+        }
+        var playoutDelay = extensions.idOf(CodecCatalog.PLAYOUT_DELAY);
+        if (playoutDelay.isPresent()) {
+            config = config.withPlayoutDelayExtensionId(playoutDelay.getAsInt());
         }
         return config;
     }
@@ -1244,14 +1540,19 @@ final class TransportBackend implements PeerBackend {
         }
     }
 
-    /// Closes the jitter buffer of a receive binding.
-    private static void closeJitter(ReceiverBinding binding) {
+    /// Closes the jitter buffer of a receive binding and takes it out of its synchronization group.
+    private void closeJitter(ReceiverBinding binding) {
+        var group = binding.syncGroup().map(syncGroups::get);
         if (binding.playout() != null) {
+            group.ifPresent(value -> value.remove(binding.playout()));
             binding.playout().close();
         }
         if (binding.assembler() != null) {
+            group.ifPresent(value -> value.remove(binding.assembler()));
             binding.assembler().close();
         }
+        binding.syncGroup().ifPresent(id -> syncGroups.computeIfPresent(id, (ignored, value) -> value.size() == 0
+                ? null : value));
     }
 
     /// Splits a new target bitrate across the active encodings of a transport and tells their tracks.
@@ -1265,8 +1566,7 @@ final class TransportBackend implements PeerBackend {
         }
         var demands = new ArrayList<EncodingDemand>();
         var tracks = new HashMap<AllocationKey, LocalTrack>();
-        // TODO: cap each section at its negotiated maximum bitrate (b=AS/b=TIAS) through the allocator's group
-        //  ceiling once both exist.
+        var ceilings = new HashMap<String, Long>();
         for (var media : outcome.media()) {
             if (!media.transportId().equals(runtime.id) || !media.direction().sends()) {
                 continue;
@@ -1274,16 +1574,14 @@ final class TransportBackend implements PeerBackend {
             var sender = media.transceiver().sender();
             var track = sender.track();
             var current = sender.currentLayers();
+            media.maxBitrate().ifPresent(ceiling -> ceilings.put(media.mid(), ceiling));
             for (var layer : media.sendLayers()) {
                 var encoding = current.stream().filter(candidate -> candidate.rid().equals(layer.rid()))
                         .map(Negotiated.SendLayer::encoding).findFirst().orElse(layer.encoding());
                 var key = new AllocationKey(media.mid(), layer.rid());
                 var min = media.kind() == MediaKind.AUDIO ? MIN_AUDIO_BITRATE : MIN_VIDEO_BITRATE;
-                var max = encoding.maxBitrate().orElse(configuration.bitrates().maxBps());
-                if (media.remoteBitrate().isPresent()) {
-                    max = Math.min(max, media.remoteBitrate().getAsLong());
-                }
-                demands.add(new EncodingDemand(key, encoding.active() && track.isPresent(), min, Math.max(min, max),
+                var max = Math.max(min, encoding.maxBitrate().orElse(configuration.bitrates().maxBps()));
+                demands.add(new EncodingDemand(key, encoding.active() && track.isPresent(), min, max,
                         encoding.priority().weight(), encoding.scaleResolutionDownBy().orElse(1)));
                 track.ifPresent(value -> tracks.put(key, value));
             }
@@ -1291,7 +1589,7 @@ final class TransportBackend implements PeerBackend {
         if (demands.isEmpty()) {
             return;
         }
-        for (var entry : allocator.allocate(target.bitsPerSecond(), demands).entrySet()) {
+        for (var entry : allocator.allocate(target.bitsPerSecond(), demands, ceilings).entrySet()) {
             var track = tracks.get(entry.getKey());
             if (track != null) {
                 track.updateTargetBitrate(entry.getKey().rid(), entry.getValue());
@@ -1329,7 +1627,6 @@ final class TransportBackend implements PeerBackend {
             }
             var channel = association.createDataChannel(label, init);
             channels.add(channel);
-            countChannels();
             return channel;
         } catch (IOException exception) {
             throw new OperationErrorException("the data channel could not be created", exception);
@@ -1338,16 +1635,20 @@ final class TransportBackend implements PeerBackend {
 
     @Override
     public List<RtcStats> statistics(Instant now) {
-        countChannels();
         var views = new ArrayList<StatsMapper.TransportView>();
         for (var runtime : transports.values()) {
-            views.add(new StatsMapper.TransportView(runtime.id, runtime.ice, runtime.dtls, runtime.srtp,
+            views.add(new StatsMapper.TransportView(runtime.id, runtime.ice, runtime.dtls,
                     Optional.ofNullable(runtime.congestion)));
         }
         var sendViews = new ArrayList<StatsMapper.SendView>();
-        senders.forEach((sender, binding) -> binding.streams().forEach((rid, stream) -> sendViews.add(
-                new StatsMapper.SendView(binding.mid(), binding.transportId(), binding.kind(), binding.payloadType(),
-                        stream, sender.track(), indexOf(binding.layers(), rid)))));
+        senders.forEach((sender, binding) -> binding.streams().forEach((rid, stream) -> {
+            var index = indexOf(binding.layers(), rid);
+            var encoding = sender.currentLayers().stream().filter(layer -> layer.rid().orElse("").equals(rid))
+                    .map(Negotiated.SendLayer::encoding).findFirst()
+                    .orElse(binding.layers().get(index).encoding());
+            sendViews.add(new StatsMapper.SendView(binding.mid(), binding.transportId(), binding.kind(),
+                    binding.payloadType(), stream, sender.track(), index, encoding));
+        }));
         var receiveViews = new ArrayList<StatsMapper.ReceiveView>();
         for (var binding : receivers.values()) {
             receiveViews.add(new StatsMapper.ReceiveView(binding.mid(), binding.transportId(), binding.kind(),
@@ -1375,6 +1676,7 @@ final class TransportBackend implements PeerBackend {
             if (congestion != null) {
                 allocate(runtime, congestion.currentTarget());
             }
+            applyTrafficClass(runtime);
         }
     }
 
@@ -1382,7 +1684,11 @@ final class TransportBackend implements PeerBackend {
     public void updateJitterBufferTarget(RtpReceiver receiver, Optional<Duration> target) {
         for (var binding : receivers.values()) {
             if (binding.receiver() == receiver && binding.playout() != null) {
-                binding.playout().setJitterBufferTarget(target);
+                if (target.isPresent()) {
+                    binding.playout().setJitterBufferTarget(target.get());
+                } else {
+                    binding.playout().clearJitterBufferTarget();
+                }
             }
         }
     }
@@ -1441,16 +1747,8 @@ final class TransportBackend implements PeerBackend {
         if (connector != null) {
             connector.interrupt();
         }
-        for (AutoCloseable closeable : new AutoCloseable[]{runtime.feedback, runtime.remb, runtime.session,
-                runtime.congestion, runtime.srtp, runtime.dtls, runtime.ice}) {
-            if (closeable != null) {
-                try {
-                    closeable.close();
-                } catch (Exception exception) {
-                    LOGGER.log(Level.DEBUG, "a transport layer failed to close: " + exception);
-                }
-            }
-        }
+        closeQuietly(runtime.feedback, runtime.remb, runtime.ccfb, runtime.session, runtime.congestion, runtime.srtp,
+                runtime.dtls, runtime.ice);
         runtime.view.end();
     }
 
@@ -1497,11 +1795,6 @@ final class TransportBackend implements PeerBackend {
             dataPath.close();
         } catch (RuntimeException exception) {
             LOGGER.log(Level.DEBUG, "the data path failed to close: " + exception);
-        }
-        try {
-            countChannels();
-        } catch (RuntimeException exception) {
-            LOGGER.log(Level.DEBUG, "the data channels could not be counted: " + exception);
         }
     }
 

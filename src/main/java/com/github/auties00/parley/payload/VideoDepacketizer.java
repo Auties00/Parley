@@ -54,7 +54,8 @@ final class VideoDepacketizer implements Depacketizer {
     /// {@return `inner`, wrapped to read the dependency descriptor when `config` names its extension}
     static Depacketizer withDescriptor(Depacketizer inner, DepacketizerConfig config) {
         var id = config.dependencyDescriptorExtensionId();
-        return id.isPresent() ? new VideoDepacketizer(inner, id.getAsInt(), DependencyDescriptor::parse) : inner;
+        return id.isPresent() ? new VideoDepacketizer(inner, id.getAsInt(), (value, latest) -> latest.isPresent()
+                ? DependencyDescriptor.parse(value, latest.get()) : DependencyDescriptor.parse(value)) : inner;
     }
 
     @Override

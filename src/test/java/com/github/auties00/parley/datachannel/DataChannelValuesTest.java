@@ -1,5 +1,6 @@
 package com.github.auties00.parley.datachannel;
 
+import com.github.auties00.parley.media.Priority;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Nested;
 import org.junit.jupiter.api.Test;
@@ -31,7 +32,7 @@ class DataChannelValuesTest {
             assertTrue(init.ordered());
             assertTrue(init.reliableDelivery());
             assertFalse(init.negotiated());
-            assertEquals(DataChannelPriority.LOW, init.priority());
+            assertEquals(Priority.LOW, init.priority());
             assertEquals("", init.protocol());
         }
 
@@ -39,14 +40,14 @@ class DataChannelValuesTest {
         @DisplayName("rejects both reliability limits, negative values, and an id without negotiation")
         void validation() {
             assertThrows(IllegalArgumentException.class, () -> new DataChannelInit(true, OptionalInt.of(1),
-                    Optional.of(Duration.ofSeconds(1)), "", false, OptionalInt.empty(), DataChannelPriority.LOW));
+                    Optional.of(Duration.ofSeconds(1)), "", false, OptionalInt.empty(), Priority.LOW));
             assertThrows(IllegalArgumentException.class, () -> DataChannelInit.reliable().withMaxRetransmits(-1));
             assertThrows(IllegalArgumentException.class,
                     () -> DataChannelInit.reliable().withMaxPacketLifeTime(Duration.ofMillis(-1)));
             assertThrows(IllegalArgumentException.class, () -> new DataChannelInit(true, OptionalInt.empty(),
-                    Optional.empty(), "", false, OptionalInt.of(3), DataChannelPriority.LOW));
+                    Optional.empty(), "", false, OptionalInt.of(3), Priority.LOW));
             assertThrows(IllegalArgumentException.class, () -> new DataChannelInit(true, OptionalInt.empty(),
-                    Optional.empty(), "", true, OptionalInt.empty(), DataChannelPriority.LOW));
+                    Optional.empty(), "", true, OptionalInt.empty(), Priority.LOW));
             assertThrows(IllegalArgumentException.class, () -> DataChannelInit.reliable().withNegotiatedId(65535));
             assertThrows(IllegalArgumentException.class, () -> DataChannelInit.reliable().withProtocol("p".repeat(70_000)));
         }
@@ -67,9 +68,9 @@ class DataChannelValuesTest {
     @CsvSource({"0,VERY_LOW", "128,VERY_LOW", "129,LOW", "256,LOW", "300,MEDIUM", "512,MEDIUM", "513,HIGH",
             "1024,HIGH", "65535,HIGH"})
     @DisplayName("maps wire priorities to the W3C priority ranges")
-    void priorities(int wire, DataChannelPriority expected) {
-        assertEquals(expected, DataChannelPriority.ofWireValue(wire));
-        assertEquals(expected, DataChannelPriority.ofWireValue(expected.wireValue()));
+    void priorities(int wire, Priority expected) {
+        assertEquals(expected, Priority.ofWireValue(wire));
+        assertEquals(expected, Priority.ofWireValue(expected.wireValue()));
     }
 
     @Test

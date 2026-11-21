@@ -326,7 +326,8 @@ SDP, while `RtpSession` and the payload formats work on top of it as usual.
 - Security: RFC 6347 and RFC 9147 (DTLS 1.2 and 1.3), RFC 5764 (DTLS-SRTP), RFC 3711, 7714 and 6188 (SRTP with
   AES-CM and AES-GCM), RFC 9335 (cryptex), RFC 7983 (demultiplexing)
 - Media: RFC 3550 (RTP and RTCP), RFC 4585 and 5104 (feedback), RFC 4588 (RTX), RFC 2198 (RED), RFC 5109 and 8627
-  (FEC), RFC 5506 (reduced-size RTCP), RFC 3611 (XR), transport-wide congestion control and GCC, REMB
+  (FEC), RFC 5506 (reduced-size RTCP), RFC 3611 (XR), RFC 8888 (congestion control feedback), transport-wide
+  congestion control and GCC, REMB, RFC 8837 (DSCP markings)
 - Payload formats: Opus (RFC 7587), G.711 and G.722 (RFC 3551), comfort noise (RFC 3389), telephone events (RFC
   4733), VP8 (RFC 7741), VP9 (RFC 9628), H.264 (RFC 6184), H.265 (RFC 7798), AV1 with the dependency descriptor
 - Data: RFC 8831, 8832 and 8261 (data channels, DCEP, SCTP over DTLS), RFC 9260, 8260, 3758 and 6525 (SCTP)

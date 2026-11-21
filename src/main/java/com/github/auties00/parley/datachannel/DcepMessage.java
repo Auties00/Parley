@@ -1,5 +1,6 @@
 package com.github.auties00.parley.datachannel;
 
+import com.github.auties00.parley.media.Priority;
 import java.nio.ByteBuffer;
 import java.nio.charset.CharacterCodingException;
 import java.nio.charset.CodingErrorAction;
@@ -110,7 +111,7 @@ sealed interface DcepMessage {
                     ? Optional.of(Duration.ofMillis(Math.min(reliabilityParameter, DataChannelInit.MAX_RELIABILITY_VALUE)))
                     : Optional.<Duration>empty();
             return new DataChannelInit(ordered, maxRetransmits, lifetime, protocol, false, OptionalInt.empty(),
-                    DataChannelPriority.ofWireValue(priority));
+                    Priority.ofWireValue(priority));
         }
 
         @Override

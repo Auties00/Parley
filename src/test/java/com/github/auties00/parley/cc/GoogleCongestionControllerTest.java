@@ -183,13 +183,14 @@ class GoogleCongestionControllerTest {
             var active = new java.util.concurrent.atomic.AtomicInteger();
             var overlaps = new java.util.concurrent.atomic.AtomicInteger();
             var seen = new CopyOnWriteArrayList<Long>();
-            controller.setTargetListener(target -> {
-                if (active.incrementAndGet() > 1) {
-                    overlaps.incrementAndGet();
-                }
-                seen.add(target.bitsPerSecond());
-                active.decrementAndGet();
-            });
+            var controller = new GoogleCongestionController(config(300_000, 5_000_000).withClock(clock)
+                    .withTargetListener(target -> {
+                        if (active.incrementAndGet() > 1) {
+                            overlaps.incrementAndGet();
+                        }
+                        seen.add(target.bitsPerSecond());
+                        active.decrementAndGet();
+                    }), false);
             var threads = new ArrayList<Thread>();
             for (var thread = 0; thread < 8; thread++) {
                 var rate = 100_000 + thread * 50_000L;

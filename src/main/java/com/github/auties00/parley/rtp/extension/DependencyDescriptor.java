@@ -16,8 +16,8 @@ import java.util.OptionalLong;
 ///
 /// Most packets carry only the three mandatory bytes, which name a frame dependency template of the stream's current
 /// [TemplateStructure]; a keyframe's packets attach the structure itself. A descriptor therefore parses against the
-/// latest structure its stream attached ([#parse(ByteBuffer, Optional)]), and the frame fields of a parsed descriptor
-/// ([#spatialId()], [#decodeTargetIndications()], [#frameDependencies()], [#chainDiffs()]) are already resolved
+/// latest structure its stream attached ([#parse(ByteBuffer, TemplateStructure)]), and the frame fields of a parsed
+/// descriptor ([#spatialId()], [#decodeTargetIndications()], [#frameDependencies()], [#chainDiffs()]) are already resolved
 /// from the template, with the per-frame overrides ("custom" DTIs, frame diffs and chains) applied.
 ///
 /// The value is usually longer than 16 bytes when it attaches a structure, so it needs the two-byte header extension
@@ -342,22 +342,6 @@ public record DependencyDescriptor(boolean startOfFrame, boolean endOfFrame, int
         Objects.requireNonNull(value, "value cannot be null");
         Objects.requireNonNull(latest, "latest cannot be null");
         return read(value, Optional.of(latest));
-    }
-
-    /// Parses a descriptor against an optional latest structure.
-    ///
-    /// @param value  the element value
-    /// @param latest the latest structure, or empty
-    /// @return the descriptor
-    /// @throws RtpFormatException if the value is malformed
-    /// @deprecated use [#parse(ByteBuffer)] or [#parse(ByteBuffer, TemplateStructure)]
-    @Deprecated(forRemoval = true)
-    public static DependencyDescriptor parse(ByteBuffer value, Optional<TemplateStructure> latest)
-            throws RtpFormatException {
-        // TODO: remove once payload.VideoDepacketizer calls the overloads (cross-group, integration).
-        Objects.requireNonNull(value, "value cannot be null");
-        Objects.requireNonNull(latest, "latest cannot be null");
-        return read(value, latest);
     }
 
     private static DependencyDescriptor read(ByteBuffer value, Optional<TemplateStructure> latest)

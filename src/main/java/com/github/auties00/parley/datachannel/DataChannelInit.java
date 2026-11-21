@@ -1,5 +1,6 @@
 package com.github.auties00.parley.datachannel;
 
+import com.github.auties00.parley.media.Priority;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.Objects;
@@ -12,7 +13,7 @@ import java.util.OptionalInt;
 /// var game = DataChannelInit.reliable()
 ///         .withOrdered(false)
 ///         .withMaxRetransmits(0)
-///         .withPriority(DataChannelPriority.HIGH);
+///         .withPriority(Priority.HIGH);
 /// var control = DataChannelInit.reliable().withNegotiatedId(0);
 /// }
 ///
@@ -31,7 +32,7 @@ import java.util.OptionalInt;
 /// @spec https://www.w3.org/TR/webrtc/#dom-rtcdatachannelinit WebRTC: Real-Time Communication in Browsers, RTCDataChannelInit
 /// @spec https://www.rfc-editor.org/rfc/rfc3758.html RFC 3758: Stream Control Transmission Protocol (SCTP) Partial Reliability Extension
 public record DataChannelInit(boolean ordered, OptionalInt maxRetransmits, Optional<Duration> maxPacketLifeTime,
-                              String protocol, boolean negotiated, OptionalInt id, DataChannelPriority priority) {
+                              String protocol, boolean negotiated, OptionalInt id, Priority priority) {
     /// The largest stream id a channel may use; 65535 is reserved.
     public static final int MAX_ID = 65534;
 
@@ -78,11 +79,11 @@ public record DataChannelInit(boolean ordered, OptionalInt maxRetransmits, Optio
         }
     }
 
-    /// {@return the options of an ordered, reliable, in-band negotiated channel with no protocol and [DataChannelPriority#LOW]
+    /// {@return the options of an ordered, reliable, in-band negotiated channel with no protocol and [Priority#LOW]
     /// priority}, the W3C defaults
     public static DataChannelInit reliable() {
         return new DataChannelInit(true, OptionalInt.empty(), Optional.empty(), "", false, OptionalInt.empty(),
-                DataChannelPriority.LOW);
+                Priority.LOW);
     }
 
     /// {@return a copy with the given ordering}
@@ -131,7 +132,7 @@ public record DataChannelInit(boolean ordered, OptionalInt maxRetransmits, Optio
     /// {@return a copy with the given priority}
     ///
     /// @param priority the priority
-    public DataChannelInit withPriority(DataChannelPriority priority) {
+    public DataChannelInit withPriority(Priority priority) {
         return new DataChannelInit(ordered, maxRetransmits, maxPacketLifeTime, protocol, negotiated, id, priority);
     }
 

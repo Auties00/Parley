@@ -1,5 +1,6 @@
 package com.github.auties00.parley.datachannel;
 
+import com.github.auties00.parley.media.Priority;
 import com.github.auties00.parley.dtls.DtlsRole;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.DisplayName;
@@ -97,7 +98,7 @@ class SctpTransportTest {
                 .withOrdered(false)
                 .withMaxRetransmits(3)
                 .withProtocol("chat-v1")
-                .withPriority(DataChannelPriority.HIGH);
+                .withPriority(Priority.HIGH);
         var local = pair[0].createDataChannel("chat", init);
         assertEquals(DataChannelState.OPEN, local.readyState());
         var remote = pair[1].acceptDataChannel(TIMEOUT).orElseThrow();
@@ -106,7 +107,7 @@ class SctpTransportTest {
         assertFalse(remote.ordered());
         assertEquals(3, remote.maxRetransmits().orElseThrow());
         assertTrue(remote.maxPacketLifeTime().isEmpty());
-        assertEquals(DataChannelPriority.HIGH, remote.priority());
+        assertEquals(Priority.HIGH, remote.priority());
         assertFalse(remote.negotiated());
         assertEquals(local.id(), remote.id());
         assertEquals(DataChannelState.OPEN, remote.readyState());

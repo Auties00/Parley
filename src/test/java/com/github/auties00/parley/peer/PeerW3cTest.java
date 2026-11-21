@@ -201,7 +201,7 @@ class PeerW3cTest {
                 assertEquals(new LocalTrackEvent.EncodingChanged(Optional.of("l"), Encoding.rid("l")),
                         events.next());
                 var parameters = sender.getParameters();
-                var inactive = parameters.encodings().get(1).active(false);
+                var inactive = parameters.encodings().get(1).withActive(false);
                 sender.setParameters(parameters.withEncodings(List.of(parameters.encodings().get(0), inactive)));
                 assertEquals(new LocalTrackEvent.EncodingChanged(Optional.of("l"), inactive), events.next());
                 assertTrue(events.next(Duration.ZERO).isEmpty(), "an unchanged encoding raises nothing");
@@ -345,7 +345,7 @@ class PeerW3cTest {
 
     /// {@return `encoding` with a scalability mode}
     private static Encoding withMode(Encoding encoding, String mode) {
-        return encoding.scalabilityMode(mode);
+        return encoding.withScalabilityMode(mode);
     }
 
     /// Sleeps without a checked exception.

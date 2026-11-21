@@ -150,8 +150,8 @@ class PeerConnectionScenariosTest {
             var track = LocalTrack.video("cam");
             a.pc.addTransceiver(track, TransceiverInit.builder()
                     .direction(TransceiverDirection.SENDONLY)
-                    .sendEncodings(List.of(Encoding.rid("h"), Encoding.rid("m").scaleDown(2),
-                            Encoding.rid("l").scaleDown(4)))
+                    .sendEncodings(List.of(Encoding.rid("h"), Encoding.rid("m").withScaleResolutionDownBy(2),
+                            Encoding.rid("l").withScaleResolutionDownBy(4)))
                     .build());
             connect(a, b);
             var remote = b.await(PeerConnectionEvent.Track.class, event -> true).receiver().track();
@@ -179,8 +179,8 @@ class PeerConnectionScenariosTest {
             a.pc.addTransceiver(video, TransceiverInit.builder()
                     .direction(TransceiverDirection.SENDONLY)
                     .streams(List.of("av"))
-                    .sendEncodings(List.of(Encoding.rid("h"), Encoding.rid("m").scaleDown(2),
-                            Encoding.rid("l").scaleDown(4)))
+                    .sendEncodings(List.of(Encoding.rid("h"), Encoding.rid("m").withScaleResolutionDownBy(2),
+                            Encoding.rid("l").withScaleResolutionDownBy(4)))
                     .build());
             var channel = a.pc.createDataChannel("control");
             connect(a, b);

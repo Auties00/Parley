@@ -192,13 +192,7 @@ final class RemoteDescriptionValidator {
     /// {@return whether the DTLS stack can verify a certificate against a fingerprint: its hash function is
     /// supported and its digest has that function's length}
     private static boolean supported(SdpAttribute.Fingerprint fingerprint) {
-        // TODO: use DtlsFingerprint.tryParse once the dtls package provides it.
-        try {
-            DtlsFingerprint.parse(fingerprint.hashFunction() + " " + fingerprint.fingerprint());
-            return true;
-        } catch (IllegalArgumentException exception) {
-            return false;
-        }
+        return DtlsFingerprint.tryParse(fingerprint.hashFunction() + " " + fingerprint.fingerprint()).isPresent();
     }
 
     /// {@return whether `value` is 4 (or `min`) to 256 ICE characters}

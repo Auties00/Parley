@@ -241,12 +241,29 @@ class IceHardeningTest {
     }
 
     @Test
-    @DisplayName("validates the DSCP value of setTrafficClass")
-    void trafficClass() {
-        try (var agent = loopbackBuilder().build()) {
+    @DisplayName("marks every UDP socket, those bound before and after, with the DSCP value of setTrafficClass")
+    void trafficClass() throws Exception {
+        var network = new com.github.auties00.parley.net.MemoryNetworkStack.Network();
+        var events = new CopyOnWriteArrayList<IceEvent>();
+        var stack = new com.github.auties00.parley.net.MemoryNetworkStack(network,
+                List.of(new com.github.auties00.parley.net.NetworkInterfaceAddress("eth0", InetAddress.ofLiteral("10.0.0.1"),
+                        24, false, false, false), new com.github.auties00.parley.net.NetworkInterfaceAddress("eth1",
+                        InetAddress.ofLiteral("10.0.1.1"), 24, false, false, false)));
+        try (var agent = IceAgent.builder().networkStack(stack).tcpCandidates(false).eventListener(events::add)
+                .build()) {
             assertThrows(IllegalArgumentException.class, () -> agent.setTrafficClass(64));
             assertThrows(IllegalArgumentException.class, () -> agent.setTrafficClass(-1));
-            assertFalse(agent.setTrafficClass(46));
+            assertTrue(agent.setTrafficClass(46), "no socket refused the value");
+            agent.gather();
+            var deadline = System.nanoTime() + Duration.ofSeconds(5).toNanos();
+            while (!events.contains(new IceEvent.GatheringStateChanged(IceGatheringState.COMPLETE))
+                    && System.nanoTime() < deadline) {
+                Thread.sleep(10);
+            }
+            assertEquals(2, network.trafficClasses().size(), "both host sockets are marked when bound");
+            assertTrue(network.trafficClasses().values().stream().allMatch(value -> value == 46));
+            assertTrue(agent.setTrafficClass(10));
+            assertTrue(network.trafficClasses().values().stream().allMatch(value -> value == 10));
         }
     }
 

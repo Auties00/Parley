@@ -187,8 +187,9 @@ class ChromeInteropTest {
 
     /// Exchanges text both ways: Chrome greets as the channel opens and echoes what Parley sends.
     private static void assertDataChannel(DataChannel channel) throws Exception {
-        channel.awaitOpen(TIMEOUT);
-        assertEquals(new DataChannelMessage.Text("hello from chrome"), channel.receive(TIMEOUT).orElseThrow());
+        assertTrue(channel.awaitOpen(TIMEOUT), "the data channel did not open: " + channel);
+        assertEquals(new DataChannelMessage.Text("hello from chrome"), channel.receive(TIMEOUT)
+                .orElseThrow(() -> new AssertionError("no greeting from Chrome on " + channel)));
         channel.send("ping");
         assertEquals(new DataChannelMessage.Text("echo:ping"), channel.receive(TIMEOUT).orElseThrow());
     }

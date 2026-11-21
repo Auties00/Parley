@@ -103,7 +103,7 @@ public final class TurnAllocation implements AutoCloseable {
     private int nextChannel = ChannelData.MIN_CHANNEL;
 
     /// The receiver of relayed data, or `null` to drop it.
-    private volatile TurnDataReceiver receiver;
+    private final TurnDataReceiver receiver;
 
     /// The token of the port reserved by `EVEN-PORT`, if the server reported one.
     private final OptionalLong reservationToken;
@@ -311,17 +311,6 @@ public final class TurnAllocation implements AutoCloseable {
                 new StunAttribute.Data(data))
                 : List.<StunAttribute>of(new XorPeerAddress(peer), new StunAttribute.Data(data));
         client.sendRaw(StunMessage.indication(StunMethod.SEND, attributes).encode(false));
-    }
-
-    /// Sets the receiver of datagrams relayed from peers, replacing the previous one.
-    ///
-    /// @param receiver the receiver
-    /// @deprecated give the receiver to [TurnAllocationOptions#receiver(TurnDataReceiver)]; datagrams relayed before
-    /// this call are dropped
-    @Deprecated(forRemoval = true)
-    public void setReceiver(TurnDataReceiver receiver) {
-        // TODO: remove once ice.IceAgent passes the receiver in its TurnAllocationOptions (cross-group).
-        this.receiver = Objects.requireNonNull(receiver, "receiver cannot be null");
     }
 
     /// Deletes the allocation and closes the client it belongs to; see [TurnClient#close()].

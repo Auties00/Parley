@@ -14,7 +14,6 @@ import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.OptionalLong;
-import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 
@@ -73,8 +72,7 @@ class DataChannelFlowTest {
         var pair = connect(SctpConfig.defaults(), SctpConfig.defaults().withMaxReceiveBufferedBytes(64 * 1024));
         var bulk = pair[0].createDataChannel("bulk", DataChannelInit.reliable());
         var remoteBulk = pair[1].acceptDataChannel(TIMEOUT).orElseThrow();
-        var bulkEvents = new CopyOnWriteArrayList<DataChannelEvent>();
-        remoteBulk.eventSink(bulkEvents::add);
+        var bulkEvents = remoteBulk.events();
         var chat = pair[0].createDataChannel("chat", DataChannelInit.reliable());
         var remoteChat = pair[1].acceptDataChannel(TIMEOUT).orElseThrow();
         for (var index = 0; index < 40; index++) {
@@ -83,7 +81,8 @@ class DataChannelFlowTest {
         chat.send("hello");
         assertEquals(new DataChannelMessage.Text("hello"), remoteChat.receive(TIMEOUT).orElseThrow());
         assertTrue(remoteBulk.awaitClosed(TIMEOUT), "the overflowing channel closes");
-        var error = bulkEvents.stream().filter(DataChannelEvent.Error.class::isInstance)
+        var error = bulkEvents.stream().takeWhile(event -> !(event instanceof DataChannelEvent.Closed))
+                .filter(DataChannelEvent.Error.class::isInstance)
                 .map(DataChannelEvent.Error.class::cast).findFirst().orElseThrow();
         assertInstanceOf(DataChannelReceiveOverflowException.class, error.cause());
         assertTrue(remoteBulk.messagesDropped() > 0);
@@ -174,8 +173,7 @@ class DataChannelFlowTest {
         opened.add(server);
         var channel = client.createDataChannel("events", DataChannelInit.reliable());
         assertEquals(SctpTransport.DEFAULT_REMOTE_MAX_MESSAGE_SIZE, channel.maxMessageSize());
-        var events = new CopyOnWriteArrayList<DataChannelEvent>();
-        channel.eventSink(events::add);
+        var stream = channel.events();
         var thread = Thread.ofVirtual().start(() -> assertDoesNotThrow(() ->
                 server.start(DtlsRole.SERVER, 5000, OptionalLong.empty(), TIMEOUT)));
         client.start(DtlsRole.CLIENT, 5000, OptionalLong.of(5000), TIMEOUT);
@@ -187,7 +185,8 @@ class DataChannelFlowTest {
         assertTrue(channel.awaitClosed(TIMEOUT));
         assertTrue(remote.awaitClosed(TIMEOUT));
         assertEquals(List.of(new DataChannelEvent.Opened(), new DataChannelEvent.Closing(), new DataChannelEvent.Closed()),
-                events);
+                stream.stream().toList());
+        assertTrue(stream.isEnded());
     }
 
     @Test

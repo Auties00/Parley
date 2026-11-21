@@ -83,6 +83,14 @@ public final class MemoryNetworkStack implements NetworkStack {
         /// The filter of datagrams to drop.
         private volatile Predicate<Sent> drop = _ -> false;
 
+        /// The DSCP value each endpoint was marked with, by address.
+        private final Map<InetSocketAddress, Integer> trafficClasses = new ConcurrentHashMap<>();
+
+        /// {@return the DSCP value of every endpoint marked so far, by address}
+        public Map<InetSocketAddress, Integer> trafficClasses() {
+            return Map.copyOf(trafficClasses);
+        }
+
         /// {@return every datagram sent so far}
         public List<Sent> sent() {
             return List.copyOf(sent);
@@ -167,6 +175,15 @@ public final class MemoryNetworkStack implements NetworkStack {
             } catch (InterruptedException exception) {
                 throw new IOException(exception);
             }
+        }
+
+        @Override
+        public boolean setTrafficClass(int dscp) {
+            if (dscp < 0 || dscp > 63) {
+                throw new IllegalArgumentException("dscp must be in 0..63: " + dscp);
+            }
+            network.trafficClasses.put(address, dscp);
+            return true;
         }
 
         @Override

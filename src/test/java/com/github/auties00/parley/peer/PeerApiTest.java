@@ -212,7 +212,7 @@ class PeerApiTest {
             sender.setPipeline(new RecordingSink(seen, sender), sender.layers());
             var parameters = sender.getParameters();
             sender.setParameters(parameters.withEncodings(List.of(parameters.encodings().get(0),
-                    parameters.encodings().get(1).active(false))));
+                    parameters.encodings().get(1).withActive(false))));
             track.write(frame(MediaKind.VIDEO), "h");
             track.write(frame(MediaKind.VIDEO), "l");
             assertEquals(1, seen.size());
@@ -536,11 +536,11 @@ class PeerApiTest {
             assertThrows(IllegalArgumentException.class, () -> a.pc().createDataChannel("x",
                     new com.github.auties00.parley.datachannel.DataChannelInit(true, OptionalInt.of(1),
                             Optional.of(Duration.ofSeconds(1)), "", false, OptionalInt.empty(),
-                            com.github.auties00.parley.datachannel.DataChannelPriority.LOW)));
+                            com.github.auties00.parley.media.Priority.LOW)));
             assertThrows(IllegalArgumentException.class, () -> a.pc().createDataChannel("x",
                     new com.github.auties00.parley.datachannel.DataChannelInit(true, OptionalInt.empty(),
                             Optional.empty(), "", true, OptionalInt.empty(),
-                            com.github.auties00.parley.datachannel.DataChannelPriority.LOW)));
+                            com.github.auties00.parley.media.Priority.LOW)));
         }
     }
 

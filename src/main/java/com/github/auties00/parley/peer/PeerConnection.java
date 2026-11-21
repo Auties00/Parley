@@ -1,8 +1,8 @@
 package com.github.auties00.parley.peer;
 
+import com.github.auties00.parley.media.Priority;
 import com.github.auties00.parley.datachannel.DataChannel;
 import com.github.auties00.parley.datachannel.DataChannelInit;
-import com.github.auties00.parley.datachannel.DataChannelPriority;
 import com.github.auties00.parley.dtls.DtlsState;
 import com.github.auties00.parley.event.EventSource;
 import com.github.auties00.parley.event.EventStream;
@@ -33,6 +33,7 @@ import java.util.OptionalInt;
 import java.util.OptionalLong;
 import java.util.Set;
 import java.util.UUID;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.Consumer;
 import java.util.function.Predicate;
@@ -139,10 +140,12 @@ public final class PeerConnection implements AutoCloseable {
     private PeerConnectionState connectionState = PeerConnectionState.NEW;
     /// Whether the connection is closed; guarded by [#lock].
     private boolean closed;
-    /// The data channels that became open; guarded by [#lock].
-    private long dataChannelsOpened;
-    /// The data channels that closed after being open; guarded by [#lock].
-    private long dataChannelsClosed;
+    /// The transports that failed for a reason neither ICE nor DTLS reports; guarded by [#lock].
+    private final Set<String> failedTransports = new HashSet<>();
+    /// The data channels that became open; counted on the channels' own threads, so lock-free.
+    private final AtomicLong dataChannelsOpened = new AtomicLong();
+    /// The data channels that closed after being open; counted on the channels' own threads, so lock-free.
+    private final AtomicLong dataChannelsClosed = new AtomicLong();
 
     /// Creates a connection whose transports `backendFactory` creates.
     private PeerConnection(Configuration configuration, PeerBackend.Factory backendFactory) {
@@ -270,8 +273,6 @@ public final class PeerConnection implements AutoCloseable {
             Optional<Negotiated> result;
             synchronized (lock) {
                 checkOpen();
-                // TODO: catch sdp.SdpFormatException and rethrow it as OperationErrorException (the W3C
-                //  sdp-syntax-error) once SessionDescription.parse throws that checked exception.
                 result = engine.setRemoteDescription(description);
                 result.ifPresent(negotiated -> trackTransports(negotiated, description.type() == JsepType.ANSWER));
             }
@@ -531,7 +532,8 @@ public final class PeerConnection implements AutoCloseable {
                     return sender;
                 }
             }
-            var transceiver = newTransceiver(track.kind(), TransceiverDirection.SENDRECV, streamIds, List.of());
+            var transceiver = newTransceiver(track.kind(), TransceiverDirection.SENDRECV, streamIds, List.of(),
+                    Optional.empty());
             transceiver.usedByAddTrack = true;
             transceiver.sender().setTrack(track);
             updateNegotiationNeeded();
@@ -601,7 +603,9 @@ public final class PeerConnection implements AutoCloseable {
         Objects.requireNonNull(init, "init cannot be null");
         synchronized (lock) {
             checkOpen();
-            var transceiver = newTransceiver(kind, init.direction(), init.streams(), init.sendEncodings());
+            var transceiver = newTransceiver(kind, init.direction(), init.streams(), init.sendEncodings(),
+                    init.remoteTrackMode());
+            transceiver.applyInit(init);
             updateNegotiationNeeded();
             return transceiver;
         }
@@ -618,7 +622,9 @@ public final class PeerConnection implements AutoCloseable {
         Objects.requireNonNull(init, "init cannot be null");
         synchronized (lock) {
             checkOpen();
-            var transceiver = newTransceiver(track.kind(), init.direction(), init.streams(), init.sendEncodings());
+            var transceiver = newTransceiver(track.kind(), init.direction(), init.streams(), init.sendEncodings(),
+                    init.remoteTrackMode());
+            transceiver.applyInit(init);
             transceiver.sender().setTrack(track);
             updateNegotiationNeeded();
             return transceiver;
@@ -656,7 +662,7 @@ public final class PeerConnection implements AutoCloseable {
     /// @throws InvalidStateException if the connection is closed
     public DataChannel createDataChannel(String label) {
         return createDataChannel(label, new DataChannelInit(true, OptionalInt.empty(), Optional.empty(), "", false,
-                OptionalInt.empty(), DataChannelPriority.LOW));
+                OptionalInt.empty(), Priority.LOW));
     }
 
     /// Creates a data channel, the W3C `createDataChannel`. The first channel makes a negotiation needed.
@@ -700,7 +706,7 @@ public final class PeerConnection implements AutoCloseable {
         var objects = new ArrayList<RtcStats>();
         var transports = backend.statistics(now);
         synchronized (lock) {
-            objects.add(new PeerConnectionStats("P", now, dataChannelsOpened, dataChannelsClosed));
+            objects.add(new PeerConnectionStats("P", now, dataChannelsOpened.get(), dataChannelsClosed.get()));
         }
         objects.addAll(transports);
         return StatsReport.of(objects);
@@ -930,11 +936,13 @@ public final class PeerConnection implements AutoCloseable {
         }
     }
 
-    /// Creates and registers a transceiver.
+    /// Creates and registers a transceiver whose remote track delivers media in `mode`, or in the configuration's
+    /// mode when it is empty.
     private RtpTransceiver newTransceiver(MediaKind kind, TransceiverDirection direction, List<String> streams,
-                                          List<Encoding> encodings) {
+                                          List<Encoding> encodings, Optional<RemoteTrackMode> mode) {
         var sender = new RtpSender(this, kind, streams, encodings);
-        var receiver = new RtpReceiver(this, kind, UUID.randomUUID().toString(), configuration.remoteTrackMode());
+        var receiver = new RtpReceiver(this, kind, UUID.randomUUID().toString(),
+                mode.orElse(configuration.remoteTrackMode()));
         var transceiver = new RtpTransceiver(this, kind, direction, sender, receiver);
         transceivers.add(transceiver);
         return transceiver;
@@ -942,7 +950,7 @@ public final class PeerConnection implements AutoCloseable {
 
     /// Creates a `RECVONLY` transceiver for a section of a remote offer no transceiver takes.
     RtpTransceiver createRemoteTransceiver(MediaKind kind) {
-        var transceiver = newTransceiver(kind, TransceiverDirection.RECVONLY, List.of(), List.of());
+        var transceiver = newTransceiver(kind, TransceiverDirection.RECVONLY, List.of(), List.of(), Optional.empty());
         transceiver.createdByRemote = true;
         return transceiver;
     }
@@ -1059,12 +1067,17 @@ public final class PeerConnection implements AutoCloseable {
     /// {@return the lowercase names of the codecs a sender negotiated, or of the configured codecs of its kind
     /// before a negotiation; the caller holds the lock}
     Set<String> sendCodecNames(RtpSender sender) {
+        return sendCodecs(sender).stream().map(codec -> codec.name().toLowerCase(java.util.Locale.ROOT))
+                .collect(Collectors.toUnmodifiableSet());
+    }
+
+    /// {@return the codecs a sender can send: the negotiated ones, or the capabilities of its kind before the first
+    /// negotiation}
+    List<Codec> sendCodecs(RtpSender sender) {
         var media = negotiatedMedia(sender);
-        var codecs = media.isPresent() && !media.get().codecs().isEmpty()
+        return media.isPresent() && !media.get().codecs().isEmpty()
                 ? media.get().codecs().stream().map(Negotiated.CodecEntry::codec).toList()
                 : codecCapabilities(sender.kind());
-        return codecs.stream().map(codec -> codec.name().toLowerCase(java.util.Locale.ROOT))
-                .collect(Collectors.toUnmodifiableSet());
     }
 
     /// Recomputes the aggregate gathering, ICE and connection states and raises their changes; the caller holds
@@ -1132,7 +1145,8 @@ public final class PeerConnection implements AutoCloseable {
     private PeerConnectionState aggregateConnection() {
         var ice = iceStates.values();
         var dtls = dtlsStates.values();
-        if (ice.contains(IceTransportState.FAILED) || dtls.contains(DtlsState.FAILED)) {
+        if (ice.contains(IceTransportState.FAILED) || dtls.contains(DtlsState.FAILED)
+                || !failedTransports.isEmpty()) {
             return PeerConnectionState.FAILED;
         }
         if (ice.contains(IceTransportState.DISCONNECTED)) {
@@ -1218,15 +1232,34 @@ public final class PeerConnection implements AutoCloseable {
 
         @Override
         public void onDataChannelOpened() {
-            synchronized (lock) {
-                dataChannelsOpened++;
-            }
+            dataChannelsOpened.incrementAndGet();
         }
 
         @Override
         public void onDataChannelClosed() {
+            dataChannelsClosed.incrementAndGet();
+        }
+
+        @Override
+        public void onSsrcChanged(RtpSender sender, long oldSsrc, long newSsrc) {
             synchronized (lock) {
-                dataChannelsClosed++;
+                if (closed) {
+                    return;
+                }
+                ssrcs.add(newSsrc);
+                sender.replaceSsrc(oldSsrc, newSsrc);
+                updateNegotiationNeeded();
+            }
+        }
+
+        @Override
+        public void onTransportFailed(String transportId) {
+            synchronized (lock) {
+                if (closed || !dtlsStates.containsKey(transportId)) {
+                    return;
+                }
+                failedTransports.add(transportId);
+                updateAggregateStates();
             }
         }
     }

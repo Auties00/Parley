@@ -2,6 +2,7 @@ package com.github.auties00.parley.datachannel;
 
 import java.util.Objects;
 import java.util.concurrent.ThreadFactory;
+import java.util.function.BiConsumer;
 
 /// The configuration of an [SctpTransport].
 ///
@@ -19,11 +20,16 @@ import java.util.concurrent.ThreadFactory;
 ///                                channels and watch their buffered amount
 /// @param maxBufferedAmount       the most bytes one channel may have waiting to be sent; a send beyond it fails
 ///                                with [DataChannelBufferFullException], positive
+/// @param channelEventListener    told of every [DataChannelEvent] of every channel of the association, in order per
+///                                channel, before the channel's own [DataChannel#events()] streams see it; it is called
+///                                with the channel's lock held, so it must neither block nor call back into the
+///                                channel
 ///
 /// @spec https://www.rfc-editor.org/rfc/rfc8841.html RFC 8841: Session Description Protocol (SDP) Offer/Answer Procedures for Stream Control Transmission Protocol (SCTP) over Datagram Transport Layer Security (DTLS) Transport
 /// @spec https://www.rfc-editor.org/rfc/rfc8260.html RFC 8260: Stream Schedulers and User Message Interleaving for the Stream Control Transmission Protocol
 public record SctpConfig(int localPort, long maxMessageSize, int maxSendBufferSize, long maxReceiveBufferedBytes,
-                         boolean messageInterleaving, ThreadFactory threadFactory, long maxBufferedAmount) {
+                         boolean messageInterleaving, ThreadFactory threadFactory, long maxBufferedAmount,
+                         BiConsumer<? super DataChannel, ? super DataChannelEvent> channelEventListener) {
     /// The SCTP port WebRTC endpoints use by default.
     public static final int DEFAULT_PORT = 5000;
 
@@ -39,11 +45,16 @@ public record SctpConfig(int localPort, long maxMessageSize, int maxSendBufferSi
     /// The default per-channel send bound: 16 MiB, the queue browsers allow a channel before `send()` throws.
     public static final long DEFAULT_MAX_BUFFERED_AMOUNT = 16L * 1024 * 1024;
 
+    /// A channel event listener that ignores every event.
+    private static final BiConsumer<DataChannel, DataChannelEvent> NO_CHANNEL_EVENTS = (_, _) -> {
+    };
+
     /// Validates the configuration.
     ///
     /// @throws IllegalArgumentException if `localPort` is outside `1` to `65535` or a size is not positive
     public SctpConfig {
         Objects.requireNonNull(threadFactory, "threadFactory");
+        Objects.requireNonNull(channelEventListener, "channelEventListener");
         if (localPort < 1 || localPort > 0xFFFF) {
             throw new IllegalArgumentException("localPort must be in 1..65535: " + localPort);
         }
@@ -52,27 +63,13 @@ public record SctpConfig(int localPort, long maxMessageSize, int maxSendBufferSi
         }
     }
 
-    /// Creates a configuration with the default per-channel send bound, [#DEFAULT_MAX_BUFFERED_AMOUNT].
-    ///
-    /// @param localPort               the local SCTP port
-    /// @param maxMessageSize          the largest accepted message
-    /// @param maxSendBufferSize       the association's send buffer
-    /// @param maxReceiveBufferedBytes the per-channel receive bound
-    /// @param messageInterleaving     whether to offer I-DATA
-    /// @param threadFactory           the thread factory
-    /// @throws IllegalArgumentException if `localPort` is outside `1` to `65535` or a size is not positive
-    public SctpConfig(int localPort, long maxMessageSize, int maxSendBufferSize, long maxReceiveBufferedBytes,
-                      boolean messageInterleaving, ThreadFactory threadFactory) {
-        this(localPort, maxMessageSize, maxSendBufferSize, maxReceiveBufferedBytes, messageInterleaving, threadFactory,
-                DEFAULT_MAX_BUFFERED_AMOUNT);
-    }
-
     /// {@return the default configuration}: port 5000, 256 KiB messages, a 2 MB send buffer, 16 MiB per channel
-    /// received and buffered for sending, interleaving offered, and virtual threads named `parley-sctp-<n>`
+    /// received and buffered for sending, interleaving offered, virtual threads named `parley-sctp-<n>`, and no
+    /// channel event listener
     public static SctpConfig defaults() {
         return new SctpConfig(DEFAULT_PORT, DEFAULT_MAX_MESSAGE_SIZE, DEFAULT_MAX_SEND_BUFFER_SIZE,
                 DEFAULT_MAX_RECEIVE_BUFFERED_BYTES, true, Thread.ofVirtual().name("parley-sctp-", 0).factory(),
-                DEFAULT_MAX_BUFFERED_AMOUNT);
+                DEFAULT_MAX_BUFFERED_AMOUNT, NO_CHANNEL_EVENTS);
     }
 
     /// {@return a copy using `localPort`}
@@ -81,7 +78,7 @@ public record SctpConfig(int localPort, long maxMessageSize, int maxSendBufferSi
     /// @throws IllegalArgumentException if `localPort` is outside `1` to `65535`
     public SctpConfig withLocalPort(int localPort) {
         return new SctpConfig(localPort, maxMessageSize, maxSendBufferSize, maxReceiveBufferedBytes,
-                messageInterleaving, threadFactory, maxBufferedAmount);
+                messageInterleaving, threadFactory, maxBufferedAmount, channelEventListener);
     }
 
     /// {@return a copy accepting messages up to `maxMessageSize` bytes}
@@ -90,7 +87,7 @@ public record SctpConfig(int localPort, long maxMessageSize, int maxSendBufferSi
     /// @throws IllegalArgumentException if `maxMessageSize` is not positive
     public SctpConfig withMaxMessageSize(long maxMessageSize) {
         return new SctpConfig(localPort, maxMessageSize, maxSendBufferSize, maxReceiveBufferedBytes,
-                messageInterleaving, threadFactory, maxBufferedAmount);
+                messageInterleaving, threadFactory, maxBufferedAmount, channelEventListener);
     }
 
     /// {@return a copy with the given send buffer}
@@ -99,7 +96,7 @@ public record SctpConfig(int localPort, long maxMessageSize, int maxSendBufferSi
     /// @throws IllegalArgumentException if `maxSendBufferSize` is not positive
     public SctpConfig withMaxSendBufferSize(int maxSendBufferSize) {
         return new SctpConfig(localPort, maxMessageSize, maxSendBufferSize, maxReceiveBufferedBytes,
-                messageInterleaving, threadFactory, maxBufferedAmount);
+                messageInterleaving, threadFactory, maxBufferedAmount, channelEventListener);
     }
 
     /// {@return a copy with the given per-channel receive bound}
@@ -108,7 +105,7 @@ public record SctpConfig(int localPort, long maxMessageSize, int maxSendBufferSi
     /// @throws IllegalArgumentException if `maxReceiveBufferedBytes` is not positive
     public SctpConfig withMaxReceiveBufferedBytes(long maxReceiveBufferedBytes) {
         return new SctpConfig(localPort, maxMessageSize, maxSendBufferSize, maxReceiveBufferedBytes,
-                messageInterleaving, threadFactory, maxBufferedAmount);
+                messageInterleaving, threadFactory, maxBufferedAmount, channelEventListener);
     }
 
     /// {@return a copy with the given per-channel send bound}
@@ -117,7 +114,7 @@ public record SctpConfig(int localPort, long maxMessageSize, int maxSendBufferSi
     /// @throws IllegalArgumentException if `maxBufferedAmount` is not positive
     public SctpConfig withMaxBufferedAmount(long maxBufferedAmount) {
         return new SctpConfig(localPort, maxMessageSize, maxSendBufferSize, maxReceiveBufferedBytes,
-                messageInterleaving, threadFactory, maxBufferedAmount);
+                messageInterleaving, threadFactory, maxBufferedAmount, channelEventListener);
     }
 
     /// {@return a copy that offers interleaving or not}
@@ -125,7 +122,7 @@ public record SctpConfig(int localPort, long maxMessageSize, int maxSendBufferSi
     /// @param messageInterleaving whether to offer I-DATA
     public SctpConfig withMessageInterleaving(boolean messageInterleaving) {
         return new SctpConfig(localPort, maxMessageSize, maxSendBufferSize, maxReceiveBufferedBytes,
-                messageInterleaving, threadFactory, maxBufferedAmount);
+                messageInterleaving, threadFactory, maxBufferedAmount, channelEventListener);
     }
 
     /// {@return a copy starting its threads from `threadFactory`}
@@ -133,6 +130,16 @@ public record SctpConfig(int localPort, long maxMessageSize, int maxSendBufferSi
     /// @param threadFactory the thread factory
     public SctpConfig withThreadFactory(ThreadFactory threadFactory) {
         return new SctpConfig(localPort, maxMessageSize, maxSendBufferSize, maxReceiveBufferedBytes,
-                messageInterleaving, threadFactory, maxBufferedAmount);
+                messageInterleaving, threadFactory, maxBufferedAmount, channelEventListener);
+    }
+
+    /// {@return a copy telling `channelEventListener` of every channel's events}
+    ///
+    /// @param channelEventListener the listener, called with the channel's lock held; it must neither block nor call
+    ///                             back into the channel
+    public SctpConfig withChannelEventListener(
+            BiConsumer<? super DataChannel, ? super DataChannelEvent> channelEventListener) {
+        return new SctpConfig(localPort, maxMessageSize, maxSendBufferSize, maxReceiveBufferedBytes,
+                messageInterleaving, threadFactory, maxBufferedAmount, channelEventListener);
     }
 }

@@ -11,8 +11,8 @@ import java.util.Objects;
 
 /// The [PeerDtlsTransport] of one transport, reading its [DtlsTransport] and fed its state changes by the backend.
 final class PeerDtlsTransportView implements PeerDtlsTransport {
-    /// The transport the view reads.
-    private final DtlsTransport dtls;
+    /// The transport the view reads; replaced when the peer restarts DTLS.
+    private volatile DtlsTransport dtls;
     /// The view of the ICE transport under it.
     private final PeerIceTransportView ice;
     /// The state changes the backend publishes.
@@ -42,6 +42,11 @@ final class PeerDtlsTransportView implements PeerDtlsTransport {
     @Override
     public EventStream<DtlsState> events() {
         return events.open();
+    }
+
+    /// Reads `replacement` from now on, as when a DTLS restart replaces the association.
+    void replace(DtlsTransport replacement) {
+        this.dtls = Objects.requireNonNull(replacement);
     }
 
     /// Raises a state change.

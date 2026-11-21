@@ -193,15 +193,16 @@ public final class RtpSender {
 
     /// Changes the encoding parameters without renegotiation, the W3C `setParameters`.
     ///
-    /// Only the activity, bitrate and frame rate caps, resolution divisor, priorities and scalability mode of each
-    /// encoding may change. Each encoding that changes raises a [LocalTrackEvent.EncodingChanged] on the attached
+    /// Only the activity, bitrate and frame rate caps, resolution divisor, priorities, scalability mode and codec of
+    /// each encoding may change; an encoding with a codec sends it from then on. Each encoding that changes raises a [LocalTrackEvent.EncodingChanged] on the attached
     /// track, so the encoder can follow it; an inactive encoding's frames are dropped.
     ///
     /// @param parameters the parameters a `getParameters()` call returned, edited
     /// @throws InvalidStateException        if no `getParameters()` call preceded this one, or the connection is
     ///                                      closed
     /// @throws InvalidModificationException if the transaction id, the number of encodings or an RTP stream id
-    ///                                      differs from the last `getParameters()` result
+    ///                                      differs from the last `getParameters()` result, or an encoding names a
+    ///                                      codec the sender cannot send
     /// @throws OperationErrorException      if a scalability mode is not one the webrtc-svc mode table defines for
     ///                                      the sender's codec (audio has none)
     public void setParameters(RtpSendParameters parameters) {
@@ -221,6 +222,7 @@ public final class RtpSender {
                 throw new InvalidModificationException("the number of encodings cannot change");
             }
             var codecs = connection.sendCodecNames(this);
+            var sendCodecs = connection.sendCodecs(this);
             var updated = new ArrayList<Negotiated.SendLayer>();
             changed = new ArrayList<>();
             for (var index = 0; index < encodings.size(); index++) {
@@ -230,8 +232,10 @@ public final class RtpSender {
                     throw new InvalidModificationException("an encoding's rid cannot change");
                 }
                 encoding.scalabilityMode().ifPresent(mode -> checkScalabilityMode(mode, codecs));
-                // TODO: validate encoding.codec() against the negotiated codecs (OperationErrorException) once
-                //  Encoding carries the per-encoding codec member.
+                if (encoding.codec().isPresent() && sendCodecs.stream()
+                        .noneMatch(codec -> CodecCatalog.matches(codec, encoding.codec().get()))) {
+                    throw new InvalidModificationException("the sender cannot send " + encoding.codec().get());
+                }
                 var next = new Negotiated.SendLayer(layer.rid(), layer.ssrc(), layer.rtxSsrc(), encoding);
                 updated.add(next);
                 if (!encoding.equals(layer.encoding())) {
@@ -401,6 +405,12 @@ public final class RtpSender {
     /// {@return the attached track, or `null`}
     LocalTrack trackOrNull() {
         return track;
+    }
+
+    /// Moves the layer that uses `oldSsrc`, as its media or retransmission source, to `newSsrc`; the caller holds the
+    /// lock.
+    void replaceSsrc(long oldSsrc, long newSsrc) {
+        layers = layers.stream().map(layer -> layer.withReplacedSsrc(oldSsrc, newSsrc)).toList();
     }
 
     /// {@return the encodings with their sources; the caller holds the lock}

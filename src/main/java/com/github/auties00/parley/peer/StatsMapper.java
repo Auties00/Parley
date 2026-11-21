@@ -32,7 +32,6 @@ import com.github.auties00.parley.stats.RemoteInboundRtpStreamStats;
 import com.github.auties00.parley.stats.RemoteOutboundRtpStreamStats;
 import com.github.auties00.parley.stats.RtcStats;
 import com.github.auties00.parley.stats.TransportStats;
-import com.github.auties00.parley.transport.SrtpTransport;
 
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
@@ -97,10 +96,8 @@ final class StatsMapper {
     /// @param id         the transport id
     /// @param ice        the ICE agent
     /// @param dtls       the DTLS transport
-    /// @param srtp       the SRTP transport
     /// @param congestion the congestion controller, when media is negotiated
-    record TransportView(String id, IceTransport ice, DtlsTransport dtls, SrtpTransport srtp,
-                         Optional<CongestionController> congestion) {
+    record TransportView(String id, IceTransport ice, DtlsTransport dtls, Optional<CongestionController> congestion) {
     }
 
     /// What the mapper reads from one send stream.
@@ -271,11 +268,8 @@ final class StatsMapper {
         var remote = statistics.remote();
         var remoteId = remote.map(ignored -> "RI" + ssrc);
         var sourceId = view.track().map(track -> "MS" + track.id());
-        // TODO: map the per-SSRC frame counters, frame size, frame rate and pacer delay of the send stream statistics
-        //  once the rtp.session package provides them; the track totals stand in until then, which every layer of a
-        //  simulcast sender reports alike.
-        var frames = view.track().map(LocalTrack::framesWritten).orElse(0L);
-        var keyFrames = view.track().map(LocalTrack::keyFramesWritten).orElse(0L);
+        var frames = statistics.framesSent();
+        var keyFrames = statistics.keyFramesSent();
         var target = view.track().flatMap(track -> statistics.rid().isPresent()
                 ? boxed(track.targetBitrate(statistics.rid().get())) : boxed(track.targetBitrate()));
         var encoding = view.encoding();
@@ -293,11 +287,14 @@ final class StatsMapper {
                 Optional.of(view.mid()), sourceId, remoteId, statistics.rid(), view.encodingIndex(),
                 statistics.packetsSent(), statistics.bytesSent(), statistics.headerBytesSent(),
                 statistics.retransmittedPacketsSent(), statistics.retransmittedBytesSent(), statistics.rtxSsrc(),
-                target.map(OptionalLong::of).orElse(OptionalLong.empty()), 0,
+                target.map(OptionalLong::of).orElse(OptionalLong.empty()),
+                seconds(statistics.totalPacketSendDelay()),
                 video ? OptionalLong.of(frames) : OptionalLong.empty(),
                 video ? OptionalLong.of(keyFrames) : OptionalLong.empty(),
                 video ? OptionalLong.of(frames) : OptionalLong.empty(),
-                OptionalInt.empty(), OptionalInt.empty(), OptionalDouble.empty(), statistics.nackCount(),
+                video ? statistics.frameWidth() : OptionalInt.empty(),
+                video ? statistics.frameHeight() : OptionalInt.empty(),
+                video ? statistics.framesPerSecond() : OptionalDouble.empty(), statistics.nackCount(),
                 statistics.firCount(), statistics.pliCount(), encoding.active(), encoding.scalabilityMode(),
                 limitation, durations));
         remote.ifPresent(reception -> result.add(new RemoteInboundRtpStreamStats("RI" + ssrc, now, ssrc, kind,
@@ -335,16 +332,15 @@ final class StatsMapper {
         var estimatedPlayout = playout.flatMap(value -> value.estimatedPlayoutTimestamp())
                 .or(() -> assembler.flatMap(value -> value.estimatedPlayoutTimestamp()));
         var playoutId = playout.map(ignored -> "AP" + view.mid());
-        // TODO: map fecSsrc and fecBytesReceived from the receive stream statistics once the rtp.session package
-        //  provides them.
         result.add(new InboundRtpStreamStats(inboundId, now, statistics.ssrc().orElse(0), kind, transportId, codecId,
                 Optional.of(view.track().id()), Optional.of(view.mid()), remoteId, statistics.packetsReceived(),
                 statistics.packetsLost(), seconds(statistics.jitter()), statistics.bytesReceived(),
                 statistics.headerBytesReceived(), statistics.packetsDiscarded()
                 + playout.map(value -> value.packetsDiscarded()).orElse(0L),
                 statistics.fecPacketsReceived(), Math.max(0, statistics.fecPacketsReceived()
-                - statistics.packetsRecovered()), 0, statistics.retransmittedPacketsReceived(),
-                statistics.retransmittedBytesReceived(), statistics.rtxSsrc(), OptionalLong.empty(),
+                - statistics.packetsRecovered()), statistics.fecBytesReceived(),
+                statistics.retransmittedPacketsReceived(), statistics.retransmittedBytesReceived(),
+                statistics.rtxSsrc(), statistics.fecSsrc(),
                 statistics.nackCount(), statistics.firCount(), statistics.pliCount(),
                 audio ? OptionalLong.empty() : OptionalLong.of(assembler.map(value -> value.framesReceived()).orElse(0L)),
                 audio ? OptionalLong.empty()

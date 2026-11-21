@@ -107,7 +107,7 @@ public final class RtpSendStream {
             return size() > MAX_FIR_REQUESTERS;
         }
     };
-    private volatile Consumer<? super KeyframeRequest> keyframeListener;
+    private final Consumer<? super KeyframeRequest> keyframeListener;
     private RtpStreamRewriter rewriter;
     private boolean forwardingKeyFrame;
     private double nackRunLength = 1;
@@ -576,17 +576,6 @@ public final class RtpSendStream {
         } catch (RtpFormatException exception) {
             throw new IllegalStateException("the writer produced an unparsable packet", exception);
         }
-    }
-
-    /// Sets the listener told of PLI and FIR requests from the peer, replacing the configuration's.
-    ///
-    /// @param listener the listener, called on the transport's RTCP reader thread
-    /// @deprecated give the listener to [SendStreamConfig.Builder#keyframeRequestListener(Consumer)]; a listener set
-    /// after the stream was created misses the requests that arrived before
-    @Deprecated(forRemoval = true)
-    public void setKeyframeRequestListener(Consumer<KeyframeRequest> listener) {
-        // TODO: remove once peer.TransportBackend passes the listener in its SendStreamConfig (cross-group).
-        this.keyframeListener = Objects.requireNonNull(listener, "listener cannot be null");
     }
 
     /// {@return a snapshot of the stream's counters}

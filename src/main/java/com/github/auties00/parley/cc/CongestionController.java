@@ -45,14 +45,6 @@ public sealed interface CongestionController extends TransportFeedbackObserver, 
     /// {@return the pacer every outgoing RTP packet should be scheduled on}
     Pacer pacer();
 
-    /// Sets the listener the target is reported to, replacing the configuration's.
-    ///
-    /// @param listener the listener
-    /// @deprecated give the listener to [CongestionConfig#withTargetListener(Consumer)]; a listener set after
-    /// construction misses the targets computed before
-    @Deprecated(forRemoval = true)
-    void setTargetListener(Consumer<TargetBitrate> listener);
-
     /// {@return the current target}
     TargetBitrate currentTarget();
 

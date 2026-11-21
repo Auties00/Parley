@@ -57,7 +57,7 @@ class Av1DependencyDescriptorTest {
         var result = new ArrayList<DependencyDescriptor>();
         for (var payload : payloads) {
             var value = payload.extensions().get(HeaderExtensionUris.DEPENDENCY_DESCRIPTOR);
-            var descriptor = DependencyDescriptor.parse(value, Optional.ofNullable(latest[0]));
+            var descriptor = latest[0] != null ? DependencyDescriptor.parse(value, latest[0]) : DependencyDescriptor.parse(value);
             descriptor.structure().ifPresent(structure -> latest[0] = structure);
             result.add(descriptor);
         }

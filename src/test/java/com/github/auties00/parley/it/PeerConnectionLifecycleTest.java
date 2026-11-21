@@ -4,6 +4,7 @@ import com.github.auties00.parley.datachannel.DataChannelMessage;
 import com.github.auties00.parley.datachannel.SctpTransportState;
 import com.github.auties00.parley.media.MediaKind;
 import com.github.auties00.parley.peer.Encoding;
+import com.github.auties00.parley.peer.JsepDescription;
 import com.github.auties00.parley.peer.LocalTrack;
 import com.github.auties00.parley.peer.LocalTrackEvent;
 import com.github.auties00.parley.peer.PeerConnectionEvent;
@@ -74,6 +75,41 @@ class PeerConnectionLifecycleTest {
             var remote = a.await(PeerConnectionEvent.DataChannel.class, event -> true).channel();
             remote.send("pong");
             assertEquals(new DataChannelMessage.Text("pong"), channel.receive(Loopback.TIMEOUT).orElseThrow());
+        }
+    }
+
+    @Test
+    @DisplayName("follows a peer that restarts DTLS: new association, media and data channels flow again")
+    void dtlsRestart() throws Exception {
+        try (var a = peer(); var b = peer()) {
+            var track = LocalTrack.audio("mic");
+            a.pc.addTrack(track, "s");
+            var before = a.pc.createDataChannel("before");
+            connect(a, b);
+            assertTrue(before.awaitOpen(Loopback.TIMEOUT));
+            var remote = b.await(PeerConnectionEvent.Track.class, event -> true).receiver().track();
+            var oldCertificate = a.pc.getSenders().getFirst().transport().orElseThrow().remoteCertificates();
+            a.pc.setLocalDescription(a.pc.createOffer());
+            var offer = a.gatheredDescription();
+            var restarted = new JsepDescription(offer.type(), offer.sdp().replaceAll("a=tls-id:\\S+",
+                    "a=tls-id:restarted0123456789abcdef"));
+            assertFalse(restarted.sdp().equals(offer.sdp()), "the offer carries a tls-id");
+            b.pc.setRemoteDescription(restarted);
+            b.pc.setLocalDescription(b.pc.createAnswer());
+            a.pc.setRemoteDescription(b.gatheredDescription());
+            assertTrue(before.awaitClosed(Loopback.TIMEOUT), "the old association's channels close");
+            var after = a.pc.createDataChannel("after");
+            assertTrue(after.awaitOpen(Loopback.TIMEOUT), "a channel opens over the new association");
+            var echo = b.await(PeerConnectionEvent.DataChannel.class, event -> event.channel().label().equals("after"))
+                    .channel();
+            after.send("again");
+            assertEquals(new DataChannelMessage.Text("again"), echo.receive(Loopback.TIMEOUT).orElseThrow());
+            try (var _ = PeerConnectionScenariosTest.audioWriter(track)) {
+                assertFrames(remote, 10);
+            }
+            assertTrue(a.pc.awaitConnectionState(PeerConnectionState.CONNECTED, Loopback.TIMEOUT));
+            assertEquals(oldCertificate.size(),
+                    a.pc.getSenders().getFirst().transport().orElseThrow().remoteCertificates().size());
         }
     }
 

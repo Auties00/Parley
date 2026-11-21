@@ -292,7 +292,7 @@ class JsepTest {
             negotiate(a, b);
             var data = a.backend().last().data().orElseThrow();
             assertEquals(5000, data.remotePort());
-            assertEquals(262144, data.remoteMaxMessageSize());
+            assertEquals(java.util.OptionalLong.of(262144), data.remoteMaxMessageSize());
         }
 
         @Test

@@ -1,5 +1,6 @@
 package com.github.auties00.parley.datachannel;
 
+import com.github.auties00.parley.media.Priority;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.RepeatedTest;
 import org.junit.jupiter.api.Test;
@@ -52,9 +53,9 @@ class DcepMessageTest {
         var cases = new DataChannelInit[]{
                 DataChannelInit.reliable(),
                 DataChannelInit.reliable().withOrdered(false),
-                DataChannelInit.reliable().withMaxRetransmits(7).withPriority(DataChannelPriority.VERY_LOW),
+                DataChannelInit.reliable().withMaxRetransmits(7).withPriority(Priority.VERY_LOW),
                 DataChannelInit.reliable().withOrdered(false).withMaxPacketLifeTime(Duration.ofMillis(1500))
-                        .withProtocol("proto").withPriority(DataChannelPriority.HIGH)
+                        .withProtocol("proto").withPriority(Priority.HIGH)
         };
         for (var init : cases) {
             var open = DcepMessage.Open.of("label", init);

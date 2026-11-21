@@ -88,7 +88,7 @@ final class GoogleCongestionController implements CongestionController {
     private final ProbeController probeController;
     private final ProbeBitrateEstimator probeEstimator;
     private final Map<Long, long[]> receiverReportState;
-    private Consumer<? super TargetBitrate> listener;
+    private final Consumer<? super TargetBitrate> listener;
     private TargetBitrate target;
     private long targetSequence;
     private long deliveredSequence;
@@ -141,19 +141,6 @@ final class GoogleCongestionController implements CongestionController {
     @Override
     public Pacer pacer() {
         return pacer;
-    }
-
-    @Override
-    @Deprecated(forRemoval = true)
-    public void setTargetListener(Consumer<TargetBitrate> listener) {
-        // TODO: remove once peer.TransportBackend passes the listener in its CongestionConfig (cross-group).
-        Objects.requireNonNull(listener, "listener");
-        lock.lock();
-        try {
-            this.listener = listener;
-        } finally {
-            lock.unlock();
-        }
     }
 
     @Override

@@ -65,8 +65,6 @@ final class JsepEngine {
     static final int SCTP_PORT = 5000;
     /// The largest message Parley accepts, the value browsers advertise.
     static final long MAX_MESSAGE_SIZE = 262144;
-    /// The `a=max-message-size` a section without the attribute implies.
-    static final long DEFAULT_REMOTE_MAX_MESSAGE_SIZE = 65536;
     /// The characters of an ICE username fragment or password.
     private static final String ICE_CHARS = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     /// The length of a generated `a=tls-id`, within the 20 to 255 characters RFC 8842 allows.
@@ -1435,7 +1433,7 @@ final class JsepEngine {
                 var remotePort = remoteSection.attribute(SdpAttribute.SctpPort.class)
                         .map(SdpAttribute.SctpPort::port).orElse(SCTP_PORT);
                 var remoteMax = remoteSection.attribute(SdpAttribute.MaxMessageSize.class)
-                        .map(SdpAttribute.MaxMessageSize::size).orElse(DEFAULT_REMOTE_MAX_MESSAGE_SIZE);
+                        .map(attribute -> OptionalLong.of(attribute.size())).orElseGet(OptionalLong::empty);
                 data = new Negotiated.Data(mid, transportId, SCTP_PORT, remotePort, MAX_MESSAGE_SIZE, remoteMax);
                 dataMid = mid;
                 continue;
@@ -1812,6 +1810,12 @@ final class JsepEngine {
                 var announced = section.attributes(SdpAttribute.Msid.class).stream().map(SdpAttribute.Msid::streamId)
                         .filter(stream -> !stream.equals("-")).collect(java.util.stream.Collectors.toSet());
                 if (!announced.equals(Set.copyOf(transceiver.sender().streams()))) {
+                    return true;
+                }
+                var announcedSsrcs = section.attributes(SdpAttribute.Ssrc.class).stream()
+                        .map(SdpAttribute.Ssrc::ssrc).collect(java.util.stream.Collectors.toSet());
+                if (!announcedSsrcs.isEmpty() && transceiver.sender().layers().stream()
+                        .anyMatch(layer -> !announcedSsrcs.contains(layer.ssrc()))) {
                     return true;
                 }
             }

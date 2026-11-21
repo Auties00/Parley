@@ -64,6 +64,20 @@ interface PeerBackend extends AutoCloseable {
 
         /// A data channel that was open closed.
         void onDataChannelClosed();
+
+        /// The RTP session of a transport moved one of a sender's sources to another SSRC after a collision; the
+        /// next offer must announce it.
+        ///
+        /// @param sender  the sender
+        /// @param oldSsrc the SSRC given up
+        /// @param newSsrc the SSRC used from now on
+        void onSsrcChanged(RtpSender sender, long oldSsrc, long newSsrc);
+
+        /// A transport failed for a reason neither ICE nor DTLS reports, such as its pacer stopping, so the
+        /// connection is failed.
+        ///
+        /// @param transportId the transport
+        void onTransportFailed(String transportId);
     }
 
     /// {@return the fingerprints of the local certificates, which every offer and answer carries}

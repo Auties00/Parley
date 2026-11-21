@@ -1,5 +1,8 @@
 package com.github.auties00.parley.datachannel;
 
+import com.github.auties00.parley.event.EventSource;
+import com.github.auties00.parley.event.EventStream;
+import com.github.auties00.parley.media.Priority;
 import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.nio.channels.ClosedChannelException;
@@ -13,7 +16,6 @@ import java.util.OptionalInt;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.locks.Condition;
 import java.util.concurrent.locks.ReentrantLock;
-import java.util.function.Consumer;
 
 /// A WebRTC data channel: a bidirectional, message-oriented channel carried on one SCTP stream of an
 /// [SctpTransport], as the W3C `RTCDataChannel`.
@@ -57,10 +59,6 @@ public final class DataChannel implements AutoCloseable {
     /// How often a waiter samples the buffered amount.
     private static final long BUFFERED_POLL_NANOS = 5_000_000L;
 
-    /// A sink that drops every event.
-    private static final Consumer<DataChannelEvent> NO_EVENTS = _ -> {
-    };
-
     private final SctpTransport transport;
     private final String label;
     private final DataChannelInit init;
@@ -70,9 +68,8 @@ public final class DataChannel implements AutoCloseable {
     private final long maxInboxBytes;
     private final long maxBufferedAmount;
 
-    /// The receiver of this channel's events, called with [#lock] held; the integration replaces it with an event
-    /// source.
-    private volatile Consumer<DataChannelEvent> eventSink = NO_EVENTS;
+    /// The source of this channel's [#events()]; published to with [#lock] held, which keeps events in order.
+    private final EventSource<DataChannelEvent> events = new EventSource<>();
 
     private int id;
     private DataChannelState state;
@@ -151,7 +148,7 @@ public final class DataChannel implements AutoCloseable {
     }
 
     /// {@return the channel's priority}
-    public DataChannelPriority priority() {
+    public Priority priority() {
         return init.priority();
     }
 
@@ -455,14 +452,17 @@ public final class DataChannel implements AutoCloseable {
         return "DataChannel[label=" + label + ", id=" + id() + ", state=" + readyState() + "]";
     }
 
-    /// Replaces the receiver of this channel's events.
+    /// Opens a stream of this channel's events: [DataChannelEvent.Opened], [DataChannelEvent.BufferedAmountLow],
+    /// [DataChannelEvent.Error], [DataChannelEvent.Closing] and [DataChannelEvent.Closed], in the order they happen.
     ///
-    /// The sink is called with the channel's lock held, in the order the events happen, so it must neither block nor
-    /// call back into the channel.
+    /// The first stream opened also gets the events raised since the channel was created, so a channel received from
+    /// the peer, or created before its transport connected, still reports its opening. The stream ends after
+    /// [DataChannelEvent.Closed].
     ///
-    /// @param sink the receiver
-    void eventSink(Consumer<DataChannelEvent> sink) {
-        this.eventSink = Objects.requireNonNull(sink, "sink");
+    /// @return the stream, which the caller should close when done
+    /// @spec https://www.w3.org/TR/webrtc/#rtcdatachannel WebRTC: Real-Time Communication in Browsers, RTCDataChannel
+    public EventStream<DataChannelEvent> events() {
+        return events.open();
     }
 
     /// {@return the received messages dropped because they would have taken the channel past its receive bound}
@@ -644,13 +644,18 @@ public final class DataChannel implements AutoCloseable {
         publishLocked(new DataChannelEvent.Closed());
     }
 
-    /// Hands an event to the sink; the caller holds [#lock], which keeps events in order.
+    /// Tells the association's listener of an event and publishes it to [#events()], ending them after
+    /// [DataChannelEvent.Closed]; the caller holds [#lock], which keeps events in order.
     private void publishLocked(DataChannelEvent event) {
         try {
-            eventSink.accept(event);
+            transport.channelEventListener().accept(this, event);
         } catch (RuntimeException exception) {
             System.getLogger(DataChannel.class.getName()).log(System.Logger.Level.WARNING,
-                    "a data channel event sink failed", exception);
+                    "a data channel event listener failed", exception);
+        }
+        events.publish(event);
+        if (event instanceof DataChannelEvent.Closed) {
+            events.end();
         }
     }
 
