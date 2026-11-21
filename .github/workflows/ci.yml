@@ -1,6 +1,7 @@
 # Pushes and pull requests: the test suite on each system (unit tests, RFC vectors, fuzzing, and the loopback
-# end-to-end tests of two peer connections over ICE, TURN, DTLS, SRTP and SCTP), then a release dry run that builds the
-# sources and javadoc jars, so a comment doclint rejects fails the change.
+# end-to-end tests of two peer connections over ICE, TURN, DTLS, SRTP and SCTP), a call against headless Chrome for
+# Testing, then a release dry run that builds the sources and javadoc jars, so a comment doclint rejects fails the
+# change.
 name: CI
 
 on:
@@ -50,6 +51,44 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: reports-${{ matrix.os }}
+          path: target/surefire-reports/
+          retention-days: 14
+
+  # A call between Parley and headless Chrome for Testing (offers in both directions: Opus and VP8 from fixtures,
+  # Chrome's fake camera and microphone back, a data channel); the test is tagged chrome and skips itself when no
+  # Chrome is configured, so the other jobs never run it
+  chrome:
+    name: Chrome interop
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '26'
+          cache: maven
+
+      - name: Install Chrome for Testing
+        id: chrome
+        uses: browser-actions/setup-chrome@v1
+        with:
+          chrome-version: stable
+          install-dependencies: true
+
+      - name: Test against Chrome
+        env:
+          PARLEY_CHROME: ${{ steps.chrome.outputs.chrome-path }}
+        run: mvn -B -ntp test -Dgroups=chrome -Dsurefire.failIfNoSpecifiedTests=false
+
+      - name: Upload the test reports
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: reports-chrome
           path: target/surefire-reports/
           retention-days: 14
 

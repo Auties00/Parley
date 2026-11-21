@@ -76,8 +76,20 @@ class PacerTest {
         assertEquals(List.of(Priority.AUDIO, Priority.AUDIO), sent.stream().map(Sent::priority).toList(),
                 "audio is not held back by the debt");
         run(pacer, 2_000 * MS);
-        assertEquals(List.of(Priority.AUDIO, Priority.AUDIO, Priority.RETRANSMISSION, Priority.VIDEO, Priority.FEC,
+        // FEC shares the video level, so the two leave in the order they were scheduled
+        assertEquals(List.of(Priority.AUDIO, Priority.AUDIO, Priority.RETRANSMISSION, Priority.FEC, Priority.VIDEO,
                 Priority.PADDING), sent.stream().map(Sent::priority).toList());
+    }
+
+    @Test
+    @DisplayName("keeps FEC in order with the video of the same stream")
+    void fecWithVideo() {
+        var pacer = pacer(80_000);
+        pacer.schedule(ByteBuffer.allocate(1000), Priority.VIDEO, 1, sink(Priority.VIDEO));
+        pacer.schedule(ByteBuffer.allocate(1000), Priority.FEC, 1, sink(Priority.FEC));
+        pacer.schedule(ByteBuffer.allocate(1000), Priority.VIDEO, 1, sink(Priority.VIDEO));
+        run(pacer, 2_000 * MS);
+        assertEquals(List.of(Priority.VIDEO, Priority.FEC, Priority.VIDEO), sent.stream().map(Sent::priority).toList());
     }
 
     @Test

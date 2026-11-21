@@ -428,6 +428,29 @@ class PeerConnectionScenariosTest {
         }
     }
 
+    @Test
+    @DisplayName("lowers the target bitrate below a constrained link's capacity and recovers once it is lifted")
+    void constrainedLink() throws Exception {
+        var stack = LoopbackOnlyStack.create();
+        try (var a = peer(builder -> builder.networkStack(stack)); var b = peer()) {
+            var track = LocalTrack.video("cam");
+            a.pc.addTransceiver(track, TransceiverInit.of(TransceiverDirection.SENDONLY));
+            connect(a, b);
+            var remote = b.await(PeerConnectionEvent.Track.class, event -> true).receiver().track();
+            try (var _ = videoWriter(track, 6000, List.of())) {
+                assertFrames(remote, 15);
+                var rampUp = waitForTarget(track, target -> target > 600_000);
+                assertTrue(rampUp > 600_000, "the target rose to " + rampUp);
+                stack.setBandwidth(300_000, Duration.ofMillis(300));
+                var constrained = waitForTarget(track, target -> target < 450_000);
+                assertTrue(constrained < 450_000, "the target fell to " + constrained + " on a 300 kbps link");
+                stack.setBandwidth(0, Duration.ZERO);
+                var recovered = waitForTarget(track, target -> target > 600_000);
+                assertTrue(recovered > 600_000, "the target rose from " + constrained + " to only " + recovered);
+            }
+        }
+    }
+
     /// Waits until the track's target bitrate satisfies `condition`, returning the last target.
     static long waitForTarget(LocalTrack track, java.util.function.LongPredicate condition) throws Exception {
         var deadline = System.nanoTime() + Loopback.TIMEOUT.toNanos();

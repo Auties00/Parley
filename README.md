@@ -309,6 +309,8 @@ SDP, while `RtpSession` and the payload formats work on top of it as usual.
 - Parley does not capture, encode, decode or render media; pair it with a codec library.
 - DTLS 1.3 is verified against itself and the RFC test vectors; browsers still negotiate DTLS 1.2 by default.
 - Plan B SDP, the identity provider API, TURN over DTLS and RTP over QUIC are not supported, as no browser ships them.
+- The interop test against Chrome (tagged `chrome`) runs only when `PARLEY_CHROME` (or `-Dparley.chrome`) names a
+  Chrome executable, Chrome for Testing in CI: `PARLEY_CHROME=/path/to/chrome mvn test -Dgroups=chrome`.
 
 ## License
 

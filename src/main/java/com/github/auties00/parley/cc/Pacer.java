@@ -19,8 +19,10 @@ import java.util.concurrent.locks.ReentrantLock;
 /// A leaky-bucket packet pacer: holds the RTP packets an RTP session would send and releases them at the pacing rate, highest [OutgoingPacketScheduler.Priority] first, so a keyframe does
 /// not leave the host as one burst that overflows a bottleneck queue.
 ///
-/// Within the order `AUDIO`, `RETRANSMISSION`, `VIDEO`, `FEC`, `PADDING`, packets of the same priority leave in the
-/// order they were scheduled. Audio is sent as soon as it is scheduled unless the configuration paces it. When the
+/// Within the order `AUDIO`, `RETRANSMISSION`, `VIDEO` and `FEC` together, `PADDING`, packets of the same level leave
+/// in the order they were scheduled. Video and FEC share a level because ULPFEC travels in RED on the media stream's
+/// source and sequence space: a FEC packet queued behind later video would leave a gap the receiver counts as loss
+/// and asks to retransmit, and a sender that writes faster than the pacing rate would starve it outright. Audio is sent as soon as it is scheduled unless the configuration paces it. When the
 /// queue would take longer than the configured maximum queue time to drain at the pacing rate, the pacer raises its
 /// rate until it would not.
 ///
@@ -167,7 +169,7 @@ public final class Pacer implements OutgoingPacketScheduler, AutoCloseable {
                 return;
             }
             var queued = new Queued(plainRtp, priority, ssrc, sink, now, plainRtp.remaining());
-            queues.get(priority).addLast(queued);
+            queues.get(level(priority)).addLast(queued);
             queuedBytes += queued.size();
             queuedPackets++;
             signalled = true;
@@ -175,6 +177,13 @@ public final class Pacer implements OutgoingPacketScheduler, AutoCloseable {
         } finally {
             lock.unlock();
         }
+    }
+
+    /// {@return the queue a priority is held in: FEC shares the video queue}
+    ///
+    /// @param priority the priority of a scheduled packet
+    private static Priority level(Priority priority) {
+        return priority == Priority.FEC ? Priority.VIDEO : priority;
     }
 
     /// Sets the rate media leaves the pacer at; the pacer also takes it as the rate the senders aim for when it
@@ -622,7 +631,7 @@ public final class Pacer implements OutgoingPacketScheduler, AutoCloseable {
     }
 
     private Queued poll(Priority priority) {
-        var packet = queues.get(priority).pollFirst();
+        var packet = queues.get(level(priority)).pollFirst();
         if (packet != null) {
             queuedBytes -= packet.size();
             queuedPackets--;

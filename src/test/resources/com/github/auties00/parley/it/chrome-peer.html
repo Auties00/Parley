@@ -1,0 +1,90 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Parley interop peer</title>
+<!--
+  The browser side of the Chrome interop test. With ?role=answer it answers the offer GET /offer returns and sends
+  the fake camera and microphone back on the offered transceivers; with ?role=offer it offers the fake camera and
+  microphone and a data channel, POSTs the offer to /offer and applies the answer GET /answer returns. Either way it
+  greets on and echoes every data channel message, and POSTs its state to /report every 500 ms as key=value lines.
+-->
+<audio id="audio" autoplay></audio>
+<video id="video" autoplay muted playsinline></video>
+<script>
+const log = text => fetch('/log', {method: 'POST', body: String(text)}).catch(() => {});
+const state = {dcOpen: 0, dcReceived: '', tracks: 0};
+
+(async () => {
+  try {
+    const pc = new RTCPeerConnection();
+    const media = await navigator.mediaDevices.getUserMedia({audio: true, video: {width: 320, height: 240}});
+    pc.ontrack = event => {
+      state.tracks++;
+      const element = document.getElementById(event.track.kind);
+      element.srcObject = new MediaStream([event.track]);
+      element.play().catch(error => log('play: ' + error));
+    };
+    const setup = channel => {
+      const opened = () => { if (state.dcOpen) return; state.dcOpen = 1; channel.send('hello from chrome'); };
+      channel.onopen = opened;
+      channel.onmessage = message => { state.dcReceived = String(message.data); channel.send('echo:' + message.data); };
+      if (channel.readyState === 'open') opened();
+    };
+    pc.ondatachannel = event => setup(event.channel);
+    pc.onconnectionstatechange = () => log('connection ' + pc.connectionState);
+    const gathered = () => new Promise(resolve => {
+      if (pc.iceGatheringState === 'complete') return resolve();
+      pc.addEventListener('icegatheringstatechange', () => pc.iceGatheringState === 'complete' && resolve());
+      setTimeout(resolve, 5000);
+    });
+
+    if (new URLSearchParams(location.search).get('role') === 'offer') {
+      for (const track of media.getTracks()) pc.addTrack(track, media);
+      setup(pc.createDataChannel('chat'));
+      await pc.setLocalDescription(await pc.createOffer());
+      await gathered();
+      await fetch('/offer', {method: 'POST', body: pc.localDescription.sdp});
+      const answer = await (await fetch('/answer')).text();
+      await pc.setRemoteDescription({type: 'answer', sdp: answer});
+    } else {
+      const offer = await (await fetch('/offer')).text();
+      await pc.setRemoteDescription({type: 'offer', sdp: offer});
+      for (const transceiver of pc.getTransceivers()) {
+        const track = media.getTracks().find(t => t.kind === transceiver.receiver.track.kind);
+        if (track) {
+          await transceiver.sender.replaceTrack(track);
+          transceiver.direction = 'sendrecv';
+        }
+      }
+      await pc.setLocalDescription(await pc.createAnswer());
+      await gathered();
+      await fetch('/answer', {method: 'POST', body: pc.localDescription.sdp});
+    }
+
+    setInterval(async () => {
+      const lines = ['connectionState=' + pc.connectionState, 'dcOpen=' + state.dcOpen,
+        'dcReceived=' + state.dcReceived, 'tracks=' + state.tracks];
+      (await pc.getStats()).forEach(s => {
+        if (s.type === 'inbound-rtp') {
+          lines.push(s.kind + '.packetsReceived=' + (s.packetsReceived || 0));
+          lines.push(s.kind + '.codec=' + (s.codecId || ''));
+          if (s.kind === 'video') {
+            lines.push('video.framesDecoded=' + (s.framesDecoded || 0));
+            lines.push('video.keyFramesDecoded=' + (s.keyFramesDecoded || 0));
+            lines.push('video.frameWidth=' + (s.frameWidth || 0));
+          } else {
+            lines.push('audio.totalSamplesReceived=' + (s.totalSamplesReceived || 0));
+            lines.push('audio.concealedSamples=' + (s.concealedSamples || 0));
+          }
+        } else if (s.type === 'outbound-rtp') {
+          lines.push(s.kind + '.packetsSent=' + (s.packetsSent || 0));
+        } else if (s.type === 'codec') {
+          lines.push('codec.' + s.id + '=' + s.mimeType);
+        }
+      });
+      fetch('/report', {method: 'POST', body: lines.join('\n')}).catch(() => {});
+    }, 500);
+  } catch (error) {
+    log('error: ' + error + ' ' + (error.stack || ''));
+  }
+})();
+</script>

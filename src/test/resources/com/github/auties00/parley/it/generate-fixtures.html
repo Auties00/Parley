@@ -1,0 +1,74 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Parley interop fixtures</title>
+<!--
+  Writes the encoded fixtures the Chrome interop test sends: one second of VP8 (320x240, 30 fps, a key frame first)
+  and one second of Opus (48 kHz mono, 20 ms frames, a 440 Hz tone), both from WebCodecs. Served by any HTTP server
+  that stores the bodies POSTed to /fixture/vp8 and /fixture/opus. Each body is a sequence of frames, each written as
+  one flag byte (1 for a key frame), a big-endian 32-bit length and the encoded bytes.
+-->
+<script>
+function pack(chunks) {
+  let size = 0;
+  for (const c of chunks) size += 5 + c.data.byteLength;
+  const out = new Uint8Array(size);
+  const view = new DataView(out.buffer);
+  let at = 0;
+  for (const c of chunks) {
+    out[at] = c.key ? 1 : 0;
+    view.setUint32(at + 1, c.data.byteLength);
+    out.set(c.data, at + 5);
+    at += 5 + c.data.byteLength;
+  }
+  return out;
+}
+
+async function video() {
+  const chunks = [];
+  const encoder = new VideoEncoder({
+    output: chunk => { const data = new Uint8Array(chunk.byteLength); chunk.copyTo(data); chunks.push({key: chunk.type === 'key', data}); },
+    error: e => { throw e; }
+  });
+  encoder.configure({codec: 'vp8', width: 320, height: 240, bitrate: 300000, framerate: 30});
+  const canvas = new OffscreenCanvas(320, 240);
+  const g = canvas.getContext('2d');
+  for (let i = 0; i < 30; i++) {
+    g.fillStyle = `hsl(${i * 12}, 70%, 50%)`;
+    g.fillRect(0, 0, 320, 240);
+    g.fillStyle = '#fff';
+    g.fillRect(10 + i * 9, 100, 40, 40);
+    const frame = new VideoFrame(canvas, {timestamp: i * 33333});
+    encoder.encode(frame, {keyFrame: i === 0});
+    frame.close();
+  }
+  await encoder.flush();
+  return pack(chunks);
+}
+
+async function audio() {
+  const chunks = [];
+  const encoder = new AudioEncoder({
+    output: chunk => { const data = new Uint8Array(chunk.byteLength); chunk.copyTo(data); chunks.push({key: true, data}); },
+    error: e => { throw e; }
+  });
+  encoder.configure({codec: 'opus', sampleRate: 48000, numberOfChannels: 1, bitrate: 32000,
+    opus: {frameDuration: 20000}});
+  const samples = new Float32Array(48000);
+  for (let i = 0; i < samples.length; i++) samples[i] = 0.3 * Math.sin(2 * Math.PI * 440 * i / 48000);
+  const data = new AudioData({format: 'f32', sampleRate: 48000, numberOfFrames: 48000, numberOfChannels: 1,
+    timestamp: 0, data: samples});
+  encoder.encode(data);
+  await encoder.flush();
+  return pack(chunks);
+}
+
+(async () => {
+  try {
+    await fetch('/fixture/vp8', {method: 'POST', body: await video()});
+    await fetch('/fixture/opus', {method: 'POST', body: await audio()});
+    await fetch('/done', {method: 'POST', body: 'ok'});
+  } catch (e) {
+    await fetch('/done', {method: 'POST', body: 'error: ' + e});
+  }
+})();
+</script>
