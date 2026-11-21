@@ -4,7 +4,7 @@ import com.github.auties00.parley.media.EncodedFrame;
 import com.github.auties00.parley.rtp.RtpFormatException;
 import com.github.auties00.parley.rtp.RtpPacket;
 import com.github.auties00.parley.rtp.extension.DependencyDescriptor;
-import com.github.auties00.parley.rtp.extension.TemplateStructure;
+import com.github.auties00.parley.rtp.extension.DependencyDescriptor.TemplateStructure;
 
 import java.nio.ByteBuffer;
 import java.util.ArrayList;

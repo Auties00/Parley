@@ -25,8 +25,10 @@ import java.util.concurrent.locks.ReentrantLock;
 /// rate until it would not.
 ///
 /// The pacer also sends the probes of its [CongestionController] and keeps up the padding rate, taking the bytes
-/// the media queue cannot supply from the [PaddingSource] the session installs with
-/// [#setPaddingSource(PaddingSource)].
+/// the media queue cannot supply from the padding source the RTP session installs with
+/// [#setPaddingSource(OutgoingPacketScheduler.PaddingSource)], or from a
+/// [com.github.auties00.parley.cc.PaddingSource] given to
+/// [#setPaddingSource(com.github.auties00.parley.cc.PaddingSource)].
 ///
 /// # Threading
 ///
@@ -113,7 +115,8 @@ public final class Pacer implements OutgoingPacketScheduler, AutoCloseable {
     private boolean mediaSent;
     private boolean signalled;
     private boolean closed;
-    private PaddingSource paddingSource;
+    private com.github.auties00.parley.cc.PaddingSource paddingSource;
+    private OutgoingPacketScheduler.PaddingSource sessionPaddingSource;
     private long sentPackets;
     private long sentBytes;
     private long failedPackets;
@@ -225,7 +228,7 @@ public final class Pacer implements OutgoingPacketScheduler, AutoCloseable {
     /// carry only queued media and no padding is sent.
     ///
     /// @param source the padding source
-    public void setPaddingSource(PaddingSource source) {
+    public void setPaddingSource(com.github.auties00.parley.cc.PaddingSource source) {
         Objects.requireNonNull(source, "source");
         lock.lock();
         try {
@@ -439,12 +442,18 @@ public final class Pacer implements OutgoingPacketScheduler, AutoCloseable {
                 account(packet.size(), probe, sent, nowNanos);
             }
             case Action.Padding(var bytes, var probe) -> {
-                PaddingSource source;
+                com.github.auties00.parley.cc.PaddingSource source;
+                OutgoingPacketScheduler.PaddingSource sessionSource;
                 lock.lock();
                 try {
                     source = paddingSource;
+                    sessionSource = sessionPaddingSource;
                 } finally {
                     lock.unlock();
+                }
+                if (source == null && sessionSource != null) {
+                    sendSessionPadding(sessionSource, bytes, probe, nowNanos);
+                    return;
                 }
                 List<PaddingPacket> packets;
                 try {
@@ -473,6 +482,51 @@ public final class Pacer implements OutgoingPacketScheduler, AutoCloseable {
                 }
             }
         }
+    }
+
+    /// Installs the padding source of an RTP session, which sends the padding itself through its own send path; a
+    /// source given to [#setPaddingSource(com.github.auties00.parley.cc.PaddingSource)] takes precedence.
+    ///
+    /// @param source the session's padding source
+    @Override
+    public void setPaddingSource(OutgoingPacketScheduler.PaddingSource source) {
+        Objects.requireNonNull(source, "source");
+        lock.lock();
+        try {
+            sessionPaddingSource = source;
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    /// Asks a session's padding source for `bytes` of padding inside the probe binding, and accounts what it sent.
+    private void sendSessionPadding(OutgoingPacketScheduler.PaddingSource source, int bytes, ProbeState probe,
+                                    long nowNanos) {
+        int sent;
+        try {
+            if (probe == null) {
+                sent = source.sendPadding(bytes, false);
+            } else {
+                sent = ScopedValue.where(PROBE, probe.cluster).call(() -> source.sendPadding(bytes, true));
+            }
+        } catch (IOException | RuntimeException exception) {
+            LOGGER.log(System.Logger.Level.DEBUG, "The session's padding source failed", exception);
+            sent = 0;
+        }
+        if (sent <= 0) {
+            lock.lock();
+            try {
+                if (probe != null) {
+                    probes.remove(probe);
+                } else {
+                    paddingDebtBytes += bytes;
+                }
+            } finally {
+                lock.unlock();
+            }
+            return;
+        }
+        account(sent, probe, true, nowNanos);
     }
 
     private boolean send(ByteBuffer packet, PacketSink sink, ProbeState probe) {
