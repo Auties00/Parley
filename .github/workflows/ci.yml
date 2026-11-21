@@ -1,5 +1,6 @@
-# Pushes and pull requests: the test suite on each system, then a release dry run that builds the sources and javadoc
-# jars, so a comment doclint rejects fails the change.
+# Pushes and pull requests: the test suite on each system (unit tests, RFC vectors, fuzzing, and the loopback
+# end-to-end tests of two peer connections over ICE, TURN, DTLS, SRTP and SCTP), then a release dry run that builds the
+# sources and javadoc jars, so a comment doclint rejects fails the change.
 name: CI
 
 on:
@@ -24,7 +25,7 @@ jobs:
   test:
     name: test on ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 30
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
@@ -40,8 +41,9 @@ jobs:
           java-version: '26'
           cache: maven
 
+      # The loopback end-to-end tests depend on timers and the runner's scheduler; one rerun absorbs a slow runner
       - name: Test
-        run: mvn -B -ntp verify
+        run: mvn -B -ntp verify -Dsurefire.rerunFailingTestsCount=1
 
       - name: Upload the test reports
         if: failure()

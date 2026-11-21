@@ -1,0 +1,30 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="320" viewBox="0 0 1280 320" role="img" aria-label="Parley: pure-Java WebRTC">
+  <defs>
+    <linearGradient id="sky" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#0b0e14"/>
+      <stop offset="1" stop-color="#141c2e"/>
+    </linearGradient>
+    <linearGradient id="wave" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#2f81f7"/>
+      <stop offset="0.5" stop-color="#a371f7"/>
+      <stop offset="1" stop-color="#f89820"/>
+    </linearGradient>
+  </defs>
+  <rect width="1280" height="320" fill="url(#sky)"/>
+  <g fill="none" stroke="url(#wave)" stroke-width="3" opacity="0.85">
+    <path d="M0 230 C 160 170, 320 290, 480 230 S 800 170, 960 230 S 1200 290, 1280 230"/>
+    <path d="M0 250 C 160 200, 320 300, 480 250 S 800 200, 960 250 S 1200 300, 1280 250" opacity="0.5"/>
+    <path d="M0 270 C 160 230, 320 310, 480 270 S 800 230, 960 270 S 1200 310, 1280 270" opacity="0.25"/>
+  </g>
+  <g fill="#2f81f7">
+    <circle cx="250" cy="120" r="34" opacity="0.9"/>
+    <circle cx="1030" cy="120" r="34" fill="#f89820" opacity="0.9"/>
+  </g>
+  <g stroke="#a371f7" stroke-width="2" stroke-dasharray="6 10" opacity="0.8">
+    <line x1="292" y1="120" x2="988" y2="120"/>
+  </g>
+  <text x="640" y="112" text-anchor="middle" font-family="Segoe UI, Helvetica, Arial, sans-serif" font-size="72"
+        font-weight="700" letter-spacing="18" fill="#e6edf3">PARLEY</text>
+  <text x="640" y="160" text-anchor="middle" font-family="Segoe UI, Helvetica, Arial, sans-serif" font-size="24"
+        fill="#9da7b3">A pure-Java, codec-agnostic WebRTC stack</text>
+</svg>
