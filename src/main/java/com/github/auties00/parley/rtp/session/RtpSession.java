@@ -905,7 +905,8 @@ public final class RtpSession implements AutoCloseable {
             var value = abs.get();
             absValue = OptionalInt.of((value.get(0) & 0xFF) << 16 | (value.get(1) & 0xFF) << 8 | value.get(2) & 0xFF);
         }
-        return new PacketArrival(packet.ssrc(), packet.length(), transportSequenceValue, absValue, arrivalNanos);
+        return new PacketArrival(packet.ssrc(), packet.sequence(), packet.length(), transportSequenceValue, absValue,
+                arrivalNanos);
     }
 
     private Optional<RtpReceiveStream> route(RtpPacket packet, long arrivalNanos, RtpReceiveStream.Work work) {

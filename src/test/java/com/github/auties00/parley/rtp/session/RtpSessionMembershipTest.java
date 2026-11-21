@@ -315,7 +315,11 @@ class RtpSessionMembershipTest {
                     ccfb.add(feedback);
                 }
             };
-            var session = net.session(net.left, 10).extensions(EXTENSIONS).feedbackObserver(observer).build();
+            var arrivals = new ArrayList<PacketArrival>();
+            var session = net.session(net.left, 10).extensions(EXTENSIONS).feedbackObserver(observer)
+                    .arrivalObserver(arrivals::add).build();
+            injectRtp(net, rtp(4321, 77));
+            assertEquals(77, arrivals.getFirst().sequence());
             assertTrue(session.roundTripTime().isEmpty());
             var stream = session.createSendStream(video().build());
             for (var i = 0; i < 3; i++) {

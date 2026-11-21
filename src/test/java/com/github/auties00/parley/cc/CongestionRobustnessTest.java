@@ -139,7 +139,8 @@ class CongestionRobustnessTest {
         }
 
         @Test
-        @DisplayName("fills the congestion window when feedback stops, then drains it with feedback")
+        @DisplayName("fills the congestion window when feedback stops, then drains it with feedback, lost feedback "
+                + "included")
         void congestionWindow() {
             var controller = controller();
             for (var sequence = 0; sequence < 10; sequence++) {
@@ -159,11 +160,11 @@ class CongestionRobustnessTest {
             }
             assertTrue(controller.pacer().isCongested(), "in flight: " + controller.bytesInFlight());
             var drained = new ArrayList<TransportFeedback.PacketResult>();
-            for (var sequence = 10; sequence < 200; sequence++) {
+            for (var sequence = 100; sequence < 200; sequence++) {
                 drained.add(TransportFeedback.PacketResult.received(sequence, 250));
             }
             clock.advanceMillis(100);
-            controller.onTransportFeedback(new TransportFeedback(2, 1, 10, 18, 1, drained), clock.nanos());
+            controller.onTransportFeedback(new TransportFeedback(2, 1, 100, 18, 1, drained), clock.nanos());
             assertEquals(0, controller.bytesInFlight());
             assertFalse(controller.pacer().isCongested());
         }

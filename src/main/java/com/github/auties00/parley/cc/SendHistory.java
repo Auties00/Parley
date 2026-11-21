@@ -14,8 +14,9 @@ import java.util.Optional;
 /// has wrapped halfway. Per SSRC it keeps the last [#SSRC_CAPACITY] packets of at most [#MAX_SSRCS] SSRCs (local
 /// send streams, so the bound is never reached in practice).
 ///
-/// The history also counts the bytes in flight: packets that no feedback has reported yet, received or lost. A
-/// packet that leaves the history unreported stops counting.
+/// The history also counts the bytes in flight: packets sent after the newest one any feedback reported, received or
+/// lost. A packet older than a reported one, or that leaves the history, stops counting, so a lost feedback
+/// message cannot leave its packets in flight for good.
 final class SendHistory {
     /// The packets kept by transport-wide sequence number: half the 16-bit sequence space.
     static final int CAPACITY = 1 << 15;
@@ -52,6 +53,7 @@ final class SendHistory {
     private long lastSequence;
     private boolean any;
     private long bytesInFlight;
+    private long settledBelow;
     private long uses;
 
     /// Creates an empty history.
@@ -141,10 +143,22 @@ final class SendHistory {
         if (get(unwrappedSequence).isEmpty()) {
             return;
         }
+        var from = Math.max(settledBelow, unwrappedSequence - CAPACITY + 1);
+        for (var sequence = from; sequence <= unwrappedSequence; sequence++) {
+            settle(sequence);
+        }
+        settledBelow = Math.max(settledBelow, unwrappedSequence + 1);
+    }
+
+    /// Stops counting one packet in flight. A packet older than one a feedback reported, which no feedback named
+    /// (its feedback was lost), is settled with it, as libwebrtc counts in flight only what follows the newest
+    /// acknowledged packet.
+    private void settle(long unwrappedSequence) {
         var slot = (int) (unwrappedSequence & (CAPACITY - 1));
-        if (!reported[slot]) {
+        var packet = packets[slot];
+        if (packet != null && packet.sequence() == unwrappedSequence && !reported[slot]) {
             reported[slot] = true;
-            bytesInFlight -= packets[slot].sizeBytes();
+            bytesInFlight -= packet.sizeBytes();
         }
     }
 
@@ -168,6 +182,18 @@ final class SendHistory {
             markReported(packet.sequence());
         } else {
             bytesInFlight -= packet.sizeBytes();
+        }
+        for (var back = 1; back < SSRC_CAPACITY; back++) {
+            var older = (rtpSequence - back) & 0xFFFF;
+            var olderSlot = older & (SSRC_CAPACITY - 1);
+            var olderPacket = ring.packets[olderSlot];
+            if (olderPacket == null || ring.sequences[olderSlot] != older || ring.reported[olderSlot]) {
+                break;
+            }
+            ring.reported[olderSlot] = true;
+            if (olderPacket.sequence() < 0) {
+                bytesInFlight -= olderPacket.sizeBytes();
+            }
         }
         return Optional.of(packet);
     }
