@@ -174,6 +174,8 @@ public final class SctpTransport implements AutoCloseable {
         var receiveWindow = Math.clamp(Math.max(config.maxMessageSize() * 2, 5_242_880L), 0, Integer.MAX_VALUE);
         SctpSocket connected;
         try {
+            // TODO: the sctp library starts its reader, timer and writer threads with Thread.ofVirtual() instead of
+            //  a caller-supplied factory; pass config.threadFactory() once its builder accepts one.
             connected = SctpSocket.builder(channel)
                     .name("parley-sctp")
                     .localPort(config.localPort())
@@ -615,6 +617,8 @@ public final class SctpTransport implements AutoCloseable {
                     lock.unlock();
                 }
                 if (channel == null) {
+                    // TODO: buffer messages that arrive on a stream before the application creates the negotiated
+                    //  channel for it, as browsers do, instead of dropping them.
                     LOGGER.log(System.Logger.Level.DEBUG, "Dropping a message on unknown stream {0}", streamId);
                     continue;
                 }

@@ -570,6 +570,8 @@ public final class DataChannel implements AutoCloseable {
             if (remaining <= 0) {
                 return false;
             }
+            // TODO: wait on the association's buffered-amount-low event instead of sampling once the sctp socket
+            //  exposes it; it currently consumes the event internally.
             lock.lock();
             try {
                 changed.await(Math.min(remaining, BUFFERED_POLL_NANOS), TimeUnit.NANOSECONDS);

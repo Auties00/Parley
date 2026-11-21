@@ -81,6 +81,8 @@ public final class TransportFeedbackGenerator implements AutoCloseable {
         this.wake = lock.newCondition();
         this.unwrapper = new SequenceUnwrapper(16);
         this.arrivals = new TreeMap<>();
+        // TODO: adapt the interval to the incoming rate (50 to 250 ms, feedback kept near 5% of the media rate) as
+        //  libwebrtc does; it stays at the configured value.
         this.intervalNanos = DEFAULT_INTERVAL.toNanos();
     }
 
