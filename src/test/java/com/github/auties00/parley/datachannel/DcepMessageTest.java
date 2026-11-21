@@ -70,7 +70,7 @@ class DcepMessageTest {
     @Test
     @DisplayName("encodes UTF-8 labels and ignores the reliability parameter of reliable channels")
     void utf8AndReliableParameter() {
-        var label = "café ☃";
+        var label = "caf\u00e9 \u2603";
         var open = new DcepMessage.Open(DcepMessage.RELIABLE, 256, 0, label, "");
         var encoded = bytes(open.encode());
         assertEquals(12 + label.getBytes(java.nio.charset.StandardCharsets.UTF_8).length, encoded.length);

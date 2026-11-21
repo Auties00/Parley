@@ -137,11 +137,11 @@ class SctpTransportTest {
         var pair = connectedPair();
         var local = pair[0].createDataChannel("data", DataChannelInit.reliable());
         var remote = pair[1].acceptDataChannel(TIMEOUT).orElseThrow();
-        local.send("hello, è世界");
+        local.send("hello, \u00e8\u4e16\u754c");
         local.send(ByteBuffer.wrap(new byte[]{1, 2, 3}));
         local.send("");
         local.send(ByteBuffer.allocate(0));
-        assertEquals(new DataChannelMessage.Text("hello, è世界"), remote.receive());
+        assertEquals(new DataChannelMessage.Text("hello, \u00e8\u4e16\u754c"), remote.receive());
         var binary = assertInstanceOf(DataChannelMessage.Binary.class, remote.receive());
         assertArrayEquals(new byte[]{1, 2, 3}, binary.toByteArray());
         assertEquals(new DataChannelMessage.Text(""), remote.receive());
@@ -151,7 +151,7 @@ class SctpTransportTest {
         assertEquals(new DataChannelMessage.Text("back"), local.receive(TIMEOUT).orElseThrow());
         var sent = local.statistics();
         assertEquals(4, sent.messagesSent());
-        assertEquals("hello, è世界".getBytes(StandardCharsets.UTF_8).length + 3, sent.bytesSent());
+        assertEquals("hello, \u00e8\u4e16\u754c".getBytes(StandardCharsets.UTF_8).length + 3, sent.bytesSent());
         assertEquals(4, remote.statistics().messagesReceived());
     }
 
@@ -212,6 +212,29 @@ class SctpTransportTest {
         var received = remote.receive(TIMEOUT).orElseThrow();
         assertEquals(new DataChannelMessage.Text("after"), received);
         assertTrue(remote.receive(Duration.ofMillis(1500)).isEmpty(), "the dropped message is never retransmitted");
+    }
+
+    @Test
+    @DisplayName("abandons messages of a timed channel once their lifetime expires")
+    void timedReliability() throws Exception {
+        var pipe = LoopbackDatagramTransport.pair();
+        var pair = connectedPair(SctpConfig.defaults(), SctpConfig.defaults(), pipe);
+        var local = pair[0].createDataChannel("timed",
+                DataChannelInit.reliable().withMaxPacketLifeTime(Duration.ofMillis(50)));
+        var remote = pair[1].acceptDataChannel(TIMEOUT).orElseThrow();
+        assertEquals(Duration.ofMillis(50), remote.maxPacketLifeTime().orElseThrow());
+        local.send("first");
+        assertEquals(new DataChannelMessage.Text("first"), remote.receive(TIMEOUT).orElseThrow());
+        var dropping = new java.util.concurrent.atomic.AtomicBoolean(true);
+        var base = pipe[0].sentDatagrams();
+        pipe[0].setDrop(index -> dropping.get() && index >= base);
+        local.send("expired");
+        Thread.sleep(700);
+        dropping.set(false);
+        local.send("fresh");
+        assertEquals(new DataChannelMessage.Text("fresh"), remote.receive(TIMEOUT).orElseThrow(),
+                "the ordered channel skips the expired message instead of waiting for it");
+        assertTrue(remote.receive(Duration.ofMillis(1500)).isEmpty());
     }
 
     @Test

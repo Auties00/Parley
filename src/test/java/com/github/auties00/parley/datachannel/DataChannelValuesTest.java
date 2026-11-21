@@ -84,7 +84,7 @@ class DataChannelValuesTest {
         assertEquals(3, message.value().remaining());
         assertEquals(message, new DataChannelMessage.Binary(ByteBuffer.wrap(new byte[]{1, 2, 3})));
         assertNotEquals(message, new DataChannelMessage.Binary(ByteBuffer.wrap(new byte[]{1, 2})));
-        assertEquals(6, new DataChannelMessage.Text("ééé").sizeBytes());
+        assertEquals(6, new DataChannelMessage.Text("\u00e9\u00e9\u00e9").sizeBytes());
     }
 
     @Test
