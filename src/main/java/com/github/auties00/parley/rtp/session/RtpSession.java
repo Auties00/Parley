@@ -63,7 +63,7 @@ import java.util.random.RandomGenerator;
 ///
 /// # Congestion control
 ///
-/// Outgoing packets go through an [OutgoingPacketScheduler] (by default sent immediately); the [PacketSink] it calls
+/// Outgoing packets go through an [OutgoingPacketScheduler] (by default sent immediately); the [OutgoingPacketScheduler.PacketSink] it calls
 /// stamps the transport-wide sequence number and the absolute send time at the moment of sending and reports every
 /// packet to the [TransportFeedbackObserver], which also receives every transport-wide feedback, REMB and reception
 /// report. On the receive side every packet's arrival is reported to the arrival observer, from which transport-wide
