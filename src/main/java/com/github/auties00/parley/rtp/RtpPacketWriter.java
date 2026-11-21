@@ -2,7 +2,7 @@ package com.github.auties00.parley.rtp;
 
 import java.nio.BufferOverflowException;
 import java.nio.ByteBuffer;
-import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
 import java.util.Objects;
 
@@ -44,8 +44,9 @@ public final class RtpPacketWriter {
     private long timestamp;
     private long ssrc;
     private List<Long> csrcs = List.of();
-    private final List<Integer> extensionIds = new ArrayList<>(4);
-    private final List<ByteBuffer> extensionValues = new ArrayList<>(4);
+    private int[] extensionIds = new int[4];
+    private ByteBuffer[] extensionValues = new ByteBuffer[4];
+    private int extensionCount;
     private boolean twoByte;
     private ByteBuffer payload = EMPTY;
     private int padding;
@@ -155,14 +156,21 @@ public final class RtpPacketWriter {
         if (id < 1 || id > 255) {
             throw new IllegalArgumentException("extension id must be in 1..255: " + id);
         }
-        if (extensionIds.contains(id)) {
-            throw new IllegalArgumentException("extension id already added: " + id);
+        for (var index = 0; index < extensionCount; index++) {
+            if (extensionIds[index] == id) {
+                throw new IllegalArgumentException("extension id already added: " + id);
+            }
         }
         if (value.remaining() > 255) {
             throw new IllegalArgumentException("extension value longer than 255 bytes: " + value.remaining());
         }
-        extensionIds.add(id);
-        extensionValues.add(value);
+        if (extensionCount == extensionIds.length) {
+            extensionIds = Arrays.copyOf(extensionIds, extensionCount * 2);
+            extensionValues = Arrays.copyOf(extensionValues, extensionCount * 2);
+        }
+        extensionIds[extensionCount] = id;
+        extensionValues[extensionCount] = value;
+        extensionCount++;
         return this;
     }
 
@@ -208,9 +216,9 @@ public final class RtpPacketWriter {
         if (twoByte) {
             return true;
         }
-        for (var i = 0; i < extensionIds.size(); i++) {
-            var length = extensionValues.get(i).remaining();
-            if (extensionIds.get(i) > 14 || length == 0 || length > 16) {
+        for (var i = 0; i < extensionCount; i++) {
+            var length = extensionValues[i].remaining();
+            if (extensionIds[i] > 14 || length == 0 || length > 16) {
                 return true;
             }
         }
@@ -219,15 +227,15 @@ public final class RtpPacketWriter {
 
     private int extensionDataLength(boolean twoByteForm) {
         var total = 0;
-        for (var value : extensionValues) {
-            total += (twoByteForm ? 2 : 1) + value.remaining();
+        for (var i = 0; i < extensionCount; i++) {
+            total += (twoByteForm ? 2 : 1) + extensionValues[i].remaining();
         }
         return (total + 3) & ~3;
     }
 
     private int headerLength() {
         var length = RtpPacket.FIXED_HEADER_LENGTH + 4 * csrcs.size();
-        if (!extensionIds.isEmpty()) {
+        if (extensionCount > 0) {
             length += 4 + extensionDataLength(useTwoByte());
         }
         return length;
@@ -250,7 +258,7 @@ public final class RtpPacketWriter {
         }
         finished = true;
         var start = destination.position();
-        var hasExtension = !extensionIds.isEmpty();
+        var hasExtension = extensionCount > 0;
         var first = 0x80 | (padding > 0 ? 0x20 : 0) | (hasExtension ? 0x10 : 0) | csrcs.size();
         destination.put((byte) first);
         destination.put((byte) ((marker ? 0x80 : 0) | payloadType));
@@ -266,22 +274,22 @@ public final class RtpPacketWriter {
             destination.putShort((short) (twoByteForm ? RtpPacket.TWO_BYTE_PROFILE : RtpPacket.ONE_BYTE_PROFILE));
             destination.putShort((short) (dataLength / 4));
             var dataStart = destination.position();
-            for (var i = 0; i < extensionIds.size(); i++) {
-                var value = extensionValues.get(i);
-                var id = extensionIds.get(i);
+            for (var i = 0; i < extensionCount; i++) {
+                var value = extensionValues[i];
+                var id = extensionIds[i];
                 if (twoByteForm) {
-                    destination.put((byte) (int) id);
+                    destination.put((byte) id);
                     destination.put((byte) value.remaining());
                 } else {
                     destination.put((byte) (id << 4 | (value.remaining() - 1)));
                 }
-                destination.put(value.duplicate());
+                put(value);
             }
             while (destination.position() < dataStart + dataLength) {
                 destination.put((byte) 0);
             }
         }
-        destination.put(payload.duplicate());
+        put(payload);
         if (padding > 0) {
             for (var i = 1; i < padding; i++) {
                 destination.put((byte) 0);
@@ -293,5 +301,12 @@ public final class RtpPacketWriter {
         view.limit(end);
         view.position(start);
         return view;
+    }
+
+    /// Copies the remaining bytes of `source` to the destination's position, advancing only the destination.
+    private void put(ByteBuffer source) {
+        var length = source.remaining();
+        destination.put(destination.position(), source, source.position(), length);
+        destination.position(destination.position() + length);
     }
 }

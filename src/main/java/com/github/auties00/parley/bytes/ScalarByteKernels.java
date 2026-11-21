@@ -1,23 +1,17 @@
 package com.github.auties00.parley.bytes;
 
-import java.lang.foreign.MemorySegment;
-import java.lang.foreign.ValueLayout;
-import java.lang.invoke.MethodHandles;
-import java.lang.invoke.VarHandle;
 import java.nio.ByteBuffer;
-import java.nio.ByteOrder;
 
 /// The scalar byte kernels, which every JVM runs.
 ///
-/// The array loops are plain indexed loops, which C2's superword pass already turns into vector instructions where
-/// the hardware has them; a buffer without an accessible array (direct or read-only) is read eight bytes at a time
-/// through a memory segment.
+/// The loops are plain indexed loops over arrays, which C2's superword pass already turns into vector instructions
+/// where the hardware has them, except the start code search, whose skip-ahead it cannot vectorize.
 final class ScalarByteKernels implements ByteKernels {
     /// The only instance.
     static final ScalarByteKernels INSTANCE = new ScalarByteKernels();
 
-    /// Eight bytes of a `byte[]` as one `long`, in native order like [ValueLayout#JAVA_LONG_UNALIGNED].
-    private static final VarHandle LONGS = MethodHandles.byteArrayViewVarHandle(long[].class, ByteOrder.nativeOrder());
+    /// The per-thread array a buffer without an accessible array is copied into before XOR.
+    private static final ThreadLocal<byte[]> SCRATCH = ThreadLocal.withInitial(() -> new byte[2048]);
 
     private ScalarByteKernels() {
     }
@@ -35,15 +29,15 @@ final class ScalarByteKernels implements ByteKernels {
             xor(target, targetOffset, source.array(), source.arrayOffset() + sourceIndex, length);
             return;
         }
-        var segment = MemorySegment.ofBuffer(source);
-        var base = (long) sourceIndex - source.position();
-        var i = 0;
-        for (; i + Long.BYTES <= length; i += Long.BYTES) {
-            var value = segment.get(ValueLayout.JAVA_LONG_UNALIGNED, base + i);
-            LONGS.set(target, targetOffset + i, (long) LONGS.get(target, targetOffset + i) ^ value);
-        }
-        for (; i < length; i++) {
-            target[targetOffset + i] ^= segment.get(ValueLayout.JAVA_BYTE, base + i);
+        // A buffer without an accessible array is copied in chunks into a per-thread scratch array, with the bulk
+        // copy intrinsic, and XORed from there: both loops compile to vector code in every caller, where a byte-wise
+        // get loop or reading longs through a memory segment were each measured slow in one of the FEC paths
+        var scratch = SCRATCH.get();
+        for (var done = 0; done < length; ) {
+            var chunk = Math.min(scratch.length, length - done);
+            source.get(sourceIndex + done, scratch, 0, chunk);
+            xor(target, targetOffset + done, scratch, 0, chunk);
+            done += chunk;
         }
     }
 

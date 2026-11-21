@@ -346,6 +346,11 @@ SDP, while `RtpSession` and the payload formats work on top of it as usual.
 - Plan B SDP, the identity provider API, TURN over DTLS and RTP over QUIC are not supported, as no browser ships them.
 - The interop test against Chrome (tagged `chrome`) runs only when `PARLEY_CHROME` (or `-Dparley.chrome`) names a
   Chrome executable, Chrome for Testing in CI: `PARLEY_CHROME=/path/to/chrome mvn test -Dgroups=chrome`.
+- The byte loops of the packet paths (FEC parity, H.264 and H.265 start codes) use the incubating Vector API when the
+  application adds `--add-modules jdk.incubator.vector`; without it, or with `-Dparley.vector=false`, they run scalar
+  code with the same results.
+- The JMH benchmarks of the packet paths live in `jmh/`, outside the library's build: `mvn -DskipTests install`, then
+  `mvn -f jmh/pom.xml package` and `java -jar jmh/target/benchmarks.jar -prof gc`.
 
 ## License
 

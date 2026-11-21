@@ -77,8 +77,12 @@ public record PacketizedPayload(ByteBuffer header, ByteBuffer body, boolean mark
         return new PacketizedPayload(header, body, marker, Map.of());
     }
 
-    /// {@return a read-only view of `buffer` from its position to its limit, positioned at zero}
+    /// {@return a read-only view of `buffer` from its position to its limit, positioned at zero; the shared empty
+    /// buffer when there is nothing to view}
     private static ByteBuffer view(ByteBuffer buffer) {
+        if (!buffer.hasRemaining()) {
+            return NO_HEADER;
+        }
         var slice = buffer.slice();
         return slice.isReadOnly() ? slice : slice.asReadOnlyBuffer();
     }
@@ -86,7 +90,8 @@ public record PacketizedPayload(ByteBuffer header, ByteBuffer body, boolean mark
     /// {@return a new read-only view of the header, positioned at zero}
     @Override
     public ByteBuffer header() {
-        return header.duplicate();
+        // An empty buffer has no position or limit to move, so the shared one is handed out as it is
+        return header.hasRemaining() ? header.duplicate() : NO_HEADER;
     }
 
     /// {@return a new read-only view of the body, positioned at zero}

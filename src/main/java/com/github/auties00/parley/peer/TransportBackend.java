@@ -1461,6 +1461,16 @@ final class TransportBackend implements PeerBackend {
         return config;
     }
 
+    /// The linear audio level of each RFC 6464 level, `10^(-dBov / 20)` for `dBov` in `0..127`, computed once rather
+    /// than per packet.
+    private static final double[] AUDIO_LEVELS = new double[128];
+
+    static {
+        for (var dbov = 0; dbov < AUDIO_LEVELS.length; dbov++) {
+            AUDIO_LEVELS[dbov] = Math.pow(10, -dbov / 20.0);
+        }
+    }
+
     /// Records the sources of a received packet on its receiver, with the RFC 6464 audio level when present.
     private static void record(RtpReceiver receiver, RtpPacket packet, OptionalInt audioLevelId) {
         var level = OptionalDouble.empty();
@@ -1468,7 +1478,7 @@ final class TransportBackend implements PeerBackend {
             var value = packet.extension(audioLevelId.getAsInt());
             if (value.isPresent() && value.get().hasRemaining()) {
                 var dbov = value.get().get(value.get().position()) & 0x7F;
-                level = OptionalDouble.of(Math.pow(10, -dbov / 20.0));
+                level = OptionalDouble.of(AUDIO_LEVELS[dbov]);
             }
         }
         receiver.recordSources(packet.ssrc(), packet.timestamp(), level, packet.csrcs());
