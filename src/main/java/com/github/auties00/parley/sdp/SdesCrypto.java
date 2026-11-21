@@ -1,6 +1,8 @@
 package com.github.auties00.parley.sdp;
 
+import java.security.MessageDigest;
 import java.security.SecureRandom;
+import java.util.Arrays;
 import java.util.Base64;
 import java.util.Objects;
 
@@ -115,6 +117,21 @@ public record SdesCrypto(int tag, String suite, byte[] keySalt) {
     /// {@return the attribute value, `<tag> <suite> inline:<base64>`, with neither lifetime nor MKI}
     public String value() {
         return tag + " " + suite + " inline:" + Base64.getEncoder().encodeToString(keySalt);
+    }
+
+    /// {@return whether `other` is an attribute with the same tag, suite and key material}
+    ///
+    /// @param other the object to compare with
+    @Override
+    public boolean equals(Object other) {
+        return other instanceof SdesCrypto that && tag == that.tag && suite.equals(that.suite)
+                && MessageDigest.isEqual(keySalt, that.keySalt);
+    }
+
+    /// {@return a hash code over the tag, the suite and the key material}
+    @Override
+    public int hashCode() {
+        return 31 * (31 * tag + suite.hashCode()) + Arrays.hashCode(keySalt);
     }
 
     /// {@return the tag and the suite, without the key material}

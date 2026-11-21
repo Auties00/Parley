@@ -21,8 +21,12 @@ public record SdpLine(char type, String value) {
     ///
     /// @param type  the line type character
     /// @param value the text after the equals sign
+    /// @throws IllegalArgumentException if `value` holds a line break
     public SdpLine {
         Objects.requireNonNull(value, "value cannot be null");
+        if (value.indexOf('\r') >= 0 || value.indexOf('\n') >= 0) {
+            throw new IllegalArgumentException("SDP line value holds a line break");
+        }
     }
 
     /// {@return an attribute line with a name and a value, `a=name:value`}

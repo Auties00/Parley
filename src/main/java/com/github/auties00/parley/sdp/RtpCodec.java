@@ -20,21 +20,22 @@ import java.util.Optional;
 /// @param name        the encoding name as written, such as `opus` or `PCMA`
 /// @param clockRate   the RTP clock rate in hertz
 /// @param channels    the channel count, `1` when the `a=rtpmap` line names none
-/// @param parameters  the format parameters of the `a=fmtp` line, or `null` when the format has none
+/// @param fmtp        the format parameters of the `a=fmtp` line, or an empty optional when the format has none
 /// @spec https://www.rfc-editor.org/rfc/rfc8866.html RFC 8866: SDP: Session Description Protocol
 /// @spec https://www.rfc-editor.org/rfc/rfc3551.html RFC 3551: RTP Profile for Audio and Video Conferences with Minimal Control
-public record RtpCodec(int payloadType, String name, int clockRate, int channels, String parameters) {
+public record RtpCodec(int payloadType, String name, int clockRate, int channels, Optional<String> fmtp) {
     /// Creates a payload format.
     ///
     /// @param payloadType the RTP payload type
     /// @param name        the encoding name
     /// @param clockRate   the RTP clock rate in hertz
     /// @param channels    the channel count
-    /// @param parameters  the format parameters, or `null` for none
+    /// @param fmtp        the format parameters, or an empty optional for none
     /// @throws IllegalArgumentException if `payloadType` is outside `0..127`, or `clockRate` or `channels` is not
     ///                                  positive
     public RtpCodec {
         Objects.requireNonNull(name, "name cannot be null");
+        Objects.requireNonNull(fmtp, "fmtp cannot be null");
         if (payloadType < 0 || payloadType > 127) {
             throw new IllegalArgumentException("payload type out of range: " + payloadType);
         }
@@ -63,7 +64,7 @@ public record RtpCodec(int payloadType, String name, int clockRate, int channels
                 continue;
             }
             var rtpmap = findFormatAttribute(section, "rtpmap", payloadType);
-            var fmtp = findFormatAttribute(section, "fmtp", payloadType).orElse(null);
+            var fmtp = findFormatAttribute(section, "fmtp", payloadType);
             if (rtpmap.isPresent()) {
                 var encoding = rtpmap.get().split("/");
                 try {
@@ -94,11 +95,6 @@ public record RtpCodec(int payloadType, String name, int clockRate, int channels
     /// is more than one channel}
     public String rtpmapValue() {
         return payloadType + " " + name + "/" + clockRate + (channels > 1 ? "/" + channels : "");
-    }
-
-    /// {@return the format parameters of the `a=fmtp` line, or an empty optional when the format has none}
-    public Optional<String> fmtp() {
-        return Optional.ofNullable(parameters);
     }
 
     /// {@return the encoding name in lower case, in the root locale}

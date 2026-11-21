@@ -127,6 +127,96 @@ public record SessionDescription(List<SdpLine> lines, List<MediaDescription> med
         });
     }
 
+    /// {@return the unmodifiable typed attributes of the session-level `a=` lines, in order}
+    ///
+    /// @see SdpAttribute#parse(SdpLine)
+    public List<SdpAttribute> typedAttributes() {
+        var result = new ArrayList<SdpAttribute>();
+        for (var line : lines) {
+            if (line.type() == 'a') {
+                result.add(SdpAttribute.parse(line));
+            }
+        }
+        return List.copyOf(result);
+    }
+
+    /// {@return the unmodifiable session-level typed attributes that are instances of `type`, in order}
+    ///
+    /// @param type the attribute record class, such as `SdpAttribute.Group.class`
+    /// @param <T>  the attribute record type
+    public <T extends SdpAttribute> List<T> attributes(Class<T> type) {
+        Objects.requireNonNull(type, "type cannot be null");
+        return typedAttributes().stream().filter(type::isInstance).map(type::cast).toList();
+    }
+
+    /// {@return the first session-level typed attribute that is an instance of `type`, or an empty optional when
+    /// there is none}
+    ///
+    /// @param type the attribute record class
+    /// @param <T>  the attribute record type
+    public <T extends SdpAttribute> Optional<T> attribute(Class<T> type) {
+        return attributes(type).stream().findFirst();
+    }
+
+    /// {@return the first typed attribute of `type` in a media section, falling back to the session level, or an
+    /// empty optional when neither level carries one}
+    ///
+    /// @param section the media section, normally one of [#media()]
+    /// @param type    the attribute record class
+    /// @param <T>     the attribute record type
+    public <T extends SdpAttribute> Optional<T> attribute(MediaDescription section, Class<T> type) {
+        return section.attribute(type).or(() -> attribute(type));
+    }
+
+    /// {@return the origin of the `o=` line, or an empty optional when there is none or it is malformed}
+    public Optional<Origin> origin() {
+        for (var line : lines) {
+            if (line.type() == 'o') {
+                return Origin.parse(line.value());
+            }
+        }
+        return Optional.empty();
+    }
+
+    /// {@return the unmodifiable session-level `a=group:BUNDLE` groups, in order}
+    ///
+    /// @spec https://www.rfc-editor.org/rfc/rfc8843.html RFC 8843: Negotiating Media Multiplexing Using the Session Description Protocol (SDP)
+    public List<SdpAttribute.Group> bundleGroups() {
+        return attributes(SdpAttribute.Group.class).stream().filter(SdpAttribute.Group::isBundle).toList();
+    }
+
+    /// {@return the media section whose `a=mid` is `mid`, or an empty optional when there is none}
+    ///
+    /// @param mid the identification tag
+    public Optional<MediaDescription> mediaByMid(String mid) {
+        Objects.requireNonNull(mid, "mid cannot be null");
+        return media.stream().filter(section -> section.mid().filter(mid::equals).isPresent()).findFirst();
+    }
+
+    /// {@return the direction of a media section: its own direction attribute, else the session-level one, else
+    /// `SENDRECV`}
+    ///
+    /// @param section the media section, normally one of [#media()]
+    public MediaDirection direction(MediaDescription section) {
+        return section.direction()
+                .or(() -> attribute(SdpAttribute.Direction.class).map(SdpAttribute.Direction::direction))
+                .orElse(MediaDirection.SENDRECV);
+    }
+
+    /// {@return a copy of this description with other media sections}
+    ///
+    /// @param newMedia the media sections
+    public SessionDescription withMedia(List<MediaDescription> newMedia) {
+        return new SessionDescription(lines, newMedia);
+    }
+
+    /// {@return a copy of this description with other session-level lines}
+    ///
+    /// @param newLines the session-level lines
+    public SessionDescription withLines(List<SdpLine> newLines) {
+        return new SessionDescription(newLines, media);
+    }
+
     /// {@return the description text with `CRLF` line endings, a terminator after the last line included}
     public String encode() {
         var builder = new StringBuilder();

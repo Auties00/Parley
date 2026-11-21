@@ -117,6 +117,126 @@ public record MediaDescription(String media, int port, String protocol, List<Str
         return Optional.empty();
     }
 
+    /// {@return the unmodifiable typed attributes of the section's `a=` lines, in order}
+    ///
+    /// @see SdpAttribute#parse(SdpLine)
+    public List<SdpAttribute> typedAttributes() {
+        var result = new ArrayList<SdpAttribute>();
+        for (var line : lines) {
+            if (line.type() == 'a') {
+                result.add(SdpAttribute.parse(line));
+            }
+        }
+        return List.copyOf(result);
+    }
+
+    /// {@return the unmodifiable typed attributes of the section that are instances of `type`, in order}
+    ///
+    /// @param type the attribute record class, such as `SdpAttribute.Rtpmap.class`
+    /// @param <T>  the attribute record type
+    public <T extends SdpAttribute> List<T> attributes(Class<T> type) {
+        Objects.requireNonNull(type, "type cannot be null");
+        var result = new ArrayList<T>();
+        for (var line : lines) {
+            if (line.type() == 'a') {
+                var attribute = SdpAttribute.parse(line);
+                if (type.isInstance(attribute)) {
+                    result.add(type.cast(attribute));
+                }
+            }
+        }
+        return List.copyOf(result);
+    }
+
+    /// {@return the first typed attribute of the section that is an instance of `type`, or an empty optional when
+    /// there is none}
+    ///
+    /// @param type the attribute record class
+    /// @param <T>  the attribute record type
+    public <T extends SdpAttribute> Optional<T> attribute(Class<T> type) {
+        Objects.requireNonNull(type, "type cannot be null");
+        for (var line : lines) {
+            if (line.type() == 'a') {
+                var attribute = SdpAttribute.parse(line);
+                if (type.isInstance(attribute)) {
+                    return Optional.of(type.cast(attribute));
+                }
+            }
+        }
+        return Optional.empty();
+    }
+
+    /// {@return the identification tag of the section's `a=mid` line, or an empty optional when it has none or it
+    /// is malformed}
+    public Optional<String> mid() {
+        return attribute(SdpAttribute.Mid.class).map(SdpAttribute.Mid::id);
+    }
+
+    /// {@return the direction of the section's first direction attribute, or an empty optional when it has none}
+    ///
+    /// A section without one inherits the session-level direction, and `SENDRECV` when that is absent too; see
+    /// [SessionDescription#direction(MediaDescription)].
+    public Optional<MediaDirection> direction() {
+        return attribute(SdpAttribute.Direction.class).map(SdpAttribute.Direction::direction);
+    }
+
+    /// {@return the unmodifiable well-formed `b=` lines of the section, in order}
+    public List<Bandwidth> bandwidths() {
+        var result = new ArrayList<Bandwidth>();
+        for (var line : lines) {
+            if (line.type() == 'b') {
+                Bandwidth.parse(line.value()).ifPresent(result::add);
+            }
+        }
+        return List.copyOf(result);
+    }
+
+    /// {@return whether the section is rejected or disabled: its port is `0` and it is not marked `a=bundle-only`}
+    ///
+    /// @spec https://www.rfc-editor.org/rfc/rfc8843.html RFC 8843: Negotiating Media Multiplexing Using the Session Description Protocol (SDP)
+    public boolean isRejected() {
+        return port == 0 && !hasAttribute("bundle-only");
+    }
+
+    /// {@return a copy of this section with another port}
+    ///
+    /// @param newPort the port, `0..65535`
+    /// @throws IllegalArgumentException if `newPort` is out of range
+    public MediaDescription withPort(int newPort) {
+        return new MediaDescription(media, newPort, protocol, formats, lines);
+    }
+
+    /// {@return a copy of this section with another format list}
+    ///
+    /// @param newFormats the formats
+    public MediaDescription withFormats(List<String> newFormats) {
+        return new MediaDescription(media, port, protocol, newFormats, lines);
+    }
+
+    /// {@return a copy of this section with other lines after the `m=` line}
+    ///
+    /// @param newLines the lines
+    public MediaDescription withLines(List<SdpLine> newLines) {
+        return new MediaDescription(media, port, protocol, formats, newLines);
+    }
+
+    /// {@return a copy of this section with `attribute` appended after its last line}
+    ///
+    /// @param attribute the attribute to append
+    public MediaDescription withAttribute(SdpAttribute attribute) {
+        var newLines = new ArrayList<>(lines);
+        newLines.add(attribute.toLine());
+        return withLines(newLines);
+    }
+
+    /// {@return a copy of this section without any `a=` line whose attribute name is `name`}
+    ///
+    /// @param name the attribute name, compared case-sensitively
+    public MediaDescription withoutAttributes(String name) {
+        Objects.requireNonNull(name, "name cannot be null");
+        return withLines(lines.stream().filter(line -> !line.isAttribute(name)).toList());
+    }
+
     /// {@return the `m=` line value of this section, `media port protocol formats...`}
     public String mediaLineValue() {
         var builder = new StringBuilder();
