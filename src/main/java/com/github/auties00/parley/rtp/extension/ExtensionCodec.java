@@ -26,7 +26,8 @@ final class ExtensionCodec {
         }
     }
 
-    /// Reads an SDES-style identifier: the remaining bytes as UTF-8 with trailing zero bytes removed.
+    /// Reads an SDES-style identifier: the remaining bytes as UTF-8 with trailing zero bytes removed, refusing one
+    /// that is empty or longer than 255 bytes, read or re-encoded (malformed UTF-8 decodes to longer replacements).
     static String readIdentifier(ByteBuffer value, String name) throws RtpFormatException {
         var bytes = new byte[value.remaining()];
         value.get(bytes);
@@ -37,10 +38,12 @@ final class ExtensionCodec {
         if (length == 0) {
             throw new RtpFormatException(name + " is empty");
         }
-        if (length > 255) {
-            throw new RtpFormatException(name + " longer than 255 bytes: " + length);
+        var text = new String(bytes, 0, length, StandardCharsets.UTF_8);
+        var encoded = text.getBytes(StandardCharsets.UTF_8).length;
+        if (length > 255 || encoded > 255) {
+            throw new RtpFormatException(name + " longer than 255 UTF-8 bytes: " + Math.max(length, encoded));
         }
-        return new String(bytes, 0, length, StandardCharsets.UTF_8);
+        return text;
     }
 
     /// Validates an SDES-style identifier: 1..255 UTF-8 bytes.

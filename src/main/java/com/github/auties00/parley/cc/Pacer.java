@@ -725,15 +725,20 @@ public final class Pacer implements OutgoingPacketScheduler, AutoCloseable {
         return packet;
     }
 
-    /// Runs the pacer: one [#process(long)] step per iteration, each isolated, so a failure in one step costs that
-    /// step only.
+    /// Runs the pacer: one [#process(long)] step and one wait per iteration, each iteration isolated, so a failure
+    /// costs that iteration only.
     private void run() {
         var consecutiveFailures = 0;
         while (true) {
-            long next;
             try {
-                next = process(clock.nanos());
+                var next = process(clock.nanos());
+                if (!await(next)) {
+                    return;
+                }
                 consecutiveFailures = 0;
+            } catch (InterruptedException exception) {
+                Thread.currentThread().interrupt();
+                return;
             } catch (RuntimeException exception) {
                 consecutiveFailures++;
                 lock.lock();
@@ -747,18 +752,12 @@ public final class Pacer implements OutgoingPacketScheduler, AutoCloseable {
                     return;
                 }
                 LOGGER.log(System.Logger.Level.WARNING, "A pacer step failed; skipping it", exception);
-                next = clock.nanos() + FAILURE_BACKOFF_NANOS;
+                if (!backOff()) {
+                    return;
+                }
             } catch (Error error) {
                 fail(error);
                 throw error;
-            }
-            try {
-                if (!await(next)) {
-                    return;
-                }
-            } catch (InterruptedException exception) {
-                Thread.currentThread().interrupt();
-                return;
             }
         }
     }
@@ -780,6 +779,23 @@ public final class Pacer implements OutgoingPacketScheduler, AutoCloseable {
             }
             signalled = false;
             return !closed;
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    /// Waits a moment after a failed iteration without reading the clock, which may be what failed; returns `false`
+    /// once the pacer is closed.
+    private boolean backOff() {
+        lock.lock();
+        try {
+            if (!closed) {
+                wake.awaitNanos(FAILURE_BACKOFF_NANOS);
+            }
+            return !closed;
+        } catch (InterruptedException exception) {
+            Thread.currentThread().interrupt();
+            return false;
         } finally {
             lock.unlock();
         }

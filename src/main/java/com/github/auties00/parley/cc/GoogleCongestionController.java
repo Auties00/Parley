@@ -308,6 +308,16 @@ final class GoogleCongestionController implements CongestionController {
         pacer.close();
     }
 
+    /// {@return the receivers whose report state is remembered}
+    int reportedSsrcs() {
+        lock.lock();
+        try {
+            return receiverReportState.size();
+        } finally {
+            lock.unlock();
+        }
+    }
+
     private record Received(SendHistory.SentPacket packet, long arrivalNanos) {
     }
 

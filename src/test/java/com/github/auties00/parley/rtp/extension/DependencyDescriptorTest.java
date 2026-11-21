@@ -54,7 +54,7 @@ class DependencyDescriptorTest {
         var encoded = new byte[descriptor.encodedLength(structure)];
         descriptor.writeTo(ByteBuffer.wrap(encoded), structure);
         assertEquals("821234", HEX.formatHex(encoded));
-        var parsed = DependencyDescriptor.parse(ByteBuffer.wrap(encoded), Optional.of(structure));
+        var parsed = DependencyDescriptor.parse(ByteBuffer.wrap(encoded), structure);
         assertEquals(descriptor, parsed);
         assertEquals(1, parsed.temporalId());
         assertEquals(List.of(2), parsed.frameDependencies());
@@ -69,7 +69,7 @@ class DependencyDescriptorTest {
         var keyframe = DependencyDescriptor.fromTemplate(structure, 0, true, true, 1, true);
         var encoded = keyframe.encode();
         assertTrue(encoded.remaining() > 16);
-        var parsed = DependencyDescriptor.parse(encoded, Optional.empty());
+        var parsed = DependencyDescriptor.parse(encoded);
         assertEquals(keyframe, parsed);
         assertEquals(structure, parsed.structure().orElseThrow());
         assertEquals(2, structure.decodeTargetTemporalId(2));
@@ -85,7 +85,7 @@ class DependencyDescriptorTest {
                 List.of(NOT_PRESENT, REQUIRED, REQUIRED), List.of(1, 20, 300, 4096), List.of(200));
         var buffer = ByteBuffer.allocate(descriptor.encodedLength(structure));
         descriptor.writeTo(buffer, structure);
-        var parsed = DependencyDescriptor.parse(buffer.flip(), Optional.of(structure));
+        var parsed = DependencyDescriptor.parse(buffer.flip(), structure);
         assertEquals(descriptor, parsed);
     }
 
@@ -93,9 +93,9 @@ class DependencyDescriptorTest {
     @DisplayName("fails without a structure, or with a template id the structure lacks")
     void failures() {
         assertThrows(RtpFormatException.class,
-                () -> DependencyDescriptor.parse(ByteBuffer.wrap(HEX.parseHex("800001")), Optional.empty()));
+                () -> DependencyDescriptor.parse(ByteBuffer.wrap(HEX.parseHex("800001"))));
         assertThrows(RtpFormatException.class,
-                () -> DependencyDescriptor.parse(ByteBuffer.wrap(HEX.parseHex("8a0001")), Optional.of(l1t3())));
+                () -> DependencyDescriptor.parse(ByteBuffer.wrap(HEX.parseHex("8a0001")), l1t3()));
         var unattached = DependencyDescriptor.fromTemplate(l1t3(), 0, true, true, 1, false);
         assertThrows(IllegalStateException.class, unattached::encode);
     }
@@ -177,8 +177,8 @@ class DependencyDescriptorTest {
                 template.spatialId(), template.temporalId(), dtis, fdiffs, chainDiffs);
         var buffer = ByteBuffer.allocate(descriptor.encodedLength(structure));
         descriptor.writeTo(buffer, structure);
-        assertEquals(descriptor, DependencyDescriptor.parse(buffer.flip(),
-                attach ? Optional.empty() : Optional.of(structure)));
+        assertEquals(descriptor, attach ? DependencyDescriptor.parse(buffer.flip())
+                : DependencyDescriptor.parse(buffer.flip(), structure));
     }
 
     private static FrameDependencyTemplate randomTemplate(Random random, int spatial, int temporal, int decodeTargets,
@@ -206,8 +206,11 @@ class DependencyDescriptorTest {
             var data = new byte[random.nextInt(40)];
             random.nextBytes(data);
             try {
-                DependencyDescriptor.parse(ByteBuffer.wrap(data),
-                        random.nextBoolean() ? Optional.of(l1t3()) : Optional.empty());
+                if (random.nextBoolean()) {
+                    DependencyDescriptor.parse(ByteBuffer.wrap(data), l1t3());
+                } else {
+                    DependencyDescriptor.parse(ByteBuffer.wrap(data));
+                }
             } catch (RtpFormatException expected) {
                 // malformed descriptors are reported, never anything else
             }

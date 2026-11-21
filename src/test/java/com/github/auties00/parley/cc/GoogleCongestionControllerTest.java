@@ -1,5 +1,6 @@
 package com.github.auties00.parley.cc;
 
+import com.github.auties00.parley.rtp.session.SentPacket;
 import com.github.auties00.parley.rtp.rtcp.ReceptionReport;
 import com.github.auties00.parley.rtp.rtcp.Remb;
 import com.github.auties00.parley.rtp.rtcp.TransportFeedback;
@@ -162,7 +163,8 @@ class GoogleCongestionControllerTest {
         @DisplayName("matches feedback to sent packets and ignores unknown sequence numbers")
         void feedbackMatching() {
             for (var sequence = 0; sequence < 50; sequence++) {
-                controller.onPacketSent(sequence, 1000, sequence * 10 * MS, Priority.VIDEO, false);
+                controller.onPacketSent(new SentPacket(sequence, 1000, sequence * 10 * MS, Priority.VIDEO, false, 1,
+                        sequence));
             }
             var results = new ArrayList<TransportFeedback.PacketResult>();
             for (var sequence = 0; sequence < 50; sequence++) {

@@ -116,7 +116,7 @@ public final class BitrateAllocator {
         double remaining = targetBps;
         var running = new ArrayList<Sender>();
         for (var sender : ordered) {
-            if (sender.floor(0) > 0 && remaining >= sender.threshold(0)) {
+            if (sender.ceiling > 0 && remaining >= sender.threshold(0)) {
                 sender.allocation[0] = sender.floor(0);
                 sender.enabledLayers = 1;
                 remaining -= sender.floor(0);

@@ -1,5 +1,6 @@
 package com.github.auties00.parley.cc;
 
+import com.github.auties00.parley.rtp.session.SentPacket;
 import com.github.auties00.parley.rtp.rtcp.TransportFeedback;
 import com.github.auties00.parley.rtp.session.OutgoingPacketScheduler.Priority;
 
@@ -42,7 +43,9 @@ final class CongestionSimulation {
 
     CongestionSimulation(CongestionConfig config, long capacityBps) {
         this.clock = new FakeClock(1_000 * MS);
-        this.controller = new GoogleCongestionController(config.withClock(clock), false);
+        this.targets = new ArrayList<>();
+        this.controller = new GoogleCongestionController(config.withClock(clock)
+                .withTargetListener(target -> targets.add(new long[]{target.atNanos(), target.bitsPerSecond()})), false);
         this.pacer = controller.pacer();
         this.events = new PriorityQueue<>((a, b) -> a.atNanos() != b.atNanos()
                 ? Long.compare(a.atNanos(), b.atNanos()) : Long.compare(a.order(), b.order()));
@@ -52,16 +55,17 @@ final class CongestionSimulation {
         this.queueLimitBytes = Long.MAX_VALUE;
         this.encoderCapBps = Long.MAX_VALUE;
         this.feedbackEnabled = true;
-        this.targets = new ArrayList<>();
         this.receiver = TransportFeedbackGenerator.create(2, clock, packet -> {
             var feedback = (TransportFeedback) packet;
             if (feedbackEnabled) {
                 schedule(clock.nanos() + propagationNanos, () -> controller.onTransportFeedback(feedback, clock.nanos()));
             }
         });
-        controller.setTargetListener(target -> targets.add(new long[]{target.atNanos(), target.bitsPerSecond()}));
-        pacer.setPaddingSource(bytes -> List.of(new PaddingPacket(ByteBuffer.allocate(Math.clamp(bytes, 200, 1200)), 2,
-                packet -> transmit(packet.remaining(), Priority.PADDING))));
+        pacer.setPaddingSource((bytes, probe) -> {
+            var size = Math.clamp(bytes, 200, 1200);
+            transmit(size, Priority.PADDING);
+            return size;
+        });
         this.nextFrameNanos = clock.nanos();
         this.nextFeedbackNanos = clock.nanos() + 100 * MS;
     }
@@ -140,7 +144,7 @@ final class CongestionSimulation {
     private void transmit(int size, Priority priority) {
         var sequence = transportSequence++ & 0xFFFF;
         var now = clock.nanos();
-        controller.onPacketSent(sequence, size, now, priority, false);
+        controller.onPacketSent(new SentPacket(sequence, size, now, priority, false, 1, sequence));
         if (random.nextDouble() < lossRate) {
             return;
         }

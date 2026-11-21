@@ -23,7 +23,7 @@ import java.util.OptionalLong;
 /// @param nackCount                the NACK messages received
 /// @param pliCount                 the PLI messages received
 /// @param firCount                 the new FIR requests received
-/// @param framesSent               the frames sent: one per [RtpSendStream#send] call, one per forwarded marker bit
+/// @param framesSent               the frames sent: one per `RtpSendStream.send` call, one per forwarded marker bit
 /// @param keyFramesSent            those of them that were key frames
 /// @param frameWidth               the width of the last frame whose size was given, in pixels
 /// @param frameHeight              the height of the last frame whose size was given, in pixels

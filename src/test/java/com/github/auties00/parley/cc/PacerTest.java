@@ -33,6 +33,12 @@ class PacerTest {
         return packet -> sent.add(new Sent(clock.nanos(), packet.remaining(), priority, Pacer.PROBE.isBound()));
     }
 
+    /// Sends one padding packet of `size` bytes, as a session's padding source would.
+    private int pad(int size) throws IOException {
+        sink(Priority.PADDING).send(ByteBuffer.allocate(size));
+        return size;
+    }
+
     private void run(Pacer pacer, long untilNanos) {
         while (clock.nanos() <= untilNanos) {
             var next = pacer.process(clock.nanos());
@@ -41,7 +47,8 @@ class PacerTest {
     }
 
     private Pacer pacer(long rateBps) {
-        return new Pacer(clock, rateBps, Duration.ofSeconds(2).toNanos(), false, null);
+        return new Pacer(clock, rateBps, Duration.ofSeconds(2).toNanos(), false, null, _ -> {
+        });
     }
 
     @Test
@@ -95,7 +102,8 @@ class PacerTest {
     @Test
     @DisplayName("paces audio too when configured to")
     void pacedAudio() {
-        var pacer = new Pacer(clock, 80_000, Duration.ofSeconds(2).toNanos(), true, null);
+        var pacer = new Pacer(clock, 80_000, Duration.ofSeconds(2).toNanos(), true, null, _ -> {
+        });
         pacer.schedule(ByteBuffer.allocate(1000), Priority.VIDEO, 1, sink(Priority.VIDEO));
         pacer.schedule(ByteBuffer.allocate(100), Priority.VIDEO, 1, sink(Priority.VIDEO));
         pacer.process(0);
@@ -109,7 +117,8 @@ class PacerTest {
     @Test
     @DisplayName("raises its rate so no packet waits longer than the queue time bound")
     void queueTimeLimit() {
-        var pacer = new Pacer(clock, 100_000, Duration.ofMillis(500).toNanos(), false, null);
+        var pacer = new Pacer(clock, 100_000, Duration.ofMillis(500).toNanos(), false, null, _ -> {
+        });
         for (var index = 0; index < 100; index++) {
             pacer.schedule(ByteBuffer.allocate(1000), Priority.VIDEO, 1, sink(Priority.VIDEO));
         }
@@ -123,9 +132,9 @@ class PacerTest {
     void probes() {
         var pacer = pacer(300_000);
         var padding = new ArrayList<Integer>();
-        pacer.setPaddingSource(bytes -> {
+        pacer.setPaddingSource((bytes, probe) -> {
             padding.add(bytes);
-            return List.of(new PaddingPacket(ByteBuffer.allocate(Math.min(bytes, 500)), 2, sink(Priority.PADDING)));
+            return pad(Math.min(bytes, 500));
         });
         pacer.schedule(ByteBuffer.allocate(1000), Priority.VIDEO, 1, sink(Priority.VIDEO));
         var cluster = ProbeCluster.of(0, 4_000_000, 0);
@@ -149,7 +158,7 @@ class PacerTest {
         pacer.addProbe(ProbeCluster.of(0, 4_000_000, 0));
         run(pacer, 100 * MS);
         assertTrue(sent.isEmpty());
-        pacer.setPaddingSource(_ -> List.of());
+        pacer.setPaddingSource((_, _) -> 0);
         pacer.addProbe(ProbeCluster.of(1, 4_000_000, 0));
         run(pacer, 200 * MS);
         assertTrue(sent.isEmpty());
@@ -159,7 +168,7 @@ class PacerTest {
     @DisplayName("keeps up the padding rate once media flowed")
     void paddingRate() {
         var pacer = pacer(1_000_000);
-        pacer.setPaddingSource(bytes -> List.of(new PaddingPacket(ByteBuffer.allocate(bytes), 2, sink(Priority.PADDING))));
+        pacer.setPaddingSource((bytes, probe) -> pad(bytes));
         pacer.setPaddingRate(400_000);
         run(pacer, 100 * MS);
         assertTrue(sent.isEmpty(), "no padding before the first media packet");
@@ -196,7 +205,8 @@ class PacerTest {
     @DisplayName("runs on its own thread from the thread factory")
     void thread() throws Exception {
         var pacer = new Pacer(System::nanoTime, 8_000_000, Duration.ofSeconds(2).toNanos(), false,
-                Thread.ofVirtual().name("test-pacer-", 0).factory());
+                Thread.ofVirtual().name("test-pacer-", 0).factory(), _ -> {
+        });
         try {
             var latch = new CountDownLatch(50);
             var threads = new ArrayList<String>();

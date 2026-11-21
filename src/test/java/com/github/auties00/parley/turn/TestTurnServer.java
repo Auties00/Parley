@@ -91,6 +91,15 @@ public final class TestTurnServer implements AutoCloseable {
     /// Whether every message from clients is ignored, as if the server were unreachable.
     private volatile boolean silent;
 
+    /// The server Allocate requests are redirected to with 300 Try Alternate, or `null`.
+    private volatile InetSocketAddress redirect;
+
+    /// The last Allocate request answered.
+    private volatile StunMessage lastAllocate;
+
+    /// Send indications that carried `DONT-FRAGMENT`.
+    private final AtomicInteger dontFragmentIndications = new AtomicInteger();
+
     /// Counters.
     private final AtomicInteger bindings = new AtomicInteger();
 
@@ -211,6 +220,23 @@ public final class TestTurnServer implements AutoCloseable {
     /// @param silent whether to ignore messages
     public void silent(boolean silent) {
         this.silent = silent;
+    }
+
+    /// Answers every Allocate request with 300 Try Alternate naming `alternate`, or stops when `null`.
+    ///
+    /// @param alternate the server to redirect to
+    public void redirectTo(InetSocketAddress alternate) {
+        redirect = alternate;
+    }
+
+    /// {@return the last Allocate request this server answered, if any}
+    public Optional<StunMessage> lastAllocate() {
+        return Optional.ofNullable(lastAllocate);
+    }
+
+    /// {@return the Send indications that carried `DONT-FRAGMENT`}
+    public int dontFragmentIndications() {
+        return dontFragmentIndications.get();
     }
 
     /// {@return the Binding requests answered}
@@ -478,6 +504,12 @@ public final class TestTurnServer implements AutoCloseable {
 
     /// Handles Allocate.
     private StunMessage allocate(Client client, StunMessage request) throws IOException {
+        lastAllocate = request;
+        var alternate = redirect;
+        if (alternate != null) {
+            return request.errorResponse(ErrorCode.TRY_ALTERNATE, "Try Alternate",
+                    List.of(new StunAttribute.AlternateServer(alternate)));
+        }
         if (allocations.containsKey(client.key())) {
             return request.errorResponse(ErrorCode.ALLOCATION_MISMATCH, "Allocation Mismatch", List.of());
         }
@@ -510,10 +542,14 @@ public final class TestTurnServer implements AutoCloseable {
         allocations.put(client.key(), allocation);
         allocationCount.incrementAndGet();
         Thread.ofVirtual().start(allocation::relayLoop);
-        return request.successResponse(List.of(
+        var attributes = new ArrayList<StunAttribute>(List.of(
                 new StunAttribute.XorRelayedAddress(localAddress(relay)),
                 new StunAttribute.Lifetime(lifetime),
                 new StunAttribute.XorMappedAddress(client.address())));
+        if (request.attribute(StunAttribute.EvenPort.class).map(StunAttribute.EvenPort::reserveNext).orElse(false)) {
+            attributes.add(new StunAttribute.ReservationToken(0x0102030405060708L));
+        }
+        return request.successResponse(attributes);
     }
 
     /// Handles Refresh.
@@ -579,6 +615,9 @@ public final class TestTurnServer implements AutoCloseable {
             return;
         }
         sendIndications.incrementAndGet();
+        if (indication.has(StunAttribute.DontFragment.class)) {
+            dontFragmentIndications.incrementAndGet();
+        }
         allocation.relay.send(data.get().value(), peer.get().address());
     }
 

@@ -36,6 +36,10 @@ import java.util.function.Consumer;
 ///
 /// Every method may be called from any thread. The sink is called without the generator's lock held, serially.
 ///
+/// @implNote This implementation reports every packet as not ECN-capable (`ECN = 00`): the JDK's datagram sockets
+/// do not expose the ECN bits of received packets, so the sender's congestion controller works from arrival times
+/// and losses alone.
+///
 /// @spec https://www.rfc-editor.org/rfc/rfc8888.html RFC 8888: RTP Control Protocol (RTCP) Feedback for Congestion Control
 public final class CongestionControlFeedbackGenerator implements AutoCloseable {
     private static final System.Logger LOGGER = System.getLogger(CongestionControlFeedbackGenerator.class.getName());

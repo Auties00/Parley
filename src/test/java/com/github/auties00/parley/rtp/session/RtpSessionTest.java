@@ -64,6 +64,17 @@ class RtpSessionTest {
         return ByteBuffer.wrap(new byte[]{(byte) value, (byte) (value >> 8), 42});
     }
 
+    /// Sends payloads as one frame, the marker on the last one.
+    static void send(RtpSendStream stream, List<ByteBuffer> payloads, long timestamp, boolean marker,
+                     Map<java.net.URI, ByteBuffer> extensions, OutgoingPacketScheduler.Priority priority)
+            throws java.io.IOException {
+        var list = new ArrayList<RtpSendStream.Payload>();
+        for (var i = 0; i < payloads.size(); i++) {
+            list.add(new RtpSendStream.Payload(payloads.get(i), marker && i == payloads.size() - 1, extensions));
+        }
+        stream.send(list, timestamp, priority);
+    }
+
     static int valueOf(RtpPacket packet) {
         var payload = packet.payload();
         return (payload.get(0) & 0xFF) | (payload.get(1) & 0xFF) << 8;
@@ -112,7 +123,7 @@ class RtpSessionTest {
             var left = pair.net.session(pair.net.left, 10).extensions(EXTENSIONS).feedbackObserver(observed).build();
             var stream = left.createSendStream(video().rid("h").build());
             pair.net.clock.advanceMillis(500);
-            stream.send(List.of(payload(1), payload(2)), 90_000, true, Map.of(), VIDEO);
+            send(stream, List.of(payload(1), payload(2)), 90_000, true, Map.of(), VIDEO);
             for (var packet : pair.net.left.sentRtp) {
                 assertEquals("v", Mid.parse(packet.extension(1).orElseThrow()).value());
                 assertEquals("h", new String(TestBytes.of(packet.extension(2).orElseThrow())));
@@ -142,8 +153,8 @@ class RtpSessionTest {
             var audio = session.createSendStream(SendStreamConfig.builder("a", 5, 111, 48_000)
                     .extensions(EXTENSIONS).build());
             var video = session.createSendStream(video().build());
-            video.send(List.of(payload(1)), 0, true, Map.of(), VIDEO);
-            audio.send(List.of(payload(2)), 0, false, Map.of(), AUDIO);
+            send(video, List.of(payload(1)), 0, true, Map.of(), VIDEO);
+            send(audio, List.of(payload(2)), 0, false, Map.of(), AUDIO);
             assertTrue(net.left.sentRtp.isEmpty());
             for (var i = queued.size() - 1; i >= 0; i--) {
                 queued.get(i).getValue().send(queued.get(i).getKey());
@@ -180,7 +191,7 @@ class RtpSessionTest {
                     () -> pair.left.createSendStream(SendStreamConfig.builder("x", RTX_SSRC, 96, 90_000).build()));
             pair.left.close();
             assertThrows(IllegalStateException.class,
-                    () -> stream.send(List.of(payload(1)), 0, true, Map.of(), VIDEO));
+                    () -> send(stream, List.of(payload(1)), 0, true, Map.of(), VIDEO));
             assertFalse(pair.net.left.sentRtcpOf(Bye.class).isEmpty());
         }
     }
@@ -205,7 +216,7 @@ class RtpSessionTest {
             pair.net.left.dropRtp = packet -> packet.ssrc() == VIDEO_SSRC && (valueOf(packet) == 5
                     || valueOf(packet) == 6) && dropped.add(valueOf(packet));
             for (var i = 0; i < 20; i++) {
-                stream.send(List.of(payload(i)), 3000L * i, true, Map.of(), VIDEO);
+                send(stream, List.of(payload(i)), 3000L * i, true, Map.of(), VIDEO);
                 pair.net.deliver();
             }
             assertEquals(new TreeSet<>(java.util.stream.IntStream.range(0, 20).boxed().toList()),
@@ -229,15 +240,15 @@ class RtpSessionTest {
         @DisplayName("retries NACKs after each round trip and falls back to a PLI when retries run out")
         void retriesThenKeyframe() throws Exception {
             var pair = new Pair();
-            var stream = pair.left.createSendStream(video().rtx(RTX_SSRC, 97)
-                    .feedback(Set.of(FeedbackMechanism.NACK, FeedbackMechanism.PLI)).build());
             var requests = new ArrayList<KeyframeRequest>();
-            stream.setKeyframeRequestListener(requests::add);
+            var stream = pair.left.createSendStream(video().rtx(RTX_SSRC, 97)
+                    .feedback(Set.of(FeedbackMechanism.NACK, FeedbackMechanism.PLI))
+                    .keyframeRequestListener(requests::add).build());
             pair.receive(videoReceiver().rtxPayloadType(97, 96).nackMaxRetries(3)
                     .feedback(Set.of(FeedbackMechanism.NACK, FeedbackMechanism.PLI)).build());
             pair.net.left.dropRtp = packet -> packet.ssrc() == RTX_SSRC || valueOf(packet) == 1;
             for (var i = 0; i < 3; i++) {
-                stream.send(List.of(payload(i)), 3000L * i, true, Map.of(), VIDEO);
+                send(stream, List.of(payload(i)), 3000L * i, true, Map.of(), VIDEO);
                 pair.net.deliver();
             }
             assertEquals(1, pair.net.right.sentRtcpOf(Nack.class).size());
@@ -261,7 +272,7 @@ class RtpSessionTest {
             pair.receive(videoReceiver().feedback(Set.of(FeedbackMechanism.NACK)).build());
             pair.net.left.dropRtp = packet -> valueOf(packet) == 1;
             for (var i = 0; i < 3; i++) {
-                stream.send(List.of(payload(i)), 3000L * i, true, Map.of(), VIDEO);
+                send(stream, List.of(payload(i)), 3000L * i, true, Map.of(), VIDEO);
                 pair.net.deliver();
             }
             assertTrue(pair.net.right.sentRtcpOf(Nack.class).isEmpty());
@@ -312,7 +323,7 @@ class RtpSessionTest {
             var count = new int[1];
             pair.net.left.dropRtp = packet -> ++count[0] == 4;
             for (var i = 0; i < 8; i++) {
-                stream.send(List.of(payload(i)), 960L * i, false, Map.of(), AUDIO);
+                send(stream, List.of(payload(i)), 960L * i, false, Map.of(), AUDIO);
                 pair.net.deliver();
             }
             assertEquals(List.of(0, 1, 2, 3, 4, 5, 6, 7), values(pair.received));
@@ -336,7 +347,7 @@ class RtpSessionTest {
                 for (var i = 0; i < 4; i++) {
                     payloads.add(payload(frame * 4 + i).position(0));
                 }
-                stream.send(payloads, 3000L * frame, true, Map.of(), VIDEO);
+                send(stream, payloads, 3000L * frame, true, Map.of(), VIDEO);
                 pair.net.deliver();
             }
             var values = new TreeSet<>(values(pair.received));
@@ -361,7 +372,7 @@ class RtpSessionTest {
                 for (var i = 0; i < 4; i++) {
                     payloads.add(payload(frame * 4 + i));
                 }
-                stream.send(payloads, 3000L * frame, true, Map.of(), VIDEO);
+                send(stream, payloads, 3000L * frame, true, Map.of(), VIDEO);
                 pair.net.deliver();
             }
             assertEquals(12, new TreeSet<>(values(pair.received)).size());
@@ -384,7 +395,7 @@ class RtpSessionTest {
             var count = new int[1];
             pair.net.left.dropRtp = packet -> ++count[0] == 4 || count[0] == 8;
             for (var i = 0; i < 10; i++) {
-                stream.send(List.of(payload(i)), 3000L * i, true, Map.of(), VIDEO);
+                send(stream, List.of(payload(i)), 3000L * i, true, Map.of(), VIDEO);
             }
             pair.net.deliver();
             pair.net.clock.advanceMillis(1100);
@@ -428,9 +439,9 @@ class RtpSessionTest {
         @DisplayName("forwards keyframe requests, deduplicating FIR retransmissions")
         void keyframes() throws Exception {
             var pair = new Pair();
-            var stream = pair.left.createSendStream(video().feedback(Set.of(FeedbackMechanism.FIR)).build());
             var requests = new ArrayList<KeyframeRequest>();
-            stream.setKeyframeRequestListener(requests::add);
+            var stream = pair.left.createSendStream(video().feedback(Set.of(FeedbackMechanism.FIR))
+                    .keyframeRequestListener(requests::add).build());
             var rx = pair.receive(videoReceiver().ssrc(VIDEO_SSRC).feedback(Set.of(FeedbackMechanism.FIR)).build());
             rx.requestKeyframe(KeyframeMethod.FIR);
             rx.requestKeyframe(KeyframeMethod.PLI);
@@ -461,10 +472,15 @@ class RtpSessionTest {
         void observer() throws Exception {
             var pair = new Pair();
             var observer = new TestObserver();
-            var left = pair.net.session(pair.net.left, 10).feedbackObserver(observer).build();
             var forwarded = new ArrayList<RtcpPacket>();
-            left.setRtcpListener(forwarded::add);
+            var left = pair.net.session(pair.net.left, 10).extensions(EXTENSIONS).feedbackObserver(observer)
+                    .rtcpListener(forwarded::add).build();
             var feedback = new TransportFeedback(20, 1, 0, 0, 0, List.of(TransportFeedback.PacketResult.lost(0)));
+            pair.right.sendRtcp(feedback);
+            pair.net.deliver();
+            assertEquals(List.of(), observer.feedback, "feedback before any packet left names nothing sent");
+            assertEquals(1, left.droppedFeedbackCount());
+            send(left.createSendStream(video().build()), List.of(payload(1)), 0, true, Map.of(), VIDEO);
             pair.right.sendRtcp(feedback, new Remb(20, 500_000, List.of(1L)),
                     new com.github.auties00.parley.rtp.rtcp.App(1, 20, "TEST", ByteBuffer.allocate(4)));
             pair.net.deliver();
@@ -490,21 +506,22 @@ class RtpSessionTest {
                     .rtx(5555, 97).extensions(EXTENSIONS).feedback(Set.of(FeedbackMechanism.NACK)).build());
             var byRid = new java.util.HashMap<String, List<Integer>>();
             var reported = new ArrayList<UnsignaledStream>();
-            pair.right.setUnhandledStreamListener(stream -> {
+            var right = new RtpSession[1];
+            right[0] = pair.net.session(pair.net.right, 30).extensions(EXTENSIONS).unsignaledStreamListener(stream -> {
                 reported.add(stream);
                 var rid = stream.rid().orElseThrow();
-                var rx = pair.right.createReceiveStream(videoReceiver().rid(rid).rtxPayloadType(97, 96)
+                var rx = right[0].createReceiveStream(videoReceiver().rid(rid).rtxPayloadType(97, 96)
                         .feedback(Set.of(FeedbackMechanism.NACK)).build());
                 var list = new ArrayList<Integer>();
                 byRid.put(rid, list);
                 rx.setPacketReceiver(packet -> list.add(valueOf(packet)));
-            });
+            }).build();
             var dropped = new HashSet<Integer>();
             pair.net.left.dropRtp = packet -> packet.ssrc() == 4444 && valueOf(packet) == 102
                     && dropped.add(valueOf(packet));
             for (var i = 0; i < 5; i++) {
-                high.send(List.of(payload(i)), 3000L * i, true, Map.of(), VIDEO);
-                low.send(List.of(payload(100 + i)), 3000L * i, true, Map.of(), VIDEO);
+                send(high, List.of(payload(i)), 3000L * i, true, Map.of(), VIDEO);
+                send(low, List.of(payload(100 + i)), 3000L * i, true, Map.of(), VIDEO);
                 pair.net.deliver();
             }
             assertEquals(2, reported.size());
@@ -519,15 +536,15 @@ class RtpSessionTest {
             var pair = new Pair();
             var stream = pair.left.createSendStream(video().build());
             var rx = pair.receive(videoReceiver().build());
-            stream.send(List.of(payload(1)), 0, true, Map.of(), VIDEO);
+            send(stream, List.of(payload(1)), 0, true, Map.of(), VIDEO);
             pair.net.deliver();
             pair.right.updateRoutes(RtpRoutingTable.of(EXTENSIONS, List.of()));
-            stream.send(List.of(payload(2)), 3000, true, Map.of(), VIDEO);
+            send(stream, List.of(payload(2)), 3000, true, Map.of(), VIDEO);
             pair.net.deliver();
             assertEquals(List.of(1), values(pair.received));
             pair.right.updateRoutes(RtpRoutingTable.of(EXTENSIONS, List.of(rx)));
             pair.right.removeReceiveStream(rx);
-            stream.send(List.of(payload(3)), 6000, true, Map.of(), VIDEO);
+            send(stream, List.of(payload(3)), 6000, true, Map.of(), VIDEO);
             pair.net.deliver();
             assertEquals(List.of(1), values(pair.received));
         }
@@ -572,7 +589,7 @@ class RtpSessionTest {
                 receiver.createReceiveStream(receiveConfig.build())
                         .setPacketReceiver(packet -> delivered.add(valueOf(packet)));
                 assertEquals(0, sources.getFirst().sendPadding(1000, true));
-                stream.send(List.of(payload(1)), 0, true, Map.of(), VIDEO);
+                send(stream, List.of(payload(1)), 0, true, Map.of(), VIDEO);
                 var before = net.left.sentRtp.size();
                 var sent = sources.getFirst().sendPadding(500, true);
                 assertTrue(sent >= 500 || rtx);
@@ -598,10 +615,9 @@ class RtpSessionTest {
         int probes;
 
         @Override
-        public void onPacketSent(int transportSequence, int sizeBytes, long sendNanos,
-                                 OutgoingPacketScheduler.Priority priority, boolean probe) {
-            sequences.add(transportSequence);
-            if (probe) {
+        public void onPacketSent(SentPacket packet) {
+            sequences.add(packet.transportSequence());
+            if (packet.priority() == OutgoingPacketScheduler.Priority.PADDING) {
                 probes++;
             }
         }

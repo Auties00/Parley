@@ -86,16 +86,15 @@ class TurnClientTest {
     @DisplayName("allocates after the 401 challenge and relays both ways with Send/Data and with a channel")
     void relaysBothWays(TurnTransport transport) throws Exception {
         try (var client = connect(transport)) {
-            var allocation = client.allocate(TurnAllocationOptions.IPV4, TIMEOUT);
-            assertEquals(1, server.challenges());
-            assertEquals(server.relayedAddresses().getFirst(), allocation.relayedAddress());
-            assertTrue(allocation.mappedAddress().isPresent());
             var received = new LinkedBlockingQueue<byte[]>();
-            allocation.setReceiver((source, data, arrival) -> {
+            var allocation = client.allocate(TurnAllocationOptions.IPV4.receiver((source, data, arrival) -> {
                 var bytes = new byte[data.remaining()];
                 data.get(bytes);
                 received.add(bytes);
-            });
+            }), TIMEOUT);
+            assertEquals(1, server.challenges());
+            assertEquals(server.relayedAddresses().getFirst(), allocation.relayedAddress());
+            assertTrue(allocation.mappedAddress().isPresent());
             allocation.createPermission(peerAddress().getAddress(), TIMEOUT);
             assertTrue(allocation.hasPermission(peerAddress().getAddress()));
 
@@ -126,9 +125,9 @@ class TurnClientTest {
     @DisplayName("drops data from a peer without a permission")
     void permissionsFilter() throws Exception {
         try (var client = connect(TurnTransport.UDP)) {
-            var allocation = client.allocate(TurnAllocationOptions.IPV4, TIMEOUT);
             var received = new LinkedBlockingQueue<byte[]>();
-            allocation.setReceiver((source, data, arrival) -> received.add(new byte[data.remaining()]));
+            var allocation = client.allocate(TurnAllocationOptions.IPV4
+                    .receiver((source, data, arrival) -> received.add(new byte[data.remaining()])), TIMEOUT);
             peer.send(ByteBuffer.wrap(new byte[]{1}), allocation.relayedAddress());
             assertEquals(null, received.poll(300, TimeUnit.MILLISECONDS));
         }
@@ -313,6 +312,86 @@ class TurnClientTest {
             }
         }
         assertEquals(StunAttribute.DontFragment.TYPE, 0x001A);
+    }
+
+    @Test
+    @DisplayName("follows 300 Try Alternate to the named server with the same credentials")
+    void alternateServer() throws Exception {
+        try (var alternate = TestTurnServer.start()) {
+            server.redirectTo(alternate.udpAddress());
+            try (var client = connect(TurnTransport.UDP)) {
+                var allocation = client.allocate(TurnAllocationOptions.IPV4, TIMEOUT);
+                assertEquals(0, server.allocations());
+                assertEquals(1, alternate.allocations());
+                assertEquals(alternate.udpAddress(), client.serverAddress());
+                assertEquals(alternate.relayedAddresses().getFirst(), allocation.relayedAddress());
+                allocation.createPermission(peerAddress().getAddress(), TIMEOUT);
+                allocation.send(ByteBuffer.wrap(new byte[]{9}), peerAddress());
+                assertEquals(List.of((byte) 9), toList(receiveOnPeer(peer)));
+            }
+        }
+    }
+
+    @Test
+    @DisplayName("follows a redirection once per server and fails with 300 on a loop")
+    void alternateLoop() throws Exception {
+        server.redirectTo(server.udpAddress());
+        try (var client = connect(TurnTransport.UDP)) {
+            var failure = assertThrows(TurnException.class, () -> client.allocate(TurnAllocationOptions.IPV4, TIMEOUT));
+            assertEquals(300, failure.errorCode().orElseThrow());
+        }
+    }
+
+    @Test
+    @DisplayName("sends EVEN-PORT and reports the RESERVATION-TOKEN, then allocates with the token")
+    void evenPort() throws Exception {
+        try (var client = connect(TurnTransport.UDP)) {
+            var allocation = client.allocate(TurnAllocationOptions.IPV4.evenPort(true), TIMEOUT);
+            var request = server.lastAllocate().orElseThrow();
+            assertTrue(request.attribute(StunAttribute.EvenPort.class).orElseThrow().reserveNext());
+            var token = allocation.reservationToken().orElseThrow();
+            assertEquals(8, token.length);
+            assertEquals(0x0102030405060708L, ByteBuffer.wrap(token).getLong());
+            try (var second = connect(TurnTransport.UDP)) {
+                second.allocate(TurnAllocationOptions.IPV4.reservationToken(token), TIMEOUT);
+                assertEquals(0x0102030405060708L, server.lastAllocate().orElseThrow()
+                        .attribute(StunAttribute.ReservationToken.class).orElseThrow().token());
+            }
+        }
+        assertThrows(IllegalArgumentException.class, () -> TurnAllocationOptions.IPV4.reservationToken(new byte[4]));
+        assertThrows(IllegalArgumentException.class, () -> new TurnAllocationOptions(
+                com.github.auties00.parley.stun.StunAddressFamily.IPV4, java.util.Optional.empty(), false, true,
+                false, java.util.OptionalLong.of(1), java.util.Optional.empty()));
+    }
+
+    @Test
+    @DisplayName("carries DONT-FRAGMENT on Send indications only when the allocation accepted it")
+    void dontFragmentIndications() throws Exception {
+        try (var client = connect(TurnTransport.UDP)) {
+            var allocation = client.allocate(TurnAllocationOptions.IPV4.withDontFragment(true), TIMEOUT);
+            assertTrue(allocation.dontFragment());
+            allocation.createPermission(peerAddress().getAddress(), TIMEOUT);
+            allocation.send(ByteBuffer.wrap(new byte[]{1}), peerAddress());
+            receiveOnPeer(peer);
+            assertEquals(1, server.dontFragmentIndications());
+        }
+        server.rejectDontFragment(true);
+        try (var client = connect(TurnTransport.UDP)) {
+            var allocation = client.allocate(TurnAllocationOptions.IPV4.withDontFragment(true), TIMEOUT);
+            assertFalse(allocation.dontFragment());
+            allocation.createPermission(peerAddress().getAddress(), TIMEOUT);
+            allocation.send(ByteBuffer.wrap(new byte[]{1}), peerAddress());
+            receiveOnPeer(peer);
+            assertEquals(1, server.dontFragmentIndications());
+        }
+    }
+
+    @Test
+    @DisplayName("connects through the system stack and clock without naming them")
+    void connectWithDefaults() throws Exception {
+        try (var client = TurnClient.connect(server.turnServer(TurnTransport.UDP), server.credentials(), TIMEOUT)) {
+            assertTrue(client.allocate(TurnAllocationOptions.IPV4, TIMEOUT).isActive());
+        }
     }
 
     private static boolean ipv6LoopbackAvailable() {

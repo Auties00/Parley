@@ -135,8 +135,8 @@ class HeaderExtensionTest {
         @Test
         @DisplayName("encodes the playout delay in tens of milliseconds")
         void playoutDelay() throws RtpFormatException {
-            assertCodec("00a064", new PlayoutDelay(100, 1000));
-            assertCodec("000000", new PlayoutDelay(0, 0));
+            assertCodec("00a064", new PlayoutDelay(java.time.Duration.ofMillis(100), java.time.Duration.ofMillis(1000)));
+            assertCodec("000000", new PlayoutDelay(java.time.Duration.ZERO, java.time.Duration.ZERO));
             assertThrows(RtpFormatException.class, () -> PlayoutDelay.parse(ByteBuffer.wrap(HEX.parseHex("064000"))));
         }
 
