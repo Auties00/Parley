@@ -146,6 +146,19 @@ final class SystemNetworkStack implements NetworkStack {
         }
 
         @Override
+        public boolean setTrafficClass(int dscp) {
+            if (dscp < 0 || dscp > 63) {
+                throw new IllegalArgumentException("dscp must be in 0..63: " + dscp);
+            }
+            try {
+                channel.setOption(StandardSocketOptions.IP_TOS, dscp << 2);
+                return true;
+            } catch (IOException | UnsupportedOperationException exception) {
+                return false;
+            }
+        }
+
+        @Override
         public InetSocketAddress receive(ByteBuffer destination) throws IOException {
             var source = channel.receive(destination);
             if (source == null) {

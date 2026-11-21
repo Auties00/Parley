@@ -47,6 +47,10 @@ public record TransportFeedback(long senderSsrc, long mediaSsrc, int baseSequenc
     /// The feedback message type of transport-wide feedback.
     public static final int FORMAT = 15;
 
+    /// The most packet statuses a parsed feedback may report: half the sequence space, beyond which the sender could
+    /// not tell the range from a wrap, and the bound libwebrtc puts on one feedback (`kMaxReportedPackets`).
+    public static final int MAX_STATUS_COUNT = 0x7FFF;
+
     /// The unit of the receive deltas, in microseconds.
     public static final long DELTA_UNIT_MICROS = 250;
 
@@ -164,6 +168,10 @@ public record TransportFeedback(long senderSsrc, long mediaSsrc, int baseSequenc
         var feedbackCount = word & 0xFF;
         if (count == 0) {
             throw new RtcpFormatException("transport feedback with no packet status");
+        }
+        if (count > MAX_STATUS_COUNT) {
+            throw new RtcpFormatException("transport feedback reports more than " + MAX_STATUS_COUNT + " packets: "
+                    + count);
         }
         var symbols = new int[count];
         var filled = 0;

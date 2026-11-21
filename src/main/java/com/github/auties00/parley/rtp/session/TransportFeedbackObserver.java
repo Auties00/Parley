@@ -1,5 +1,6 @@
 package com.github.auties00.parley.rtp.session;
 
+import com.github.auties00.parley.rtp.rtcp.CongestionControlFeedback;
 import com.github.auties00.parley.rtp.rtcp.ReceptionReport;
 import com.github.auties00.parley.rtp.rtcp.Remb;
 import com.github.auties00.parley.rtp.rtcp.TransportFeedback;
@@ -7,7 +8,8 @@ import com.github.auties00.parley.rtp.rtcp.TransportFeedback;
 import java.util.List;
 
 /// Observes what a sender-side congestion controller needs: every packet that actually left, and every piece of
-/// congestion feedback the peer returned.
+/// congestion feedback the peer returned: transport-wide feedback, RFC 8888 congestion control feedback, REMB and
+/// reception reports.
 ///
 /// # Threading
 ///
@@ -20,14 +22,8 @@ import java.util.List;
 public interface TransportFeedbackObserver {
     /// Called after a packet was written to the transport.
     ///
-    /// @param transportSequence the transport-wide sequence number stamped on it, `0..65535`, or `-1` when the
-    ///                          session did not negotiate the transport-wide sequence extension
-    /// @param sizeBytes         the packet's size before SRTP protection, header and padding included
-    /// @param sendNanos         when it was sent, in nanoseconds of the session's clock
-    /// @param priority          its priority class
-    /// @param probe             whether it belonged to a probe cluster
-    void onPacketSent(int transportSequence, int sizeBytes, long sendNanos, OutgoingPacketScheduler.Priority priority,
-                      boolean probe);
+    /// @param packet the packet
+    void onPacketSent(SentPacket packet);
 
     /// Called for every transport-wide feedback packet received.
     ///
@@ -48,4 +44,15 @@ public interface TransportFeedbackObserver {
     ///                     `LSR`
     /// @param arrivalNanos when the report arrived, in nanoseconds of the session's clock
     void onReceptionReports(List<ReceptionReport> reports, long rttNanos, long arrivalNanos);
+
+    /// Called for every RFC 8888 congestion control feedback received, which names packets by SSRC and RTP sequence
+    /// number instead of a transport-wide sequence number.
+    ///
+    /// @implSpec The default implementation ignores the feedback.
+    ///
+    /// @param feedback     the feedback
+    /// @param arrivalNanos when it arrived, in nanoseconds of the session's clock
+    /// @spec https://www.rfc-editor.org/rfc/rfc8888.html RFC 8888: RTP Control Protocol (RTCP) Feedback for Congestion Control
+    default void onCongestionControlFeedback(CongestionControlFeedback feedback, long arrivalNanos) {
+    }
 }

@@ -1,10 +1,11 @@
 package com.github.auties00.parley.cc;
 
 import com.github.auties00.parley.net.MonotonicClock;
+import com.github.auties00.parley.rtp.rtcp.CongestionControlFeedback;
 import com.github.auties00.parley.rtp.rtcp.ReceptionReport;
 import com.github.auties00.parley.rtp.rtcp.Remb;
 import com.github.auties00.parley.rtp.rtcp.TransportFeedback;
-import com.github.auties00.parley.rtp.session.OutgoingPacketScheduler;
+import com.github.auties00.parley.rtp.session.SentPacket;
 
 import java.time.Duration;
 import java.util.ArrayList;
@@ -15,38 +16,60 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.OptionalLong;
-import java.util.function.Consumer;
 import java.util.concurrent.locks.ReentrantLock;
+import java.util.function.Consumer;
 
 /// The Google Congestion Control estimator of draft-ietf-rmcat-gcc-02, in its send-side form driven by
-/// transport-wide congestion control feedback.
+/// transport-wide congestion control feedback or RFC 8888 congestion control feedback.
 ///
 /// The target is the smallest of three estimates, clamped to the configured bounds:
 ///
 /// - the delay-based estimate: packet groups' inter-arrival delay variation is filtered into a trend, an over-use
 ///   detector with an adaptive threshold classifies it, and an AIMD controller raises or lowers the rate, using the
 ///   acknowledged throughput as the base of a decrease and the result of probes as a direct measurement;
-/// - the loss-based estimate, from the loss transport feedback reports (or, when no transport feedback arrives,
-///   from receiver reports), capped at the delay-based one;
+/// - the loss-based estimate, from the loss the feedback reports (or, when no feedback arrives, from receiver
+///   reports), capped at the delay-based one;
 /// - the most recent REMB, the receiver's own limit.
 ///
-/// The pacer runs at the target times the configured pacing factor. Probing starts with the first sent packet:
-/// two initial probes and exponential probing, then periodic probes while the sender is application-limited.
+/// The congestion window then bounds the bytes in flight to what the target sends in one round trip plus
+/// [CongestionController#WINDOW_QUEUE_ALLOWANCE]: while more are in flight the pacer holds every packet but audio,
+/// and the reported target is lowered step by step with the window's fill (and raised back as it drains). The window
+/// applies only while feedback keeps arriving.
 ///
-/// Without any transport feedback (a peer that only sends REMB and receiver reports) the delay-based estimate is
-/// absent and the target follows the loss-based estimate capped at the REMB.
+/// The pacer runs at the target times the configured pacing factor. Probing starts with the first sent packet: two
+/// initial probes and exponential probing, then periodic probes while the sender is application-limited.
+///
+/// Without any feedback (a peer that only sends REMB and receiver reports) the delay-based estimate is absent and the
+/// target follows the loss-based estimate capped at the REMB.
+///
+/// @implNote This implementation runs the loss-based controller the GCC draft specifies (section 6), not the
+/// heuristic "loss-based v2" controller of later libwebrtc releases, which no specification describes; the choice is
+/// deliberate.
 ///
 /// @spec https://datatracker.ietf.org/doc/html/draft-ietf-rmcat-gcc-02 A Google Congestion Control Algorithm for Real-Time Communication
 /// @spec https://datatracker.ietf.org/doc/html/draft-holmer-rmcat-transport-wide-cc-extensions-01 draft-holmer-rmcat-transport-wide-cc-extensions-01: RTP Extensions for Transport-wide Congestion Control
+/// @spec https://www.rfc-editor.org/rfc/rfc8888.html RFC 8888: RTP Control Protocol (RTCP) Feedback for Congestion Control
 /// @spec https://datatracker.ietf.org/doc/html/draft-alvestrand-rmcat-remb-03 RTCP message for Receiver Estimated Maximum Bitrate
-public final class GoogleCongestionController implements CongestionController {
+final class GoogleCongestionController implements CongestionController {
     private static final System.Logger LOGGER = System.getLogger(GoogleCongestionController.class.getName());
 
     /// The round-trip time assumed before any measurement: 200 ms.
     static final long DEFAULT_RTT_NANOS = 200_000_000L;
 
-    /// Receiver-report loss is used only when no transport feedback reported loss for this long.
+    /// Receiver-report loss is used only when no feedback reported loss for this long.
     static final long TWCC_LOSS_FRESHNESS_NANOS = 2_000_000_000L;
+
+    /// The congestion window applies only while feedback arrived within this long.
+    static final long WINDOW_FEEDBACK_TIMEOUT_NANOS = 2_000_000_000L;
+
+    /// The smallest congestion window, in bytes: a few packets, so a low target can still make progress.
+    static final long MIN_WINDOW_BYTES = 6_000;
+
+    /// The lowest share of the estimate the congestion window pushback lowers the reported target to.
+    static final double MIN_PUSHBACK_RATIO = 0.1;
+
+    /// The receivers whose report state is remembered at most; reports name local send streams only.
+    static final int MAX_REPORTED_SSRCS = 64;
 
     /// The smoothing of feedback-derived round-trip time samples.
     private static final double RTT_SMOOTHING = 0.9;
@@ -65,7 +88,7 @@ public final class GoogleCongestionController implements CongestionController {
     private final ProbeController probeController;
     private final ProbeBitrateEstimator probeEstimator;
     private final Map<Long, long[]> receiverReportState;
-    private Consumer<TargetBitrate> listener;
+    private Consumer<? super TargetBitrate> listener;
     private TargetBitrate target;
     private long targetSequence;
     private long deliveredSequence;
@@ -75,11 +98,16 @@ public final class GoogleCongestionController implements CongestionController {
     private boolean reportedRtt;
     private boolean feedbackRttKnown;
     private boolean transportFeedbackSeen;
+    private long lastFeedbackNanos;
     private long lastTwccLossNanos;
     private boolean twccLossSeen;
     private boolean probingStarted;
     private long referenceTime;
     private boolean referenceTimeKnown;
+    private long reportTimestamp;
+    private boolean reportTimestampKnown;
+    private double pushbackRatio = 1;
+    private boolean congested;
 
     /// Creates a controller.
     ///
@@ -90,7 +118,7 @@ public final class GoogleCongestionController implements CongestionController {
         this.clock = config.clock();
         var startPacing = (long) (config.startBitrateBps() * config.pacingFactor());
         this.pacer = new Pacer(clock, startPacing, config.maxQueueTime().toNanos(), config.paceAudio(),
-                startThread ? config.threadFactory() : null);
+                startThread ? config.threadFactory() : null, config.failureListener());
         this.lock = new ReentrantLock();
         this.listenerLock = new ReentrantLock();
         this.history = new SendHistory();
@@ -102,8 +130,7 @@ public final class GoogleCongestionController implements CongestionController {
         this.probeController = new ProbeController(config.maxBitrateBps());
         this.probeEstimator = new ProbeBitrateEstimator();
         this.receiverReportState = new HashMap<>();
-        this.listener = _ -> {
-        };
+        this.listener = config.targetListener();
         this.maxBitrateBps = config.maxBitrateBps();
         this.rembLimitBps = Long.MAX_VALUE;
         this.rttNanos = DEFAULT_RTT_NANOS;
@@ -117,7 +144,9 @@ public final class GoogleCongestionController implements CongestionController {
     }
 
     @Override
+    @Deprecated(forRemoval = true)
     public void setTargetListener(Consumer<TargetBitrate> listener) {
+        // TODO: remove once peer.TransportBackend passes the listener in its CongestionConfig (cross-group).
         Objects.requireNonNull(listener, "listener");
         lock.lock();
         try {
@@ -132,6 +161,16 @@ public final class GoogleCongestionController implements CongestionController {
         lock.lock();
         try {
             return target;
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    @Override
+    public long bytesInFlight() {
+        lock.lock();
+        try {
+            return history.bytesInFlight();
         } finally {
             lock.unlock();
         }
@@ -159,27 +198,26 @@ public final class GoogleCongestionController implements CongestionController {
 
     /// Records a sent packet; a packet sent while the pacer sends a probe is attributed to that probe.
     ///
-    /// @param transportSequence the 16-bit transport-wide sequence number the packet carries
-    /// @param sizeBytes         the packet size on the wire, before SRTP
-    /// @param sendNanos         when it was sent, on this controller's clock
-    /// @param priority          its priority class
-    /// @param probe             whether the session knows it is a probe
+    /// @param packet the packet
     @Override
-    public void onPacketSent(int transportSequence, int sizeBytes, long sendNanos,
-                             OutgoingPacketScheduler.Priority priority, boolean probe) {
-        Objects.requireNonNull(priority, "priority");
+    public void onPacketSent(SentPacket packet) {
+        Objects.requireNonNull(packet, "packet");
         var cluster = Pacer.PROBE.isBound() ? Optional.of(Pacer.PROBE.get()) : Optional.<ProbeCluster>empty();
         List<ProbeCluster> initialProbes = List.of();
+        boolean congestedNow;
         lock.lock();
         try {
-            history.add(transportSequence, sizeBytes, sendNanos, priority, cluster);
+            history.add(packet.transportSequence(), packet.ssrc(), packet.sequence(), packet.size(),
+                    packet.sendNanos(), packet.priority(), cluster);
             if (!probingStarted) {
                 probingStarted = true;
-                initialProbes = probeController.onStart(target.bitsPerSecond(), sendNanos);
+                initialProbes = probeController.onStart(target.bitsPerSecond(), packet.sendNanos());
             }
+            congestedNow = updateCongestion(packet.sendNanos());
         } finally {
             lock.unlock();
         }
+        pacer.setCongested(congestedNow);
         initialProbes.forEach(pacer::addProbe);
     }
 
@@ -190,6 +228,19 @@ public final class GoogleCongestionController implements CongestionController {
         lock.lock();
         try {
             update = handleTransportFeedback(feedback, arrivalNanos);
+        } finally {
+            lock.unlock();
+        }
+        apply(update);
+    }
+
+    @Override
+    public void onCongestionControlFeedback(CongestionControlFeedback feedback, long arrivalNanos) {
+        Objects.requireNonNull(feedback, "feedback");
+        Update update;
+        lock.lock();
+        try {
+            update = handleCongestionControlFeedback(feedback, arrivalNanos);
         } finally {
             lock.unlock();
         }
@@ -224,6 +275,10 @@ public final class GoogleCongestionController implements CongestionController {
             long expected = 0;
             long lost = 0;
             for (var report : reports) {
+                if (!receiverReportState.containsKey(report.ssrc())
+                        && receiverReportState.size() >= MAX_REPORTED_SSRCS) {
+                    continue;
+                }
                 var previous = receiverReportState.put(report.ssrc(),
                         new long[]{report.extendedHighestSequence(), report.cumulativeLost()});
                 if (previous != null) {
@@ -236,7 +291,7 @@ public final class GoogleCongestionController implements CongestionController {
             }
             var twccFresh = twccLossSeen && arrivalNanos - lastTwccLossNanos < TWCC_LOSS_FRESHNESS_NANOS;
             if (!twccFresh && expected > 0) {
-                lossBased.onLoss(expected, lost, this.rttNanos, arrivalNanos);
+                lossBased.onLoss(expected, Math.clamp(lost, 0, expected), this.rttNanos, arrivalNanos);
                 if (transportFeedbackSeen) {
                     lossBased.capAt(delayBased.estimate());
                 }
@@ -256,12 +311,11 @@ public final class GoogleCongestionController implements CongestionController {
     private record Received(SendHistory.SentPacket packet, long arrivalNanos) {
     }
 
-    private record Update(List<ProbeCluster> probes, long pacingRateBps, long targetBps,
-                          Optional<TargetBitrate> target, long sequence, Consumer<TargetBitrate> listener) {
+    private record Update(List<ProbeCluster> probes, long pacingRateBps, long targetBps, boolean congested,
+                          Optional<TargetBitrate> target, long sequence, Consumer<? super TargetBitrate> listener) {
     }
 
     private Update handleTransportFeedback(TransportFeedback feedback, long nowNanos) {
-        transportFeedbackSeen = true;
         var reference = feedback.referenceTime64ms() & 0xFFFFFF;
         referenceTime = referenceTimeKnown ? SequenceUnwrapper.nearest(referenceTime, reference, 1 << 24) : reference;
         referenceTimeKnown = true;
@@ -270,7 +324,11 @@ public final class GoogleCongestionController implements CongestionController {
         long expected = 0;
         long lost = 0;
         for (var result : feedback.results()) {
-            var sent = history.get(history.unwrap(result.transportSequence()));
+            var unwrapped = history.unwrap(result.transportSequence());
+            var sent = history.get(unwrapped);
+            if (sent.isPresent()) {
+                history.markReported(unwrapped);
+            }
             if (result.receiveDeltaMicros().isPresent()) {
                 arrivalNanos += result.receiveDeltaMicros().getAsLong() * 1_000L;
                 if (sent.isPresent()) {
@@ -282,6 +340,49 @@ public final class GoogleCongestionController implements CongestionController {
                 lost++;
             }
         }
+        return onFeedback(received, expected, lost, nowNanos);
+    }
+
+    /// Matches RFC 8888 feedback against the send history by SSRC and sequence number. A packet reported more than
+    /// once (reports overlap when a receiver repeats its window) counts only the first time.
+    private Update handleCongestionControlFeedback(CongestionControlFeedback feedback, long nowNanos) {
+        var timestamp = feedback.reportTimestamp();
+        reportTimestamp = reportTimestampKnown
+                ? SequenceUnwrapper.nearest(reportTimestamp, timestamp, 1L << 32) : timestamp;
+        reportTimestampKnown = true;
+        var reportNanos = reportTimestamp / 65_536 * 1_000_000_000L
+                + (reportTimestamp % 65_536) * 1_000_000_000L / 65_536;
+        var received = new ArrayList<Received>();
+        long expected = 0;
+        long lost = 0;
+        for (var report : feedback.reports()) {
+            var sequence = report.beginSequence();
+            for (var metric : report.metrics()) {
+                var sent = history.takeBySsrc(report.ssrc(), sequence);
+                sequence = (sequence + 1) & 0xFFFF;
+                if (sent.isEmpty()) {
+                    continue;
+                }
+                expected++;
+                if (!metric.received()) {
+                    lost++;
+                    continue;
+                }
+                var offset = metric.arrivalTimeOffset();
+                if (offset == CongestionControlFeedback.Metric.OVER_RANGE
+                        || offset == CongestionControlFeedback.Metric.UNAVAILABLE) {
+                    continue;
+                }
+                received.add(new Received(sent.get(), reportNanos - offset * 1_000_000_000L / 1_024));
+            }
+        }
+        return onFeedback(received, expected, lost, nowNanos);
+    }
+
+    /// Runs the estimators on the packets one feedback reported.
+    private Update onFeedback(List<Received> received, long expected, long lost, long nowNanos) {
+        transportFeedbackSeen = true;
+        lastFeedbackNanos = nowNanos;
         if (expected > 0) {
             lossBased.onLoss(expected, lost, rttNanos, nowNanos);
             lastTwccLossNanos = nowNanos;
@@ -327,24 +428,68 @@ public final class GoogleCongestionController implements CongestionController {
         feedbackRttKnown = true;
     }
 
-    private Update recompute(long nowNanos, List<ProbeCluster> probes) {
+    /// {@return the congestion window in bytes for an estimate}
+    private long window(long bitrateBps) {
+        var nanos = rttNanos + WINDOW_QUEUE_ALLOWANCE.toNanos();
+        return Math.max(MIN_WINDOW_BYTES, bitrateBps / 8 * nanos / 1_000_000_000L);
+    }
+
+    /// {@return whether the window is full now}; updates [#congested]. Called under the lock.
+    private boolean updateCongestion(long nowNanos) {
+        congested = config.congestionWindow() && transportFeedbackSeen
+                && nowNanos - lastFeedbackNanos < WINDOW_FEEDBACK_TIMEOUT_NANOS
+                && history.bytesInFlight() > window(estimate());
+        return congested;
+    }
+
+    /// {@return the estimate before the congestion window pushback}
+    private long estimate() {
         var delay = transportFeedbackSeen ? delayBased.estimate() : Long.MAX_VALUE;
         var bitrate = Math.min(Math.min(delay, lossBased.estimate()), rembLimitBps);
-        bitrate = Math.clamp(bitrate, config.minBitrateBps(), maxBitrateBps);
+        return Math.clamp(bitrate, config.minBitrateBps(), maxBitrateBps);
+    }
+
+    /// Steps the pushback ratio with the window's fill, as libwebrtc's congestion window pushback does. Called under
+    /// the lock with feedback.
+    private void updatePushback(long bitrate, long nowNanos) {
+        if (!config.congestionWindow() || !transportFeedbackSeen
+                || nowNanos - lastFeedbackNanos >= WINDOW_FEEDBACK_TIMEOUT_NANOS) {
+            pushbackRatio = 1;
+            return;
+        }
+        var fill = (double) history.bytesInFlight() / window(bitrate);
+        if (fill > 1.5) {
+            pushbackRatio *= 0.9;
+        } else if (fill > 1) {
+            pushbackRatio *= 0.95;
+        } else if (fill < 0.1) {
+            pushbackRatio = 1;
+        } else {
+            pushbackRatio = Math.min(1, pushbackRatio * 1.05);
+        }
+        pushbackRatio = Math.max(MIN_PUSHBACK_RATIO, pushbackRatio);
+    }
+
+    private Update recompute(long nowNanos, List<ProbeCluster> probes) {
+        var estimate = estimate();
+        updatePushback(estimate, nowNanos);
+        var bitrate = Math.max(config.minBitrateBps(), (long) (estimate * pushbackRatio));
         var stable = Math.min(bitrate, delayBased.linkCapacity().orElse(bitrate));
         stable = Math.max(stable, Math.min(config.minBitrateBps(), bitrate));
-        var pacing = Math.max(1, (long) (bitrate * config.pacingFactor()));
+        var pacing = Math.max(1, (long) (estimate * config.pacingFactor()));
         Optional<TargetBitrate> changed = Optional.empty();
         if (bitrate != target.bitsPerSecond() || stable != target.stableBitsPerSecond()) {
             target = new TargetBitrate(bitrate, stable, lossBased.lossRatio(), Duration.ofNanos(rttNanos), nowNanos);
             targetSequence++;
             changed = Optional.of(target);
         }
-        return new Update(List.copyOf(probes), pacing, bitrate, changed, targetSequence, listener);
+        var congestedNow = updateCongestion(nowNanos);
+        return new Update(List.copyOf(probes), pacing, bitrate, congestedNow, changed, targetSequence, listener);
     }
 
     private void apply(Update update) {
         pacer.setRates(update.pacingRateBps(), update.targetBps());
+        pacer.setCongested(update.congested());
         update.probes().forEach(pacer::addProbe);
         if (update.target().isEmpty()) {
             return;

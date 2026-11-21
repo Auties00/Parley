@@ -6,6 +6,7 @@ import com.github.auties00.parley.rtp.SequenceNumbers;
 import java.nio.ByteBuffer;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.OptionalLong;
 
 /// Rewrites the packets of several source streams into one continuous output stream: the SFU helper that forwards
 /// one simulcast layer at a time to a receiver and switches layers without the receiver seeing a new stream.
@@ -36,6 +37,9 @@ public final class RtpStreamRewriter {
     private long timestampOffset;
     private int switchBase;
     private boolean started;
+    private boolean anchored;
+    private int initialSequence;
+    private long initialTimestamp;
     private int lastSequence;
     private long lastTimestamp;
     private long lastArrivalNanos;
@@ -74,8 +78,8 @@ public final class RtpStreamRewriter {
     }
 
     /// {@return the source currently forwarded, if any}
-    public Optional<Long> activeSource() {
-        return activeSource < 0 ? Optional.empty() : Optional.of(activeSource);
+    public OptionalLong activeSource() {
+        return activeSource < 0 ? OptionalLong.empty() : OptionalLong.of(activeSource);
     }
 
     /// Requests a switch to another source at its next switch point.
@@ -99,8 +103,52 @@ public final class RtpStreamRewriter {
         if (tailroom < 0) {
             throw new IllegalArgumentException("tailroom cannot be negative: " + tailroom);
         }
+        var mapped = map(packet, switchPoint, arrivalNanos);
+        if (mapped.isEmpty()) {
+            return Optional.empty();
+        }
+        var out = ByteBuffer.allocate(packet.length() + tailroom);
+        out.put(packet.buffer());
+        out.putShort(2, (short) mapped.get().sequence());
+        out.putInt(4, (int) mapped.get().timestamp());
+        out.putInt(8, (int) outputSsrc);
+        out.flip();
+        return Optional.of(out);
+    }
+
+    /// The output sequence number and timestamp a source packet maps to.
+    ///
+    /// @param sequence  the output sequence number
+    /// @param timestamp the output timestamp
+    record Mapped(int sequence, long timestamp) {
+    }
+
+    /// Makes the output start at a given sequence number and timestamp, so it continues a stream that sent before
+    /// the rewriter forwarded anything; ignored once a packet was forwarded.
+    ///
+    /// @param sequence  the first output sequence number
+    /// @param timestamp the first output timestamp
+    void startAt(int sequence, long timestamp) {
+        if (!started) {
+            initialSequence = sequence & 0xFFFF;
+            initialTimestamp = timestamp & 0xFFFFFFFFL;
+            anchored = true;
+        }
+    }
+
+    /// Maps one source packet to the output spaces, advancing the switch state as [#rewrite] does, without copying
+    /// the packet.
+    ///
+    /// @param packet       a packet of any source
+    /// @param switchPoint  whether a decoder can start at the packet
+    /// @param arrivalNanos when the packet arrived
+    /// @return the output numbers, or empty when the packet is not forwarded
+    Optional<Mapped> map(RtpPacket packet, boolean switchPoint, long arrivalNanos) {
         if (packet.ssrc() == pendingSource && switchPoint) {
-            if (started) {
+            if (!started && anchored) {
+                sequenceOffset = (initialSequence - packet.sequence()) & 0xFFFF;
+                timestampOffset = (initialTimestamp - packet.timestamp()) & 0xFFFFFFFFL;
+            } else if (started) {
                 sequenceOffset = (lastSequence + 1 - packet.sequence()) & 0xFFFF;
                 var elapsed = Math.max(0, arrivalNanos - lastArrivalNanos);
                 var ticks = Math.max(1, (elapsed / 1_000_000_000L) * clockRate
@@ -116,12 +164,6 @@ public final class RtpStreamRewriter {
         }
         var sequence = (packet.sequence() + sequenceOffset) & 0xFFFF;
         var timestamp = (packet.timestamp() + timestampOffset) & 0xFFFFFFFFL;
-        var out = ByteBuffer.allocate(packet.length() + tailroom);
-        out.put(packet.buffer());
-        out.putShort(2, (short) sequence);
-        out.putInt(4, (int) timestamp);
-        out.putInt(8, (int) outputSsrc);
-        out.flip();
         if (!started || SequenceNumbers.isNewer(sequence, lastSequence)) {
             lastSequence = sequence;
             lastTimestamp = timestamp;
@@ -132,7 +174,7 @@ public final class RtpStreamRewriter {
         sources[slot] = packet.ssrc();
         sourceSequences[slot] = packet.sequence();
         outputSequences[slot] = sequence;
-        return Optional.of(out);
+        return Optional.of(new Mapped(sequence, timestamp));
     }
 
     /// {@return the source packet an output sequence number was rewritten from, while it is among the last

@@ -4,6 +4,7 @@ import com.github.auties00.parley.rtp.SequenceNumbers;
 
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
+import java.util.BitSet;
 import java.util.List;
 import java.util.Objects;
 
@@ -11,8 +12,10 @@ import java.util.Objects;
 /// `mediaSsrc` to retransmit the listed packets.
 ///
 /// On the wire the sequence numbers are packed into `PID`/`BLP` pairs: a packet id plus a bitmask of the 16 that
-/// follow it. [#sequences()] holds them unpacked, in wire order; writing packs them again, starting a new pair
-/// whenever a number is not within 16 after the current pair's id.
+/// follow it. Writing packs [#sequences()] in their order, starting a new pair whenever a number is not within 16
+/// after the current pair's id. Parsing unpacks the pairs, drops repeated numbers and orders the rest in sequence
+/// wrap order from the first `PID`: by distance from it modulo 65536. A parsed NACK therefore re-encodes to the
+/// same set of numbers however its sender repeated or ordered them.
 ///
 /// @param senderSsrc the feedback sender, an unsigned 32-bit value
 /// @param mediaSsrc  the media source whose packets are missing, an unsigned 32-bit value
@@ -46,16 +49,28 @@ public record Nack(long senderSsrc, long mediaSsrc, List<Integer> sequences) imp
         }
         var sender = RtcpCodec.uint32(body);
         var media = RtcpCodec.uint32(body);
-        var sequences = new ArrayList<Integer>();
+        var seen = new BitSet(0x10000);
+        var first = -1;
         while (body.hasRemaining()) {
             var pid = body.getShort() & 0xFFFF;
             var blp = body.getShort() & 0xFFFF;
-            sequences.add(pid);
+            if (first < 0) {
+                first = pid;
+            }
+            seen.set(pid);
             for (var bit = 0; bit < 16; bit++) {
                 if ((blp & (1 << bit)) != 0) {
-                    sequences.add(SequenceNumbers.add(pid, bit + 1));
+                    seen.set(SequenceNumbers.add(pid, bit + 1));
                 }
             }
+        }
+        var sequences = new ArrayList<Integer>(seen.cardinality());
+        for (var sequence = seen.nextSetBit(first); sequence >= 0; sequence = seen.nextSetBit(sequence + 1)) {
+            sequences.add(sequence);
+        }
+        for (var sequence = seen.nextSetBit(0); sequence >= 0 && sequence < first;
+             sequence = seen.nextSetBit(sequence + 1)) {
+            sequences.add(sequence);
         }
         return new Nack(sender, media, sequences);
     }

@@ -26,9 +26,12 @@ public record AbsCaptureTime(long captureTimestamp, OptionalLong estimatedCaptur
     ///
     /// @param value the element value; the position is advanced past the bytes read
     /// @return the capture time
-    /// @throws RtpFormatException if the value is shorter than 8 bytes
+    /// @throws RtpFormatException if the value is neither 8 nor 16 bytes long
     public static AbsCaptureTime parse(ByteBuffer value) throws RtpFormatException {
         ExtensionCodec.require(value, 8, "abs-capture-time");
+        if (value.remaining() != 8 && value.remaining() != 16) {
+            throw new RtpFormatException("abs-capture-time value is neither 8 nor 16 bytes: " + value.remaining());
+        }
         var timestamp = value.getLong();
         var offset = value.remaining() >= 8 ? OptionalLong.of(value.getLong()) : OptionalLong.empty();
         return new AbsCaptureTime(timestamp, offset);

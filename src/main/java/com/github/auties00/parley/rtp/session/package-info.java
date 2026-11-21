@@ -11,7 +11,9 @@
 ///   pacer, and the observer of sent packets and feedback.
 /// - [RtpStreamRewriter] keeps one output stream continuous across the simulcast switches of an SFU.
 ///
-/// Statistics are immutable snapshots ([SendStreamStatistics], [ReceiveStreamStatistics]).
+/// Statistics are immutable snapshots ([SendStreamStatistics], [ReceiveStreamStatistics]). A local SSRC that changes
+/// after a collision is reported as an [SsrcChange]; every packet that left reaches the congestion controller as a
+/// [SentPacket].
 ///
 /// Unless otherwise noted, passing `null` to a method or constructor of a type in this package throws
 /// [NullPointerException].

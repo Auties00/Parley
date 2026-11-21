@@ -27,6 +27,11 @@ import java.util.concurrent.locks.ReentrantLock;
 /// To keep an encoding from flapping on and off around its minimum, an encoding that was not allocated anything by
 /// the previous call is enabled only once its minimum plus [#ENABLE_HYSTERESIS] of it is available.
 ///
+/// A sender may have a ceiling ([#allocate(long, List, Map)]): the cap its m-section's `b=AS` or `b=TIAS` puts on
+/// all its encodings together. Its encodings then share at most the ceiling, filled bottom-up as above, and a
+/// ceiling below the smallest encoding's minimum lowers that minimum to the ceiling rather than suspend the sender:
+/// the remote asked for less than the encoder's floor, and a slower stream is better than none.
+///
 /// # Threading
 ///
 /// Instances are safe for use from several threads; calls are serialized, since each depends on the encodings the
@@ -54,7 +59,28 @@ public final class BitrateAllocator {
     ///         `demands`; inactive and suspended encodings map to `0`, and the rates sum to at most `targetBps`
     /// @throws IllegalArgumentException if `targetBps` is negative or two demands have the same key
     public Map<AllocationKey, Long> allocate(long targetBps, List<EncodingDemand> demands) {
+        return allocate(targetBps, demands, Map.of());
+    }
+
+    /// Splits `targetBps` among `demands`, keeping each sender within its ceiling.
+    ///
+    /// @param targetBps the rate to split, in bits per second
+    /// @param demands   one demand per encoding
+    /// @param ceilings  the highest rate all the encodings of a sender may share together, by sender id, in bits per
+    ///                  second; a sender without an entry has no ceiling
+    /// @return an unmodifiable map from every demand's key to its rate in bits per second, in the order of
+    ///         `demands`; inactive and suspended encodings map to `0`, the rates sum to at most `targetBps`, and the
+    ///         rates of one sender to at most its ceiling
+    /// @throws IllegalArgumentException if `targetBps` or a ceiling is negative, or two demands have the same key
+    /// @spec https://www.rfc-editor.org/rfc/rfc3890.html RFC 3890: A Transport Independent Bandwidth Modifier for the Session Description Protocol (SDP)
+    public Map<AllocationKey, Long> allocate(long targetBps, List<EncodingDemand> demands, Map<String, Long> ceilings) {
         Objects.requireNonNull(demands, "demands");
+        Objects.requireNonNull(ceilings, "ceilings");
+        for (var ceiling : ceilings.entrySet()) {
+            if (ceiling.getValue() < 0) {
+                throw new IllegalArgumentException("ceiling must not be negative: " + ceiling);
+            }
+        }
         if (targetBps < 0) {
             throw new IllegalArgumentException("targetBps must not be negative: " + targetBps);
         }
@@ -67,13 +93,14 @@ public final class BitrateAllocator {
         }
         lock.lock();
         try {
-            return allocateLocked(targetBps, demands);
+            return allocateLocked(targetBps, demands, ceilings);
         } finally {
             lock.unlock();
         }
     }
 
-    private Map<AllocationKey, Long> allocateLocked(long targetBps, List<EncodingDemand> demands) {
+    private Map<AllocationKey, Long> allocateLocked(long targetBps, List<EncodingDemand> demands,
+                                                    Map<String, Long> ceilings) {
         var senders = new LinkedHashMap<String, Sender>();
         for (var demand : demands) {
             if (demand.active()) {
@@ -82,17 +109,17 @@ public final class BitrateAllocator {
         }
         var ordered = new ArrayList<>(senders.values());
         for (var sender : ordered) {
-            sender.prepare(enabled);
+            var ceiling = ceilings.get(sender.id);
+            sender.prepare(enabled, ceiling == null ? Double.POSITIVE_INFINITY : ceiling);
         }
         ordered.sort(Comparator.comparingDouble((Sender sender) -> sender.priority).reversed());
         double remaining = targetBps;
         var running = new ArrayList<Sender>();
         for (var sender : ordered) {
-            var base = sender.layers.getFirst();
-            if (remaining >= sender.threshold(0)) {
-                sender.allocation[0] = base.minBitrateBps();
+            if (sender.floor(0) > 0 && remaining >= sender.threshold(0)) {
+                sender.allocation[0] = sender.floor(0);
                 sender.enabledLayers = 1;
-                remaining -= base.minBitrateBps();
+                remaining -= sender.floor(0);
                 running.add(sender);
             }
         }
@@ -144,37 +171,60 @@ public final class BitrateAllocator {
 
     /// The active encodings of one sender during one allocation.
     private static final class Sender {
+        final String id;
         final List<EncodingDemand> layers;
         double priority;
+        double ceiling;
         double[] allocation;
+        double[] floors;
         double[] thresholds;
         int enabledLayers;
 
         Sender(String id) {
+            this.id = id;
             this.layers = new ArrayList<>();
         }
 
-        void prepare(Set<AllocationKey> previouslyEnabled) {
+        void prepare(Set<AllocationKey> previouslyEnabled, double ceiling) {
             layers.sort(Comparator.comparingDouble(EncodingDemand::scaleResolutionDownBy).reversed());
             priority = layers.stream().mapToDouble(EncodingDemand::priority).max().orElse(1);
+            this.ceiling = ceiling;
             allocation = new double[layers.size()];
+            floors = new double[layers.size()];
             thresholds = new double[layers.size()];
             for (var index = 0; index < layers.size(); index++) {
                 var layer = layers.get(index);
-                var min = (double) layer.minBitrateBps();
+                var min = index == 0 ? Math.min(layer.minBitrateBps(), ceiling) : (double) layer.minBitrateBps();
+                floors[index] = min;
                 thresholds[index] = previouslyEnabled.contains(layer.key()) ? min : min * (1 + ENABLE_HYSTERESIS);
             }
+        }
+
+        double floor(int index) {
+            return floors[index];
         }
 
         double threshold(int index) {
             return thresholds[index];
         }
 
+        double total() {
+            double sum = 0;
+            for (var index = 0; index < enabledLayers; index++) {
+                sum += allocation[index];
+            }
+            return sum;
+        }
+
         double absorb(double amount) {
             double took = 0;
             while (amount - took > 1e-9) {
+                var headroom = ceiling - total();
+                if (headroom <= 1e-9) {
+                    break;
+                }
                 var top = enabledLayers - 1;
-                var room = layers.get(top).maxBitrateBps() - allocation[top];
+                var room = Math.min(Math.min(layers.get(top).maxBitrateBps(), ceiling) - allocation[top], headroom);
                 if (room > 1e-9) {
                     var add = Math.min(room, amount - took);
                     allocation[top] += add;
@@ -184,12 +234,11 @@ public final class BitrateAllocator {
                 if (enabledLayers == layers.size()) {
                     break;
                 }
-                var next = layers.get(enabledLayers);
-                if (amount - took + 1e-9 < thresholds[enabledLayers]) {
+                if (amount - took + 1e-9 < thresholds[enabledLayers] || headroom + 1e-9 < floors[enabledLayers]) {
                     break;
                 }
-                allocation[enabledLayers] = next.minBitrateBps();
-                took += next.minBitrateBps();
+                allocation[enabledLayers] = floors[enabledLayers];
+                took += floors[enabledLayers];
                 enabledLayers++;
             }
             return took;

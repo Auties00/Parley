@@ -9,6 +9,7 @@ import java.time.Duration;
 /// @param permissionRefresh the interval of permission refreshes, under the five-minute permission lifetime
 /// @param channelRefresh    the interval of channel binding refreshes, under the ten-minute channel lifetime
 /// @param closeTimeout      the longest time closing waits for the server to delete the allocation
+/// @spec https://www.rfc-editor.org/rfc/rfc8656.html RFC 8656: Traversal Using Relays around NAT (TURN): Relay Extensions to Session Traversal Utilities for NAT (STUN)
 record TurnTimers(Duration allocationMargin, Duration permissionRefresh, Duration channelRefresh, Duration closeTimeout) {
     /// The intervals of a real deployment: refresh one minute before expiry, permissions every four minutes,
     /// channels every nine.

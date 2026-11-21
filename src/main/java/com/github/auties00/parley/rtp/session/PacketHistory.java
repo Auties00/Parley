@@ -67,6 +67,12 @@ final class PacketHistory {
         return out;
     }
 
+    /// Forgets every packet, as after an SSRC change.
+    void clear() {
+        bySequence.clear();
+        order.clear();
+    }
+
     int size() {
         return order.size();
     }

@@ -1,5 +1,7 @@
 package com.github.auties00.parley.rtp.session;
 
+import java.util.OptionalInt;
+import java.util.OptionalDouble;
 import java.time.Duration;
 import java.util.Objects;
 import java.util.Optional;
@@ -21,18 +23,33 @@ import java.util.OptionalLong;
 /// @param nackCount                the NACK messages received
 /// @param pliCount                 the PLI messages received
 /// @param firCount                 the new FIR requests received
+/// @param framesSent               the frames sent: one per [RtpSendStream#send] call, one per forwarded marker bit
+/// @param keyFramesSent            those of them that were key frames
+/// @param frameWidth               the width of the last frame whose size was given, in pixels
+/// @param frameHeight              the height of the last frame whose size was given, in pixels
+/// @param framesPerSecond          the frames sent in the last second, once the stream has sent for a second
+/// @param totalPacketSendDelay     the sum of the time each media packet waited in the scheduler (the pacer queue)
+///                                 between being scheduled and leaving
+/// @param droppedPackets           the packets dropped unsent: after the stream was removed, or forwarded from a
+///                                 source not switched to yet
 /// @param remote                   what the remote receiver last reported, once it reported
 /// @spec https://www.w3.org/TR/webrtc-stats/ Identifiers for WebRTC's Statistics API
 public record SendStreamStatistics(long ssrc, OptionalLong rtxSsrc, Optional<String> rid, long packetsSent,
                                    long bytesSent, long headerBytesSent, long retransmittedPacketsSent,
                                    long retransmittedBytesSent, long fecPacketsSent, long paddingPacketsSent,
-                                   long nackCount, long pliCount, long firCount,
-                                   Optional<RemoteReception> remote) {
+                                   long nackCount, long pliCount, long firCount, long framesSent,
+                                   long keyFramesSent, OptionalInt frameWidth, OptionalInt frameHeight,
+                                   OptionalDouble framesPerSecond, Duration totalPacketSendDelay,
+                                   long droppedPackets, Optional<RemoteReception> remote) {
     /// Checks the optional fields are not `null`.
     public SendStreamStatistics {
         Objects.requireNonNull(rtxSsrc, "rtxSsrc cannot be null");
         Objects.requireNonNull(rid, "rid cannot be null");
         Objects.requireNonNull(remote, "remote cannot be null");
+        Objects.requireNonNull(frameWidth, "frameWidth cannot be null");
+        Objects.requireNonNull(frameHeight, "frameHeight cannot be null");
+        Objects.requireNonNull(framesPerSecond, "framesPerSecond cannot be null");
+        Objects.requireNonNull(totalPacketSendDelay, "totalPacketSendDelay cannot be null");
     }
 
     /// The remote receiver's last reception report about the stream, and the round-trip times measured from its

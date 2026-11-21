@@ -4,32 +4,37 @@ import com.github.auties00.parley.rtp.RtpFormatException;
 
 import java.net.URI;
 import java.nio.ByteBuffer;
+import java.time.Duration;
+import java.util.Objects;
 
 /// The playout delay limits the sender asks the receiver's jitter buffer to respect: `0/0` asks for rendering as
 /// soon as possible (game streaming, remote desktop), larger values for smoother playback.
 ///
 /// Both limits travel as 12-bit counts of 10 milliseconds, so a written value is rounded down to 10 ms.
 ///
-/// @param minimumMillis the minimum delay in milliseconds, `0..40950`
-/// @param maximumMillis the maximum delay in milliseconds, `0..40950`
+/// @param minimum the minimum delay, `0..40950` milliseconds
+/// @param maximum the maximum delay, `0..40950` milliseconds, at least `minimum`
 /// @spec https://webrtc.googlesource.com/src/+/refs/heads/main/docs/native-code/rtp-hdrext/playout-delay/README.md WebRTC: Playout Delay
-public record PlayoutDelay(int minimumMillis, int maximumMillis) implements HeaderExtension {
+public record PlayoutDelay(Duration minimum, Duration maximum) implements HeaderExtension {
     /// The encoded length.
     public static final int LENGTH = 3;
 
-    /// The largest representable delay in milliseconds.
-    public static final int MAXIMUM_MILLIS = 4095 * 10;
+    /// The largest representable delay: 4095 units of 10 milliseconds.
+    public static final Duration MAXIMUM = Duration.ofMillis(4095 * 10);
 
     /// Validates the ranges.
     ///
-    /// @throws IllegalArgumentException if a limit is out of range or the minimum exceeds the maximum
+    /// @throws IllegalArgumentException if a limit is negative or above [#MAXIMUM], or the minimum exceeds the
+    ///                                  maximum
     public PlayoutDelay {
-        if (minimumMillis < 0 || minimumMillis > MAXIMUM_MILLIS || maximumMillis < 0
-                || maximumMillis > MAXIMUM_MILLIS) {
-            throw new IllegalArgumentException("delays must be in 0.." + MAXIMUM_MILLIS);
+        Objects.requireNonNull(minimum, "minimum cannot be null");
+        Objects.requireNonNull(maximum, "maximum cannot be null");
+        if (minimum.isNegative() || maximum.isNegative() || minimum.compareTo(MAXIMUM) > 0
+                || maximum.compareTo(MAXIMUM) > 0) {
+            throw new IllegalArgumentException("delays must be in 0.." + MAXIMUM.toMillis() + " ms");
         }
-        if (minimumMillis > maximumMillis) {
-            throw new IllegalArgumentException("minimum exceeds maximum: " + minimumMillis + " > " + maximumMillis);
+        if (minimum.compareTo(maximum) > 0) {
+            throw new IllegalArgumentException("minimum exceeds maximum: " + minimum + " > " + maximum);
         }
     }
 
@@ -46,7 +51,7 @@ public record PlayoutDelay(int minimumMillis, int maximumMillis) implements Head
         if (minimum > maximum) {
             throw new RtpFormatException("playout-delay minimum exceeds maximum");
         }
-        return new PlayoutDelay(minimum, maximum);
+        return new PlayoutDelay(Duration.ofMillis(minimum), Duration.ofMillis(maximum));
     }
 
     @Override
@@ -62,7 +67,7 @@ public record PlayoutDelay(int minimumMillis, int maximumMillis) implements Head
     @Override
     public void writeTo(ByteBuffer destination) {
         ExtensionCodec.checkRoom(destination, LENGTH);
-        var raw = (minimumMillis / 10) << 12 | maximumMillis / 10;
+        var raw = (int) (minimum.toMillis() / 10) << 12 | (int) (maximum.toMillis() / 10);
         destination.put((byte) (raw >>> 16)).put((byte) (raw >>> 8)).put((byte) raw);
     }
 }

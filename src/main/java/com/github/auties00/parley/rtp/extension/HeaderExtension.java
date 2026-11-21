@@ -40,7 +40,7 @@ public sealed interface HeaderExtension permits Mid, RtpStreamId, RepairedRtpStr
     ///
     /// The dependency descriptor is not parsed here: its frame fields can only be read against the latest template
     /// structure of the stream, so it is read with
-    /// [DependencyDescriptor#parse(ByteBuffer, Optional)].
+    /// [DependencyDescriptor#parse(ByteBuffer, DependencyDescriptor.TemplateStructure)].
     ///
     /// @param uri   the negotiated URI of the element
     /// @param value the element value between position and limit; it is not modified

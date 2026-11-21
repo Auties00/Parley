@@ -46,14 +46,20 @@ import java.util.Set;
 ///
 /// {@snippet lang = java :
 /// var server = TurnServer.parse(URI.create("turns:turn.example.org"));
-/// try (var client = TurnClient.connect(server, new TurnCredentials("user", "secret"), stack,
-///         MonotonicClock.system(), Duration.ofSeconds(5))) {
-///     var allocation = client.allocate(TurnAllocationOptions.IPV4, Duration.ofSeconds(5));
-///     allocation.setReceiver((peer, data, arrival) -> handle(peer, data));
+/// try (var client = TurnClient.connect(server, new TurnCredentials("user", "secret"), Duration.ofSeconds(5))) {
+///     var allocation = client.allocate(TurnAllocationOptions.IPV4
+///             .receiver((peer, data, arrival) -> handle(peer, data)), Duration.ofSeconds(5));
 ///     allocation.createPermission(peer.getAddress(), Duration.ofSeconds(5));
 ///     allocation.send(datagram, peer);
 /// }
 /// }
+///
+/// # Redirection
+///
+/// A 300 Try Alternate answer to the Allocate request moves the client to the server its `ALTERNATE-SERVER` names
+/// (over the same transport, with the TLS name of `ALTERNATE-DOMAIN` when present) and the Allocate starts over
+/// there with the same credentials and a fresh challenge. Each server is tried once: a redirection back to a server
+/// already tried fails the allocation with error 300.
 ///
 /// # Authentication
 ///
@@ -105,8 +111,8 @@ public final class TurnClient implements AutoCloseable {
     /// The refresh intervals.
     private final TurnTimers timers;
 
-    /// The connection to the server.
-    private final Link link;
+    /// The connection to the current server; replaced when the server redirects the Allocate.
+    private volatile Link link;
 
     /// The outstanding transactions.
     private final StunClientTransactions transactions;
@@ -193,8 +199,73 @@ public final class TurnClient implements AutoCloseable {
             case TLS -> new StreamLink(stack.connectTls(server.unresolvedAddress(), server.host(), timeout));
         };
         var client = new TurnClient(server, credentials, stack, clock, timers, link);
-        stack.threadFactory().newThread(client::readLoop).start();
+        client.startReading(link);
         return client;
+    }
+
+    /// Connects to a TURN server through the system network stack, with virtual threads and the system clock; see
+    /// [#connect(TurnServer,TurnCredentials,NetworkStack,MonotonicClock,Duration)].
+    ///
+    /// @param server      the server
+    /// @param credentials the long-term credentials
+    /// @param timeout     the longest time connecting may take
+    /// @return the connected client
+    /// @throws IOException if the server cannot be resolved or reached
+    public static TurnClient connect(TurnServer server, TurnCredentials credentials, Duration timeout)
+            throws IOException {
+        return connect(server, credentials, NetworkStack.system(Thread.ofVirtual().name("parley-turn-", 0).factory()),
+                MonotonicClock.system(), timeout);
+    }
+
+    /// Opens a link to a server address over the transport of [#server].
+    private Link open(InetSocketAddress address, String tlsName, Duration timeout) throws IOException {
+        return switch (server.transport()) {
+            case UDP -> {
+                var wildcard = address.getAddress() instanceof Inet6Address
+                        ? InetAddress.ofLiteral("::")
+                        : InetAddress.ofLiteral("0.0.0.0");
+                var endpoint = stack.bindUdp(new InetSocketAddress(wildcard, 0));
+                yield new UdpLink(endpoint, address);
+            }
+            case TCP -> new StreamLink(stack.connectTcp(address, timeout));
+            case TLS -> new StreamLink(stack.connectTls(address, tlsName, timeout));
+        };
+    }
+
+    /// Starts the reading thread of a link.
+    private void startReading(Link reading) {
+        stack.threadFactory().newThread(() -> readLoop(reading)).start();
+    }
+
+    /// Moves the client to the server a 300 Try Alternate named, forgetting the old server's challenge.
+    ///
+    /// @throws TurnException if the response names no alternate or one already tried
+    private void redirect(StunMessage response, java.util.Set<InetSocketAddress> tried, long deadline)
+            throws IOException {
+        var alternate = response.attribute(StunAttribute.AlternateServer.class)
+                .orElseThrow(() -> new TurnException("300 Try Alternate without ALTERNATE-SERVER",
+                        ErrorCode.TRY_ALTERNATE))
+                .address();
+        if (!tried.add(alternate)) {
+            throw new TurnException("the TURN server redirected to " + alternate + ", already tried",
+                    ErrorCode.TRY_ALTERNATE);
+        }
+        var tlsName = response.attribute(StunAttribute.AlternateDomain.class)
+                .map(StunAttribute.AlternateDomain::value).orElse(server.host());
+        var replacement = open(alternate, tlsName, remaining(deadline));
+        var previous = link;
+        synchronized (lock) {
+            realm = null;
+            nonce = null;
+            key = null;
+            integrity = StunIntegrity.HMAC_SHA1;
+            offeredAlgorithms = null;
+            algorithm = StunPasswordAlgorithm.MD5;
+            userHash = false;
+            link = replacement;
+        }
+        startReading(replacement);
+        previous.close();
     }
 
     /// {@return the server this client is connected to}
@@ -221,15 +292,17 @@ public final class TurnClient implements AutoCloseable {
 
     /// Creates the allocation of this client.
     ///
-    /// Sends Allocate with `REQUESTED-TRANSPORT` UDP and the options' family, lifetime and `DONT-FRAGMENT`, answers
-    /// the 401 challenge with the credentials, and starts the refresh timer.
+    /// Sends Allocate with `REQUESTED-TRANSPORT` UDP and the options' family, lifetime, `DONT-FRAGMENT`, `EVEN-PORT`
+    /// and `RESERVATION-TOKEN`, answers the 401 challenge with the credentials, follows a 300 Try Alternate once per
+    /// server, and starts the refresh timer.
     ///
     /// @param options what to ask for
     /// @param timeout the longest time the whole exchange may take
     /// @return the allocation
     /// @throws TurnException         if the server refused the allocation; [TurnException#errorCode()] holds its
     ///                               error code (440 when it does not support the family, 486 when the quota is
-    ///                               reached)
+    ///                               reached, 508 when it cannot reserve the ports `EVEN-PORT` asked for, 300 when
+    ///                               it redirected to a server already tried)
     /// @throws IOException           if the server did not answer or the connection failed
     /// @throws InterruptedException  if the calling thread is interrupted
     /// @throws IllegalStateException if the client already has an allocation or is closed
@@ -244,6 +317,8 @@ public final class TurnClient implements AutoCloseable {
         ensureOpen();
         var deadline = clock.nanos() + timeout.toNanos();
         var current = options;
+        var tried = new java.util.HashSet<InetSocketAddress>();
+        tried.add(link.remoteAddress());
         while (true) {
             var attributes = new ArrayList<StunAttribute>();
             attributes.add(new StunAttribute.RequestedTransport(StunAttribute.RequestedTransport.UDP));
@@ -254,6 +329,10 @@ public final class TurnClient implements AutoCloseable {
             if (current.dontFragment()) {
                 attributes.add(new StunAttribute.DontFragment());
             }
+            if (current.evenPort()) {
+                attributes.add(new StunAttribute.EvenPort(current.reserveNextPort()));
+            }
+            current.reservationToken().ifPresent(token -> attributes.add(new StunAttribute.ReservationToken(token)));
             var response = transact(StunMethod.ALLOCATE, attributes, remaining(deadline));
             if (response.messageClass() == StunClass.SUCCESS_RESPONSE) {
                 var relayed = response.attribute(StunAttribute.XorRelayedAddress.class)
@@ -263,7 +342,9 @@ public final class TurnClient implements AutoCloseable {
                 var lifetime = response.attribute(StunAttribute.Lifetime.class)
                         .map(StunAttribute.Lifetime::lifetime)
                         .orElse(Duration.ofMinutes(10));
-                var created = new TurnAllocation(this, relayed, mapped, lifetime, current, timers, clock);
+                var token = response.attribute(StunAttribute.ReservationToken.class)
+                        .map(StunAttribute.ReservationToken::token);
+                var created = new TurnAllocation(this, relayed, mapped, lifetime, current, timers, clock, token);
                 synchronized (lock) {
                     if (closed) {
                         throw new IOException("the TURN client is closed");
@@ -274,6 +355,10 @@ public final class TurnClient implements AutoCloseable {
                 return created;
             }
             var error = response.errorCode().orElseThrow(() -> new TurnException("error response without ERROR-CODE"));
+            if (error.code() == ErrorCode.TRY_ALTERNATE) {
+                redirect(response, tried, deadline);
+                continue;
+            }
             if (error.code() == ErrorCode.UNKNOWN_ATTRIBUTE && current.dontFragment()
                     && response.attribute(UnknownAttributes.class)
                     .map(unknown -> unknown.types().contains(StunAttribute.DontFragment.TYPE))
@@ -443,33 +528,36 @@ public final class TurnClient implements AutoCloseable {
         }
     }
 
-    /// Reads messages from the server until the connection closes.
-    private void readLoop() {
+    /// Reads messages from one link until it closes; the end of the current link fails the allocation, the end of
+    /// a link a redirection replaced does nothing.
+    private void readLoop(Link reading) {
         try {
-            switch (link) {
+            switch (reading) {
                 case UdpLink udp -> readDatagrams(udp);
                 case StreamLink stream -> readStream(stream);
             }
         } catch (IOException exception) {
-            if (!closed && LOGGER.isLoggable(Level.DEBUG)) {
+            if (!closed && reading == link && LOGGER.isLoggable(Level.DEBUG)) {
                 LOGGER.log(Level.DEBUG, "TURN connection to " + server.host() + " ended", exception);
             }
         } finally {
-            TurnAllocation current;
-            synchronized (lock) {
-                current = allocation;
+            if (reading == link) {
+                TurnAllocation current;
+                synchronized (lock) {
+                    current = allocation;
+                }
+                if (current != null) {
+                    current.markFailed();
+                }
+                transactions.close();
             }
-            if (current != null) {
-                current.markFailed();
-            }
-            transactions.close();
         }
     }
 
     /// Reads datagrams from the UDP socket.
     private void readDatagrams(UdpLink udp) throws IOException {
         var buffer = ByteBuffer.allocate(MAX_MESSAGE);
-        while (!closed) {
+        while (!closed && udp == link) {
             buffer.clear();
             InetSocketAddress source;
             try {
@@ -491,7 +579,7 @@ public final class TurnClient implements AutoCloseable {
     /// bytes.
     private void readStream(StreamLink stream) throws IOException {
         var buffer = ByteBuffer.allocate(MAX_MESSAGE * 2);
-        while (!closed) {
+        while (!closed && stream == link) {
             if (stream.connection().read(buffer) < 0) {
                 throw new EOFException("the TURN server closed the connection");
             }

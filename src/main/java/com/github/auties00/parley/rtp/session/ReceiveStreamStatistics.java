@@ -24,6 +24,9 @@ import java.util.OptionalLong;
 /// @param retransmittedPacketsReceived the packets that arrived as retransmissions (RTX or plain)
 /// @param retransmittedBytesReceived   the payload bytes of those packets
 /// @param fecPacketsReceived           the FEC packets received
+/// @param fecBytesReceived             the payload bytes of those packets (the RED block of a ULPFEC packet)
+/// @param fecSsrc                      the SSRC FEC travels on when it has its own (FlexFEC); empty for ULPFEC, which
+///                                     shares the media SSRC
 /// @param packetsRecovered             the media packets rebuilt from FEC or RED redundancy
 /// @param nackCount                    the NACK messages sent
 /// @param pliCount                     the PLI messages sent
@@ -37,7 +40,8 @@ public record ReceiveStreamStatistics(OptionalLong ssrc, OptionalLong rtxSsrc, O
                                       long headerBytesReceived, long packetsLost, int fractionLost, Duration jitter,
                                       long packetsDuplicated, long packetsDiscarded,
                                       long retransmittedPacketsReceived, long retransmittedBytesReceived,
-                                      long fecPacketsReceived, long packetsRecovered, long nackCount, long pliCount,
+                                      long fecPacketsReceived, long fecBytesReceived, OptionalLong fecSsrc,
+                                      long packetsRecovered, long nackCount, long pliCount,
                                       long firCount, OptionalLong lastPacketReceivedNanos,
                                       Optional<RemoteSender> remoteSender, Optional<Duration> roundTripTime) {
     /// Checks the fields are not `null`.
@@ -47,6 +51,7 @@ public record ReceiveStreamStatistics(OptionalLong ssrc, OptionalLong rtxSsrc, O
         Objects.requireNonNull(mid, "mid cannot be null");
         Objects.requireNonNull(rid, "rid cannot be null");
         Objects.requireNonNull(jitter, "jitter cannot be null");
+        Objects.requireNonNull(fecSsrc, "fecSsrc cannot be null");
         Objects.requireNonNull(lastPacketReceivedNanos, "lastPacketReceivedNanos cannot be null");
         Objects.requireNonNull(remoteSender, "remoteSender cannot be null");
         Objects.requireNonNull(roundTripTime, "roundTripTime cannot be null");

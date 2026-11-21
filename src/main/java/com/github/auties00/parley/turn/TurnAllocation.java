@@ -1,5 +1,6 @@
 package com.github.auties00.parley.turn;
 
+import java.util.OptionalLong;
 import com.github.auties00.parley.net.MonotonicClock;
 import com.github.auties00.parley.stun.StunAttribute;
 import com.github.auties00.parley.stun.StunAttribute.ErrorCode;
@@ -35,8 +36,8 @@ import java.util.concurrent.locks.ReentrantLock;
 /// [#bindChannel(InetSocketAddress,Duration)]) installed a permission for its IP address.
 ///
 /// [#send(ByteBuffer,InetSocketAddress)] relays a datagram to a peer as ChannelData when a channel is bound to it and
-/// as a Send indication otherwise; datagrams from peers reach the [TurnDataReceiver] set with
-/// [#setReceiver(TurnDataReceiver)].
+/// as a Send indication otherwise, the indication carrying `DONT-FRAGMENT` when the Allocate request did and the
+/// server accepted it; datagrams from peers reach the [TurnDataReceiver] of the [TurnAllocationOptions].
 ///
 /// An allocation fails when the server reports it gone (437 Allocation Mismatch), when a refresh cannot reach the
 /// server before the allocation expires, or when the connection to the server ends; [#isActive()] then turns `false`
@@ -104,13 +105,19 @@ public final class TurnAllocation implements AutoCloseable {
     /// The receiver of relayed data, or `null` to drop it.
     private volatile TurnDataReceiver receiver;
 
+    /// The token of the port reserved by `EVEN-PORT`, if the server reported one.
+    private final OptionalLong reservationToken;
+
     /// Whether the allocation is usable.
     private volatile boolean active = true;
 
     /// Creates the allocation the server granted.
     TurnAllocation(TurnClient client, InetSocketAddress relayedAddress, Optional<InetSocketAddress> mappedAddress,
-                   Duration lifetime, TurnAllocationOptions options, TurnTimers timers, MonotonicClock clock) {
+                   Duration lifetime, TurnAllocationOptions options, TurnTimers timers, MonotonicClock clock,
+                   Optional<Long> reservationToken) {
         this.client = client;
+        this.receiver = options.receiver().orElse(null);
+        this.reservationToken = reservationToken.map(OptionalLong::of).orElse(OptionalLong.empty());
         this.relayedAddress = relayedAddress;
         this.mappedAddress = mappedAddress;
         this.options = options;
@@ -128,6 +135,20 @@ public final class TurnAllocation implements AutoCloseable {
     /// `XOR-MAPPED-ADDRESS`, or an empty optional when the server did not report it}
     public Optional<InetSocketAddress> mappedAddress() {
         return mappedAddress;
+    }
+
+    /// {@return the `RESERVATION-TOKEN` of the port the server reserved for an `EVEN-PORT` request that asked for the
+    /// next port, eight bytes to pass to [TurnAllocationOptions#reservationToken(byte\[\])]; empty otherwise}
+    public Optional<byte[]> reservationToken() {
+        if (reservationToken.isEmpty()) {
+            return Optional.empty();
+        }
+        return Optional.of(java.nio.ByteBuffer.allocate(8).putLong(reservationToken.getAsLong()).array());
+    }
+
+    /// {@return whether the server accepted `DONT-FRAGMENT`, so Send indications carry it too}
+    public boolean dontFragment() {
+        return options.dontFragment();
     }
 
     /// {@return the TURN server holding the allocation}
@@ -285,14 +306,21 @@ public final class TurnAllocation implements AutoCloseable {
             client.sendRaw(ChannelData.encode(channel, data, client.isStream()));
             return;
         }
-        var indication = StunMessage.indication(StunMethod.SEND, List.of(new XorPeerAddress(peer), new StunAttribute.Data(data)));
-        client.sendRaw(indication.encode(false));
+        var attributes = options.dontFragment()
+                ? List.<StunAttribute>of(new XorPeerAddress(peer), new StunAttribute.DontFragment(),
+                new StunAttribute.Data(data))
+                : List.<StunAttribute>of(new XorPeerAddress(peer), new StunAttribute.Data(data));
+        client.sendRaw(StunMessage.indication(StunMethod.SEND, attributes).encode(false));
     }
 
     /// Sets the receiver of datagrams relayed from peers, replacing the previous one.
     ///
     /// @param receiver the receiver
+    /// @deprecated give the receiver to [TurnAllocationOptions#receiver(TurnDataReceiver)]; datagrams relayed before
+    /// this call are dropped
+    @Deprecated(forRemoval = true)
     public void setReceiver(TurnDataReceiver receiver) {
+        // TODO: remove once ice.IceAgent passes the receiver in its TurnAllocationOptions (cross-group).
         this.receiver = Objects.requireNonNull(receiver, "receiver cannot be null");
     }
 

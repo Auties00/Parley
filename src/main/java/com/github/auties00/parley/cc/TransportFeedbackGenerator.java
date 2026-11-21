@@ -1,5 +1,6 @@
 package com.github.auties00.parley.cc;
 
+import java.util.ArrayDeque;
 import com.github.auties00.parley.net.MonotonicClock;
 import com.github.auties00.parley.rtp.rtcp.RtcpPacket;
 import com.github.auties00.parley.rtp.rtcp.TransportFeedback;
@@ -25,8 +26,11 @@ import java.util.function.Consumer;
 /// later one to the previous received packet. A feedback ends early, and the next one continues, when a delta does
 /// not fit the 16-bit signed tick count or the feedback reaches [#MAX_PACKETS_PER_FEEDBACK] packets.
 ///
-/// Feedback is sent every [#DEFAULT_INTERVAL] once [#start(ThreadFactory)] runs the generator's thread, or whenever
-/// the owner calls [#sendFeedback()] or [#process()].
+/// Once [#start(ThreadFactory)] runs the generator's thread, feedback is sent on a fixed schedule whose interval
+/// adapts to the incoming rate: the feedback is kept near [#FEEDBACK_SHARE] of the media rate, assuming
+/// [#FEEDBACK_SIZE_BYTES] per message, within [#MIN_INTERVAL] and [#MAX_INTERVAL]; [#DEFAULT_INTERVAL] applies until
+/// packet sizes have been reported for a second. [#setInterval(Duration)] fixes the interval instead. The owner
+/// may also send at any time with [#sendFeedback()] or [#process()].
 ///
 /// # Threading
 ///
@@ -36,8 +40,24 @@ import java.util.function.Consumer;
 public final class TransportFeedbackGenerator implements AutoCloseable {
     private static final System.Logger LOGGER = System.getLogger(TransportFeedbackGenerator.class.getName());
 
-    /// The default feedback interval: 100 ms.
+    /// The interval before the incoming rate is known: 100 ms.
     public static final Duration DEFAULT_INTERVAL = Duration.ofMillis(100);
+
+    /// The shortest adaptive interval: 50 ms.
+    public static final Duration MIN_INTERVAL = Duration.ofMillis(50);
+
+    /// The longest adaptive interval: 250 ms.
+    public static final Duration MAX_INTERVAL = Duration.ofMillis(250);
+
+    /// The share of the incoming rate the adaptive interval spends on feedback: 5%, the share RFC 3550 gives RTCP.
+    public static final double FEEDBACK_SHARE = 0.05;
+
+    /// The feedback size the adaptive interval assumes, with its IP, UDP and SRTCP overhead: 68 bytes, libwebrtc's
+    /// estimate of a typical report.
+    public static final int FEEDBACK_SIZE_BYTES = 68;
+
+    /// The window the incoming rate is measured over.
+    static final long RATE_WINDOW_NANOS = 1_000_000_000L;
 
     /// The most packets one feedback reports, which keeps the encoded message well under a typical MTU even when
     /// every delta needs two bytes.
@@ -68,6 +88,10 @@ public final class TransportFeedbackGenerator implements AutoCloseable {
     private boolean epochSet;
     private int feedbackCount;
     private long intervalNanos;
+    private boolean fixedInterval;
+    private final ArrayDeque<long[]> rateSamples;
+    private long rateBytes;
+    private long firstSizedArrivalNanos = Long.MIN_VALUE;
     private long lastFeedbackNanos;
     private boolean closed;
     private boolean started;
@@ -81,9 +105,8 @@ public final class TransportFeedbackGenerator implements AutoCloseable {
         this.wake = lock.newCondition();
         this.unwrapper = new SequenceUnwrapper(16);
         this.arrivals = new TreeMap<>();
-        // TODO: adapt the interval to the incoming rate (50 to 250 ms, feedback kept near 5% of the media rate) as
-        //  libwebrtc does; it stays at the configured value.
         this.intervalNanos = DEFAULT_INTERVAL.toNanos();
+        this.rateSamples = new ArrayDeque<>();
     }
 
     /// Creates a generator.
@@ -111,26 +134,84 @@ public final class TransportFeedbackGenerator implements AutoCloseable {
         checkSsrc(mediaSsrc);
         lock.lock();
         try {
-            if (!epochSet) {
-                epochSet = true;
-                epochNanos = arrivalNanos;
-                this.mediaSsrc = mediaSsrc;
-                lastFeedbackNanos = arrivalNanos;
-            }
-            var sequence = unwrapper.unwrap(transportSequence & 0xFFFF);
-            if (reportingStarted) {
-                if (sequence < nextToReport) {
-                    return;
-                }
-                if (sequence - nextToReport > MAX_SEQUENCE_JUMP) {
-                    arrivals.clear();
-                    nextToReport = sequence;
-                }
-            }
-            arrivals.putIfAbsent(sequence, arrivalNanos);
+            record(transportSequence, mediaSsrc, arrivalNanos);
         } finally {
             lock.unlock();
         }
+    }
+
+    /// Records the arrival of a packet carrying a transport-wide sequence number, with its size, which the adaptive
+    /// feedback interval is derived from.
+    ///
+    /// @param transportSequence the 16-bit sequence number from the header extension
+    /// @param mediaSsrc         the SSRC of the packet; the first one seen is named as the media source of the feedback
+    /// @param sizeBytes         the packet's size, headers included
+    /// @param arrivalNanos      the arrival time, on this generator's clock
+    /// @throws IllegalArgumentException if `mediaSsrc` is not an unsigned 32-bit value or `sizeBytes` is negative
+    public void onPacketReceived(int transportSequence, long mediaSsrc, int sizeBytes, long arrivalNanos) {
+        checkSsrc(mediaSsrc);
+        if (sizeBytes < 0) {
+            throw new IllegalArgumentException("sizeBytes cannot be negative: " + sizeBytes);
+        }
+        lock.lock();
+        try {
+            record(transportSequence, mediaSsrc, arrivalNanos);
+            if (firstSizedArrivalNanos == Long.MIN_VALUE) {
+                firstSizedArrivalNanos = arrivalNanos;
+            }
+            rateSamples.addLast(new long[]{arrivalNanos, sizeBytes});
+            rateBytes += sizeBytes;
+            while (!rateSamples.isEmpty() && arrivalNanos - rateSamples.peekFirst()[0] > RATE_WINDOW_NANOS) {
+                rateBytes -= rateSamples.pollFirst()[1];
+            }
+            if (!fixedInterval && arrivalNanos - firstSizedArrivalNanos >= RATE_WINDOW_NANOS) {
+                intervalNanos = adaptiveInterval(rateBytes * 8 * 1_000_000_000L / RATE_WINDOW_NANOS);
+            }
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    /// {@return the feedback interval for an incoming rate, in nanoseconds}
+    ///
+    /// @param incomingBps the incoming rate, in bits per second
+    static long adaptiveInterval(long incomingBps) {
+        if (incomingBps <= 0) {
+            return MAX_INTERVAL.toNanos();
+        }
+        var nanos = (long) (FEEDBACK_SIZE_BYTES * 8 * 1e9 / (FEEDBACK_SHARE * incomingBps));
+        return Math.clamp(nanos, MIN_INTERVAL.toNanos(), MAX_INTERVAL.toNanos());
+    }
+
+    /// {@return the current feedback interval}
+    public Duration interval() {
+        lock.lock();
+        try {
+            return Duration.ofNanos(intervalNanos);
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    /// Records an arrival; the caller holds the lock.
+    private void record(int transportSequence, long mediaSsrc, long arrivalNanos) {
+        if (!epochSet) {
+            epochSet = true;
+            epochNanos = arrivalNanos;
+            this.mediaSsrc = mediaSsrc;
+            lastFeedbackNanos = arrivalNanos;
+        }
+        var sequence = unwrapper.unwrap(transportSequence & 0xFFFF);
+        if (reportingStarted) {
+            if (sequence < nextToReport) {
+                return;
+            }
+            if (sequence - nextToReport > MAX_SEQUENCE_JUMP) {
+                arrivals.clear();
+                nextToReport = sequence;
+            }
+        }
+        arrivals.putIfAbsent(sequence, arrivalNanos);
     }
 
     /// Sends feedback about every packet received since the last feedback, now; nothing is sent when there is
@@ -164,7 +245,7 @@ public final class TransportFeedbackGenerator implements AutoCloseable {
         deliver(feedback);
     }
 
-    /// Changes the feedback interval.
+    /// Fixes the feedback interval, ending its adaptation to the incoming rate.
     ///
     /// @param interval the interval, positive
     /// @throws IllegalArgumentException if `interval` is not positive
@@ -176,6 +257,7 @@ public final class TransportFeedbackGenerator implements AutoCloseable {
         lock.lock();
         try {
             intervalNanos = interval.toNanos();
+            fixedInterval = true;
             wake.signalAll();
         } finally {
             lock.unlock();
@@ -212,26 +294,52 @@ public final class TransportFeedbackGenerator implements AutoCloseable {
         }
     }
 
+    /// Sends feedback on a schedule that advances by one interval per message, so the build-and-send time and
+    /// spurious wake-ups do not stretch the period; after a stall longer than an interval the schedule restarts from
+    /// the current time.
     private void run() {
         try {
+            long next;
+            lock.lock();
+            try {
+                next = clock.nanos() + intervalNanos;
+            } finally {
+                lock.unlock();
+            }
             while (true) {
                 lock.lock();
                 try {
-                    if (closed) {
-                        return;
-                    }
-                    wake.awaitNanos(intervalNanos);
-                    if (closed) {
-                        return;
+                    while (true) {
+                        if (closed) {
+                            return;
+                        }
+                        var wait = next - clock.nanos();
+                        if (wait <= 0) {
+                            break;
+                        }
+                        wake.awaitNanos(Math.min(wait, intervalNanos));
                     }
                 } finally {
                     lock.unlock();
                 }
                 sendFeedback();
+                lock.lock();
+                try {
+                    next = nextDeadline(next, intervalNanos, clock.nanos());
+                } finally {
+                    lock.unlock();
+                }
             }
         } catch (InterruptedException exception) {
             Thread.currentThread().interrupt();
         }
+    }
+
+    /// {@return the deadline after `previous`: one interval later, or one interval after `now` when the schedule
+    /// fell more than an interval behind}
+    static long nextDeadline(long previous, long intervalNanos, long now) {
+        var next = previous + intervalNanos;
+        return now - next > intervalNanos ? now + intervalNanos : next;
     }
 
     private void deliver(List<TransportFeedback> feedback) {

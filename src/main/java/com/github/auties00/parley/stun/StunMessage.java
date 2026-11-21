@@ -369,11 +369,28 @@ public final class StunMessage {
         }
     }
 
-    /// {@return the encoded length of the message with the given trailer}
+    /// {@return the encoded length of the message without integrity or `FINGERPRINT`}
+    public int encodedLength() {
+        return length(Optional.empty(), false);
+    }
+
+    /// {@return the encoded length of the message without integrity}
     ///
-    /// @param integrity   the integrity attribute to append, or an empty optional for none
     /// @param fingerprint whether `FINGERPRINT` is appended
-    public int encodedLength(Optional<StunIntegrity> integrity, boolean fingerprint) {
+    public int encodedLength(boolean fingerprint) {
+        return length(Optional.empty(), fingerprint);
+    }
+
+    /// {@return the encoded length of the message signed with an integrity attribute}
+    ///
+    /// @param integrity   the integrity attribute appended
+    /// @param fingerprint whether `FINGERPRINT` is appended after it
+    public int encodedLength(StunIntegrity integrity, boolean fingerprint) {
+        Objects.requireNonNull(integrity, "integrity cannot be null");
+        return length(Optional.of(integrity), fingerprint);
+    }
+
+    private int length(Optional<StunIntegrity> integrity, boolean fingerprint) {
         var length = HEADER_LENGTH;
         for (var attribute : attributes) {
             if (isComputed(attribute)) {
@@ -392,8 +409,8 @@ public final class StunMessage {
     /// @param fingerprint whether to append `FINGERPRINT`
     /// @throws IllegalArgumentException if the attributes do not fit in 65535 bytes
     public ByteBuffer encode(boolean fingerprint) {
-        var buffer = ByteBuffer.allocate(encodedLength(Optional.empty(), fingerprint));
-        encodeTo(buffer, Optional.empty(), StunIntegrity.HMAC_SHA1, fingerprint);
+        var buffer = ByteBuffer.allocate(length(Optional.empty(), fingerprint));
+        write(buffer, Optional.empty(), StunIntegrity.HMAC_SHA1, fingerprint);
         return buffer.flip();
     }
 
@@ -405,28 +422,54 @@ public final class StunMessage {
     /// @throws IllegalArgumentException if the attributes do not fit in 65535 bytes
     public ByteBuffer encode(StunKey key, StunIntegrity integrity, boolean fingerprint) {
         Objects.requireNonNull(key, "key cannot be null");
-        var buffer = ByteBuffer.allocate(encodedLength(Optional.of(integrity), fingerprint));
-        encodeTo(buffer, Optional.of(key), integrity, fingerprint);
+        Objects.requireNonNull(integrity, "integrity cannot be null");
+        var buffer = ByteBuffer.allocate(length(Optional.of(integrity), fingerprint));
+        write(buffer, Optional.of(key), integrity, fingerprint);
         return buffer.flip();
     }
 
-    /// Encodes the message at the buffer's position, which advances past it.
+    /// Encodes the message at the buffer's position, which advances past it, without integrity or `FINGERPRINT`.
     ///
-    /// Padding bytes are zero. When `key` is present the integrity attribute is computed over everything written
-    /// before it, then `FINGERPRINT` over everything before it.
+    /// @param destination the buffer, with at least [#encodedLength()] bytes remaining
+    /// @return the number of bytes written
+    /// @throws java.nio.BufferOverflowException if the message does not fit
+    /// @throws IllegalArgumentException         if the attributes do not fit in 65535 bytes
+    public int encodeTo(ByteBuffer destination) {
+        return write(destination, Optional.empty(), StunIntegrity.HMAC_SHA1, false);
+    }
+
+    /// Encodes the message at the buffer's position, which advances past it, without integrity.
     ///
-    /// @param destination the buffer, with at least [#encodedLength(Optional,boolean)] bytes remaining
-    /// @param key         the integrity key, or an empty optional to sign nothing
-    /// @param integrity   the integrity attribute to append when `key` is present
+    /// @param destination the buffer, with at least [#encodedLength(boolean)] bytes remaining
     /// @param fingerprint whether to append `FINGERPRINT`
     /// @return the number of bytes written
     /// @throws java.nio.BufferOverflowException if the message does not fit
     /// @throws IllegalArgumentException         if the attributes do not fit in 65535 bytes
-    public int encodeTo(ByteBuffer destination, Optional<StunKey> key, StunIntegrity integrity, boolean fingerprint) {
-        Objects.requireNonNull(destination, "destination cannot be null");
+    public int encodeTo(ByteBuffer destination, boolean fingerprint) {
+        return write(destination, Optional.empty(), StunIntegrity.HMAC_SHA1, fingerprint);
+    }
+
+    /// Encodes the message at the buffer's position, which advances past it, signed with `key`.
+    ///
+    /// Padding bytes are zero. The integrity attribute is computed over everything written before it, then
+    /// `FINGERPRINT` over everything before it.
+    ///
+    /// @param destination the buffer, with at least [#encodedLength(StunIntegrity,boolean)] bytes remaining
+    /// @param key         the integrity key
+    /// @param integrity   the integrity attribute to append
+    /// @param fingerprint whether to append `FINGERPRINT`
+    /// @return the number of bytes written
+    /// @throws java.nio.BufferOverflowException if the message does not fit
+    /// @throws IllegalArgumentException         if the attributes do not fit in 65535 bytes
+    public int encodeTo(ByteBuffer destination, StunKey key, StunIntegrity integrity, boolean fingerprint) {
         Objects.requireNonNull(key, "key cannot be null");
+        return write(destination, Optional.of(key), integrity, fingerprint);
+    }
+
+    private int write(ByteBuffer destination, Optional<StunKey> key, StunIntegrity integrity, boolean fingerprint) {
+        Objects.requireNonNull(destination, "destination cannot be null");
         Objects.requireNonNull(integrity, "integrity cannot be null");
-        var total = encodedLength(key.map(_ -> integrity), fingerprint);
+        var total = length(key.map(_ -> integrity), fingerprint);
         if (total - HEADER_LENGTH > 0xFFFF) {
             throw new IllegalArgumentException("STUN message longer than 65535 bytes");
         }

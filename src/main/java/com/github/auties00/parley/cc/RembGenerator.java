@@ -289,23 +289,30 @@ public final class RembGenerator implements AutoCloseable {
         }
     }
 
+    /// Checks for a due report on a schedule that advances by one period per check, so the processing time and
+    /// spurious wake-ups do not stretch it.
     private void run() {
         var period = REPORT_INTERVAL.toNanos() / 4;
         try {
+            var next = clock.nanos() + period;
             while (true) {
                 lock.lock();
                 try {
-                    if (closed) {
-                        return;
-                    }
-                    wake.awaitNanos(period);
-                    if (closed) {
-                        return;
+                    while (true) {
+                        if (closed) {
+                            return;
+                        }
+                        var wait = next - clock.nanos();
+                        if (wait <= 0) {
+                            break;
+                        }
+                        wake.awaitNanos(Math.min(wait, period));
                     }
                 } finally {
                     lock.unlock();
                 }
                 process();
+                next = TransportFeedbackGenerator.nextDeadline(next, period, clock.nanos());
             }
         } catch (InterruptedException exception) {
             Thread.currentThread().interrupt();

@@ -6,6 +6,8 @@ import com.github.auties00.parley.rtp.rtcp.ReceptionReport;
 /// loss accounting (A.3) and the interarrival jitter estimator (A.8).
 ///
 /// Not thread-safe: the owning stream serializes access.
+///
+/// @spec https://www.rfc-editor.org/rfc/rfc3550.html RFC 3550: RTP: A Transport Protocol for Real-Time Applications
 final class ReceptionStatistics {
     /// A forward jump larger than this restarts the sequence (RFC 3550 A.1 `MAX_DROPOUT`).
     static final int MAX_DROPOUT = 3000;

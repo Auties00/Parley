@@ -13,7 +13,9 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 
-/// Recovers lost media packets of one stream from the FEC packets that protect it.
+/// Recovers lost media packets of one stream from the FEC packets that protect it: ULPFEC and FlexFEC parity
+/// payloads with flexible masks, RFC 8627 payloads with fixed columns and rows (`F=1`), and RFC 8627
+/// retransmissions (`R=1`), which carry a lost packet whole.
 ///
 /// The decoder keeps copies of the last [#MEDIA_WINDOW] media packets and of the last [#FEC_WINDOW] FEC payloads that
 /// could not recover anything yet; each new packet of either kind retries every pending FEC payload, so recoveries
@@ -64,6 +66,18 @@ public final class FecDecoder {
     /// @return the packets this payload let the decoder recover, new heap packets
     /// @throws RtpFormatException if the payload is malformed or uses an unsupported FlexFEC variant
     public List<RtpPacket> addFec(ByteBuffer payload) throws RtpFormatException {
+        if (format == FecFormat.FLEXFEC && FecCodec.isRetransmission(payload)) {
+            var packet = FecCodec.decodeRetransmission(payload);
+            if (packet.ssrc() != protectedSsrc || media.containsKey(packet.sequence())) {
+                return List.of();
+            }
+            store(packet);
+            recovered++;
+            var out = new ArrayList<RtpPacket>();
+            out.add(packet);
+            out.addAll(tryRecover());
+            return out;
+        }
         var parsed = FecCodec.parse(format, payload);
         if (parsed.protectedSsrc().isPresent() && parsed.protectedSsrc().getAsLong() != protectedSsrc) {
             return List.of();

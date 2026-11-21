@@ -6,6 +6,9 @@ import java.util.random.RandomGenerator;
 /// RFC 4585 section 3.5.
 ///
 /// Not thread-safe: the session serializes access.
+///
+/// @spec https://www.rfc-editor.org/rfc/rfc3550.html RFC 3550: RTP: A Transport Protocol for Real-Time Applications
+/// @spec https://www.rfc-editor.org/rfc/rfc4585.html RFC 4585: Extended RTP Profile for Real-time Transport Control Protocol (RTCP)-Based Feedback (RTP/AVPF)
 final class RtcpScheduler {
     /// The fraction of the session bandwidth RTCP uses.
     static final double RTCP_FRACTION = 0.05;
@@ -56,6 +59,21 @@ final class RtcpScheduler {
         }
         var rtcpBandwidth = config.sessionBandwidthBps() * RTCP_FRACTION / 8;
         var td = deterministicInterval(Math.max(members, 1), senders, rtcpBandwidth, weSent, averageSize, minimum);
+        var t = td * (random.nextDouble() + 0.5) / COMPENSATION;
+        return (long) (t * 1e9);
+    }
+
+    /// {@return the randomized interval in nanoseconds before a BYE may leave, under the BYE reconsideration of RFC
+    /// 3550 section 6.3.7: computed as for a first report with `byeMembers` members (the leaving participant plus
+    /// the BYEs received since it decided to leave), none of them senders, and the BYE's own size as the average}
+    ///
+    /// @param byeMembers the members to count, at least one
+    /// @param byeSize    the size of the compound BYE packet, in bytes
+    long byeInterval(int byeMembers, int byeSize) {
+        var minimum = config.minimumInterval().toNanos() / 1e9 / 2;
+        var rtcpBandwidth = config.sessionBandwidthBps() * RTCP_FRACTION / 8;
+        var td = deterministicInterval(Math.max(byeMembers, 1), 0, rtcpBandwidth, false,
+                byeSize + LOWER_LAYER_OVERHEAD, minimum);
         var t = td * (random.nextDouble() + 0.5) / COMPENSATION;
         return (long) (t * 1e9);
     }

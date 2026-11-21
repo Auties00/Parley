@@ -100,6 +100,7 @@ public final class RtpReceiveStream {
     private long retransmittedPackets;
     private long retransmittedBytes;
     private long fecPackets;
+    private long fecBytes;
     private long recovered;
     private long nackCount;
     private long pliCount;
@@ -201,7 +202,7 @@ public final class RtpReceiveStream {
                     rtxSsrc < 0 ? OptionalLong.empty() : OptionalLong.of(rtxSsrc), config.mid(), config.rid(),
                     statistics.received(), bytesReceived, headerBytesReceived, statistics.cumulativeLost(),
                     statistics.lastFractionLost(), jitter, duplicated, discarded, retransmittedPackets,
-                    retransmittedBytes, fecPackets, recovered, nackCount, pliCount, firCount,
+                    retransmittedBytes, fecPackets, fecBytes, fecSsrc(), recovered, nackCount, pliCount, firCount,
                     lastPacketNanos == Long.MIN_VALUE ? OptionalLong.empty() : OptionalLong.of(lastPacketNanos),
                     remote, receiverRttNanos < 0 ? Optional.empty() : Optional.of(Duration.ofNanos(receiverRttNanos)));
         } finally {
@@ -211,6 +212,12 @@ public final class RtpReceiveStream {
 
     long lastPacketNanos() {
         return lastPacketNanos;
+    }
+
+    /// {@return the FlexFEC SSRC, when FEC travels on its own SSRC}
+    private OptionalLong fecSsrc() {
+        return config.fec().filter(fec -> fec instanceof FecConfig.Flexfec)
+                .map(fec -> OptionalLong.of(((FecConfig.Flexfec) fec).ssrc())).orElse(OptionalLong.empty());
     }
 
     OptionalLong mediaSsrc() {
@@ -273,6 +280,7 @@ public final class RtpReceiveStream {
         if (flexfec.isPresent() && (packet.ssrc() == flexfec.get().ssrc()
                 || (payloadType == flexfec.get().payloadType() && packet.ssrc() != mediaSsrc))) {
             fecPackets++;
+            fecBytes += packet.payloadLength();
             if (fecDecoder != null) {
                 try {
                     for (var recoveredPacket : fecDecoder.addFec(packet.payload())) {
@@ -341,6 +349,7 @@ public final class RtpReceiveStream {
             var ulpfec = config.fec().filter(fec -> fec instanceof FecConfig.Ulpfec).map(FecConfig.Ulpfec.class::cast);
             if (ulpfec.isPresent() && primary.payloadType() == ulpfec.get().ulpfecPayloadType()) {
                 fecPackets++;
+                fecBytes += primary.data().remaining();
                 nackObserve(packet.sequence(), origin, work, arrivalNanos);
                 skip(unwrapper.unwrap(packet.sequence()), work);
                 if (fecDecoder != null) {

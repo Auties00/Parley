@@ -9,6 +9,7 @@ import com.github.auties00.parley.rtp.extension.HeaderExtensionMap;
 import com.github.auties00.parley.rtp.extension.HeaderExtensionUris;
 import com.github.auties00.parley.rtp.extension.TransportSequenceNumber;
 import com.github.auties00.parley.rtp.rtcp.Bye;
+import com.github.auties00.parley.rtp.rtcp.CongestionControlFeedback;
 import com.github.auties00.parley.rtp.rtcp.ExtendedReport;
 import com.github.auties00.parley.rtp.rtcp.FullIntraRequest;
 import com.github.auties00.parley.rtp.rtcp.Nack;
@@ -26,10 +27,11 @@ import com.github.auties00.parley.transport.RtpTransport;
 import java.io.IOException;
 import java.lang.System.Logger.Level;
 import java.nio.ByteBuffer;
+import java.time.Duration;
 import java.time.InstantSource;
+import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Base64;
-import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -54,32 +56,63 @@ import java.util.random.RandomGenerator;
 /// var session = RtpSession.builder(transport)
 ///         .cname("parley")
 ///         .extensions(bundleExtensions)
+///         .rtcpListener(packet -> log(packet))
 ///         .build();
 /// var audio = session.createSendStream(SendStreamConfig.builder("0", 0x1234, 111, 48_000)
 ///         .extensions(bundleExtensions)
 ///         .build());
-/// audio.send(List.of(opusFrame), timestamp, false, Map.of(), OutgoingPacketScheduler.Priority.AUDIO);
+/// audio.send(List.of(new RtpSendStream.Payload(opusFrame, false, Map.of())), timestamp,
+///         OutgoingPacketScheduler.Priority.AUDIO);
 /// }
+///
+/// # Members and collisions
+///
+/// The session keeps one table of remote members (RFC 3550 section 6.2.1): every remote SSRC heard in RTP or RTCP,
+/// with its CNAME and the receiver reference time it asked to be answered. SSRCs are the peer's to choose, so the
+/// table is bounded ([MemberTable#CAPACITY] members, the least recently heard dropped first) and forgets a member
+/// silent for [#MEMBER_TIMEOUT_NANOS]. A CNAME is recorded only for a member heard in RTP, bound to a receive stream
+/// or that sent a sender report, and the first CNAME of a member wins: a later different one is a third-party SSRC
+/// collision, counted and remembered for a while (RFC 3550 section 8.2).
+///
+/// A remote packet carrying one of the session's own SSRCs is a collision, or a loop of the session's own traffic
+/// when it comes with the session's own CNAME. A loop is dropped and counted. A collision moves the local stream to
+/// a new random SSRC: the old one is announced in a receiver report, a source description and a BYE, and the
+/// configuration's SSRC change listener is told ([SsrcChange]). A stream changes SSRC at most once per
+/// [#COLLISION_HOLDOFF_NANOS]; repeated collisions inside it are dropped and counted, so a peer cannot make the
+/// session renumber its streams at line rate.
+///
+/// # Leaving
+///
+/// [#removeSendStream(RtpSendStream)] and [#close()] announce the leaving SSRCs (media, RTX and FlexFEC) in a compound
+/// packet of a receiver report, the CNAME and BYE packets of at most 31 sources each. With more than
+/// [#BYE_RECONSIDERATION_MEMBERS] members the BYE waits for the reconsideration timer of RFC 3550 section 6.3.7, so a
+/// large session does not flood its members with simultaneous BYEs.
 ///
 /// # Congestion control
 ///
-/// Outgoing packets go through an [OutgoingPacketScheduler] (by default sent immediately); the [OutgoingPacketScheduler.PacketSink] it calls
-/// stamps the transport-wide sequence number and the absolute send time at the moment of sending and reports every
-/// packet to the [TransportFeedbackObserver], which also receives every transport-wide feedback, REMB and reception
-/// report. On the receive side every packet's arrival is reported to the arrival observer, from which transport-wide
-/// feedback and REMB are generated.
+/// Outgoing packets go through an [OutgoingPacketScheduler] (by default sent immediately); the
+/// [OutgoingPacketScheduler.PacketSink] it calls stamps the transport-wide sequence number and the absolute send time
+/// at the moment of sending and reports every packet to the [TransportFeedbackObserver], which also receives every
+/// transport-wide feedback, RFC 8888 feedback, REMB and reception report. Transport-wide feedback that names no
+/// packet this session could have sent is dropped and counted before it reaches the observer. On the receive side
+/// every packet's arrival is reported to the arrival observer, from which feedback is generated.
 ///
 /// # Threading
 ///
 /// Every method is thread-safe. Incoming packets are processed on the transport's reader threads; RTCP timing, NACK
-/// retries and the reorder delay run on one timer thread from the builder's [ThreadFactory]. Listeners are called on
-/// those threads, outside the session's lock, and must not block.
+/// retries, the reorder delay and delayed BYEs run on one timer thread from the builder's [ThreadFactory]. Listeners
+/// are given to the builder, so none can miss an event; they are called on those threads, outside the session's
+/// lock, and must not block.
 ///
 /// # Lifecycle
 ///
 /// The session installs itself as the transport's RTP and RTCP receiver when built. [#close()] sends a BYE for every
-/// local SSRC, stops the timer thread and detaches from the transport; the transport itself stays open, its owner
-/// closes it.
+/// local SSRC, stops the timer thread once any delayed BYE has left, and detaches from the transport; the transport
+/// itself stays open, its owner closes it.
+///
+/// @implNote This implementation cannot tell a loop or a third-party collision by the source transport address, as
+/// RFC 3550 section 8.2 does: a BUNDLE transport delivers every packet from the one address ICE selected. It tells a
+/// loop by the session's own CNAME instead, and keeps the first CNAME of a contested SSRC.
 ///
 /// @see RtpSendStream
 /// @see RtpReceiveStream
@@ -88,6 +121,7 @@ import java.util.random.RandomGenerator;
 /// @spec https://www.rfc-editor.org/rfc/rfc4585.html RFC 4585: Extended RTP Profile for Real-time Transport Control Protocol (RTCP)-Based Feedback (RTP/AVPF)
 /// @spec https://www.rfc-editor.org/rfc/rfc5506.html RFC 5506: Support for Reduced-Size Real-Time Transport Control Protocol (RTCP): Opportunities and Consequences
 /// @spec https://www.rfc-editor.org/rfc/rfc8843.html RFC 8843: Negotiating Media Multiplexing Using the Session Description Protocol (SDP)
+/// @spec https://www.rfc-editor.org/rfc/rfc8888.html RFC 8888: RTP Control Protocol (RTCP) Feedback for Congestion Control
 public final class RtpSession implements AutoCloseable {
     private static final System.Logger LOGGER = System.getLogger(RtpSession.class.getName());
 
@@ -99,6 +133,22 @@ public final class RtpSession implements AutoCloseable {
     static final long MEMBER_TIMEOUT_NANOS = 30_000_000_000L;
     /// How long after reporting an unsignaled SSRC the session reports it again.
     static final long UNSIGNALED_REPORT_INTERVAL_NANOS = 1_000_000_000L;
+    /// The shortest time between two SSRC changes of one local stream.
+    static final long COLLISION_HOLDOFF_NANOS = 5_000_000_000L;
+    /// How long a loop of the session's own traffic makes it treat RTP carrying a local SSRC as looped.
+    static final long LOOP_MEMORY_NANOS = 30_000_000_000L;
+    /// How long a third-party collision is remembered.
+    static final long CONFLICT_TIMEOUT_NANOS = 30_000_000_000L;
+    /// The third-party collisions remembered at most.
+    static final int MAX_CONFLICTS = 64;
+    /// The members above which a BYE waits for the reconsideration timer (RFC 3550 section 6.3.7).
+    static final int BYE_RECONSIDERATION_MEMBERS = 50;
+    /// The most sources one BYE packet names.
+    static final int MAX_BYE_SOURCES = 31;
+    /// The most receiver reference times one DLRR block answers.
+    static final int MAX_DLRR_ENTRIES = 31;
+    /// The transport-wide sequence numbers back from the last one sent that feedback may name: half the space.
+    static final int FEEDBACK_WINDOW = 0x8000;
 
     /// What an outgoing packet is, for the statistics.
     enum PacketKind {
@@ -106,8 +156,26 @@ public final class RtpSession implements AutoCloseable {
     }
 
     /// One packet ready for the scheduler.
+    ///
+    /// @param scheduledNanos when it was handed to the scheduler, so the pacer queue time is measured
     record Outgoing(ByteBuffer buffer, OutgoingPacketScheduler.Priority priority, long ssrc, PacketKind kind,
-                    RtpSendStream stream) {
+                    RtpSendStream stream, long scheduledNanos) {
+    }
+
+    /// A BYE waiting for the reconsideration timer.
+    private static final class PendingBye {
+        final List<RtcpPacket> compound;
+        final long startNanos;
+        final int size;
+        long dueNanos;
+        int byeMembers = 1;
+
+        PendingBye(List<RtcpPacket> compound, long startNanos, int size, long dueNanos) {
+            this.compound = compound;
+            this.startNanos = startNanos;
+            this.size = size;
+            this.dueNanos = dueNanos;
+        }
     }
 
     private final SessionTransport transport;
@@ -116,9 +184,12 @@ public final class RtpSession implements AutoCloseable {
     private final OutgoingPacketScheduler scheduler;
     private final TransportFeedbackObserver feedbackObserver;
     private final Consumer<PacketArrival> arrivalObserver;
+    private final Consumer<? super UnsignaledStream> unsignaledStreamListener;
+    private final Consumer<? super RtcpPacket> rtcpListener;
+    private final Consumer<? super SsrcChange> ssrcChangedListener;
     private final RtcpConfig rtcpConfig;
     private final String cname;
-    private final long localSsrc;
+    private volatile long localSsrc;
     private final RandomGenerator random;
     private final ReentrantLock lock = new ReentrantLock();
     private final ReentrantLock sendLock = new ReentrantLock();
@@ -129,22 +200,26 @@ public final class RtpSession implements AutoCloseable {
     private final RtcpScheduler rtcpScheduler;
     private final Map<Long, Long> senderReportsSent = boundedMap();
     private final Map<Long, Long> referenceTimesSent = boundedMap();
-    private final Map<Long, long[]> peerReferenceTimes = new HashMap<>();
+    private final MemberTable members = new MemberTable(MEMBER_TIMEOUT_NANOS);
     private final List<RtcpPacket> pendingFeedback = new ArrayList<>();
-    private final Map<Long, Long> remoteSsrcs = new HashMap<>();
     private final Map<Long, Long> unsignaledReported = boundedMap();
-    private final Map<Long, String> remoteCnames = new HashMap<>();
+    private final Map<Long, Long> conflicts = new LinkedHashMap<>();
+    private final Map<Long, Long> lastSsrcChange = new LinkedHashMap<>();
+    private final ArrayDeque<PendingBye> pendingByes = new ArrayDeque<>();
     private int transportSequence;
+    private boolean transportSequenceUsed;
     private volatile long rttNanos = -1;
     private volatile boolean closed;
-    private volatile Consumer<UnsignaledStream> unhandledStreamListener = stream -> {
-    };
-    private volatile Consumer<RtcpPacket> rtcpListener = packet -> {
-    };
     private final Thread timerThread;
     private long malformedRtp;
     private long malformedRtcp;
     private long unhandledRtp;
+    private long loopedPackets;
+    private long collisions;
+    private long ignoredCollisions;
+    private long thirdPartyCollisions;
+    private long droppedFeedback;
+    private long lastLoopNanos = Long.MIN_VALUE;
 
     private RtpSession(Builder builder) {
         this.transport = builder.transport;
@@ -153,6 +228,9 @@ public final class RtpSession implements AutoCloseable {
         this.scheduler = builder.scheduler;
         this.feedbackObserver = builder.feedbackObserver;
         this.arrivalObserver = builder.arrivalObserver;
+        this.unsignaledStreamListener = builder.unsignaledStreamListener;
+        this.rtcpListener = builder.rtcpListener;
+        this.ssrcChangedListener = builder.ssrcChangedListener;
         this.rtcpConfig = builder.rtcp;
         this.random = builder.random;
         this.cname = builder.cname != null ? builder.cname : randomCname(random);
@@ -220,12 +298,14 @@ public final class RtpSession implements AutoCloseable {
         lock.lock();
         try {
             checkOpen();
-            for (var stream : sendStreams) {
-                if (stream.ownsSsrc(config.ssrc()) || config.rtxSsrc().stream().anyMatch(stream::ownsSsrc)) {
-                    throw new IllegalArgumentException("SSRC already used by " + stream);
+            var stream = new RtpSendStream(this, config, random.nextInt(1 << 15));
+            for (var existing : sendStreams) {
+                for (var ssrc : stream.ssrcs()) {
+                    if (existing.ownsSsrc(ssrc)) {
+                        throw new IllegalArgumentException("SSRC already used by " + existing);
+                    }
                 }
             }
-            var stream = new RtpSendStream(this, config, random.nextInt(1 << 15));
             sendStreams.add(stream);
             return stream;
         } finally {
@@ -254,7 +334,12 @@ public final class RtpSession implements AutoCloseable {
         }
     }
 
-    /// Removes a send stream; it sends nothing more and its SSRCs are announced in a BYE.
+    /// Removes a send stream; it sends nothing more and its SSRCs (media, RTX and FlexFEC) are announced in a
+    /// compound packet of a receiver report, the CNAME and a BYE, delayed by the reconsideration timer in a session
+    /// of more than [#BYE_RECONSIDERATION_MEMBERS] members.
+    ///
+    /// The stream is marked removed under the session's lock, so a send racing the removal on another thread is
+    /// dropped rather than sent after the BYE.
     ///
     /// @param stream a stream of this session
     /// @throws IOException if sending the BYE fails
@@ -266,14 +351,15 @@ public final class RtpSession implements AutoCloseable {
             if (!sendStreams.remove(stream) || closed) {
                 return;
             }
-            var ssrcs = new ArrayList<Long>();
-            ssrcs.add(stream.ssrc());
-            stream.config().rtxSsrc().ifPresent(ssrcs::add);
-            bye = List.of(new ReceiverReport(feedbackSsrc(), List.of()), new Bye(ssrcs, Optional.empty()));
+            stream.markRemoved();
+            bye = leaving(stream.ssrcs(), feedbackSsrc());
+            if (delayBye(bye)) {
+                return;
+            }
         } finally {
             lock.unlock();
         }
-        transport.sendRtcp(RtcpPacket.encodeCompound(bye, transport.protectionOverhead()));
+        sendCompound(bye);
     }
 
     /// Removes a receive stream and every route to it.
@@ -318,23 +404,7 @@ public final class RtpSession implements AutoCloseable {
         }
     }
 
-    /// Sets the listener told of incoming SSRCs no receive stream claims; it may create a receive stream for one,
-    /// after which the packet that triggered the report is routed again. Each SSRC is reported at most once a second.
-    ///
-    /// @param listener the listener, called on the transport's reader thread
-    public void setUnhandledStreamListener(Consumer<UnsignaledStream> listener) {
-        this.unhandledStreamListener = Objects.requireNonNull(listener, "listener cannot be null");
-    }
-
-    /// Sets the listener told of every received RTCP packet the session does not consume: application data, BYEs,
-    /// RFC 8888 feedback, unknown packets, and REMB or transport-wide feedback when no feedback observer was given.
-    ///
-    /// @param listener the listener, called on the transport's reader thread
-    public void setRtcpListener(Consumer<RtcpPacket> listener) {
-        this.rtcpListener = Objects.requireNonNull(listener, "listener cannot be null");
-    }
-
-    /// Sends RTCP packets now, such as transport-wide feedback generated outside the session.
+    /// Sends RTCP packets now, such as feedback generated outside the session.
     ///
     /// Packets that start with a sender or receiver report, or any packets when reduced-size RTCP was negotiated,
     /// are sent as given; otherwise the session prepends a receiver report and its source description so the
@@ -389,46 +459,47 @@ public final class RtpSession implements AutoCloseable {
         }
     }
 
-    /// {@return the CNAME a remote SSRC announced in its source descriptions}
+    /// {@return the CNAME a remote SSRC announced in its source descriptions, while it is a member}
     ///
     /// @param ssrc the remote SSRC
     public Optional<String> remoteCname(long ssrc) {
         lock.lock();
         try {
-            return Optional.ofNullable(remoteCnames.get(ssrc));
+            return members.peek(ssrc).map(member -> member.cname);
         } finally {
             lock.unlock();
         }
     }
 
-    /// {@return the latest round-trip time measured, from reception reports or extended reports, in nanoseconds,
-    /// or `-1` before the first measurement}
-    public long roundTripTimeNanos() {
-        return rttNanos;
+    /// {@return the latest round-trip time measured, from reception reports or extended reports; empty before the
+    /// first measurement}
+    public Optional<Duration> roundTripTime() {
+        var rtt = rttNanos;
+        return rtt < 0 ? Optional.empty() : Optional.of(Duration.ofNanos(rtt));
     }
 
-    /// Closes the session: sends a BYE for every local SSRC, stops the timer thread and stops receiving. The
-    /// transport stays open. Calling it again does nothing.
+    /// Closes the session: announces every local SSRC in a BYE, stops receiving, and stops the timer thread once a
+    /// BYE delayed by reconsideration has left. The transport stays open. Calling it again does nothing.
     @Override
     public void close() {
         List<RtcpPacket> bye;
+        boolean delayed;
         lock.lock();
         try {
             if (closed) {
                 return;
             }
-            closed = true;
             var ssrcs = new ArrayList<Long>();
             for (var stream : sendStreams) {
-                ssrcs.add(stream.ssrc());
-                stream.config().rtxSsrc().ifPresent(ssrcs::add);
+                stream.markRemoved();
+                ssrcs.addAll(stream.ssrcs());
             }
             if (ssrcs.isEmpty()) {
                 ssrcs.add(localSsrc);
             }
-            bye = List.of(new ReceiverReport(feedbackSsrc(), List.of()),
-                    SourceDescription.ofCname(feedbackSsrc(), cname),
-                    new Bye(ssrcs.subList(0, Math.min(31, ssrcs.size())), Optional.empty()));
+            bye = leaving(ssrcs, feedbackSsrc());
+            delayed = timerThread != null && delayBye(bye);
+            closed = true;
         } finally {
             lock.unlock();
         }
@@ -436,14 +507,45 @@ public final class RtpSession implements AutoCloseable {
         });
         transport.setRtcpReceiver((packet, arrival) -> {
         });
-        try {
-            transport.sendRtcp(RtcpPacket.encodeCompound(bye, transport.protectionOverhead()));
-        } catch (IOException | RuntimeException exception) {
-            LOGGER.log(Level.DEBUG, "could not send the closing BYE", exception);
+        if (!delayed) {
+            try {
+                sendCompound(bye);
+            } catch (IOException | RuntimeException exception) {
+                LOGGER.log(Level.DEBUG, "could not send the closing BYE", exception);
+            }
         }
-        if (timerThread != null) {
-            timerThread.interrupt();
+        wakeTimer();
+    }
+
+    /// {@return the compound packet announcing that `ssrcs` leave: a receiver report and the CNAME of
+    /// `reporterSsrc`, then BYE packets of at most [#MAX_BYE_SOURCES] sources each}
+    private List<RtcpPacket> leaving(List<Long> ssrcs, long reporterSsrc) {
+        var compound = new ArrayList<RtcpPacket>();
+        compound.add(new ReceiverReport(reporterSsrc, List.of()));
+        compound.add(SourceDescription.ofCname(reporterSsrc, cname));
+        for (var from = 0; from < ssrcs.size(); from += MAX_BYE_SOURCES) {
+            compound.add(new Bye(List.copyOf(ssrcs.subList(from, Math.min(ssrcs.size(), from + MAX_BYE_SOURCES))),
+                    Optional.empty()));
         }
+        return compound;
+    }
+
+    /// Queues a BYE for the reconsideration timer when the session has more than
+    /// [#BYE_RECONSIDERATION_MEMBERS] members. Called under the lock.
+    ///
+    /// @return whether the BYE was queued
+    private boolean delayBye(List<RtcpPacket> compound) {
+        var now = clock.nanos();
+        if (members(now) <= BYE_RECONSIDERATION_MEMBERS) {
+            return false;
+        }
+        var size = 0;
+        for (var packet : compound) {
+            size += packet.encodedLength();
+        }
+        pendingByes.addLast(new PendingBye(compound, now, size, now + rtcpScheduler.byeInterval(1, size)));
+        wakeTimer();
+        return true;
     }
 
     ReentrantLock lock() {
@@ -485,6 +587,123 @@ public final class RtpSession implements AutoCloseable {
         return unhandledRtp;
     }
 
+    long loopedPacketCount() {
+        return loopedPackets;
+    }
+
+    long collisionCount() {
+        return collisions;
+    }
+
+    long ignoredCollisionCount() {
+        return ignoredCollisions;
+    }
+
+    long thirdPartyCollisionCount() {
+        return thirdPartyCollisions;
+    }
+
+    long droppedFeedbackCount() {
+        return droppedFeedback;
+    }
+
+    int memberTableSize() {
+        return members.size();
+    }
+
+    int pendingByeCount() {
+        return pendingByes.size();
+    }
+
+    /// Moves a local stream from one of its SSRCs to a new one: sends the BYE compound for the old SSRC, replaces it
+    /// and tells the SSRC change listener.
+    ///
+    /// @throws IOException if sending the BYE fails; the change is made anyway
+    void changeSsrc(RtpSendStream stream, long oldSsrc, long newSsrc) throws IOException {
+        List<RtcpPacket> bye;
+        lock.lock();
+        try {
+            checkOpen();
+            if (stream.isRemoved() || !sendStreams.contains(stream)) {
+                throw new IllegalStateException("the stream was removed");
+            }
+            if (!stream.ownsSsrc(oldSsrc)) {
+                throw new IllegalArgumentException("the stream does not use SSRC " + oldSsrc);
+            }
+            if (oldSsrc == newSsrc) {
+                return;
+            }
+            if (sendStreamOf(newSsrc) != null || newSsrc == localSsrc) {
+                throw new IllegalArgumentException("SSRC already used locally: " + newSsrc);
+            }
+            bye = leaving(List.of(oldSsrc), oldSsrc);
+            stream.replaceSsrc(oldSsrc, newSsrc);
+            lastSsrcChange.put(newSsrc, clock.nanos());
+        } finally {
+            lock.unlock();
+        }
+        notifySsrcChange(new SsrcChange(oldSsrc, newSsrc));
+        sendCompound(bye);
+    }
+
+    private void notifySsrcChange(SsrcChange change) {
+        try {
+            ssrcChangedListener.accept(change);
+        } catch (RuntimeException exception) {
+            LOGGER.log(Level.WARNING, "the SSRC change listener failed", exception);
+        }
+    }
+
+    /// Reacts to a remote packet carrying a local SSRC. Called under the lock.
+    ///
+    /// @param ssrc     the local SSRC
+    /// @param looped   whether the packet came with the session's own CNAME
+    /// @param nowNanos the time
+    /// @return the BYE compound and the change to report, when the stream moves to a new SSRC
+    private Optional<Map.Entry<List<RtcpPacket>, SsrcChange>> onLocalSsrc(long ssrc, boolean looped, long nowNanos) {
+        if (looped || (lastLoopNanos != Long.MIN_VALUE && nowNanos - lastLoopNanos < LOOP_MEMORY_NANOS)) {
+            if (looped) {
+                lastLoopNanos = nowNanos;
+            }
+            loopedPackets++;
+            return Optional.empty();
+        }
+        var last = lastSsrcChange.get(ssrc);
+        if (last != null && nowNanos - last < COLLISION_HOLDOFF_NANOS) {
+            ignoredCollisions++;
+            return Optional.empty();
+        }
+        collisions++;
+        var replacement = newSsrc();
+        var bye = leaving(List.of(ssrc), ssrc);
+        var stream = sendStreamOf(ssrc);
+        if (stream != null) {
+            stream.replaceSsrc(ssrc, replacement);
+        } else {
+            localSsrc = replacement;
+        }
+        lastSsrcChange.put(replacement, nowNanos);
+        while (lastSsrcChange.size() > MAX_CONFLICTS) {
+            lastSsrcChange.remove(lastSsrcChange.keySet().iterator().next());
+        }
+        return Optional.of(Map.entry(bye, new SsrcChange(ssrc, replacement)));
+    }
+
+    /// {@return a random SSRC no local stream and no known member uses}
+    private long newSsrc() {
+        while (true) {
+            var candidate = random.nextLong(1, 1L << 32);
+            if (candidate != localSsrc && sendStreamOf(candidate) == null && members.peek(candidate).isEmpty()) {
+                return candidate;
+            }
+        }
+    }
+
+    /// {@return whether `ssrc` is one of the session's own SSRCs}
+    private boolean isLocal(long ssrc) {
+        return ssrc == localSsrc || sendStreamOf(ssrc) != null;
+    }
+
     /// Hands packets to the scheduler; with the immediate scheduler, sends them and reports the first failure.
     void dispatch(List<Outgoing> outgoing) throws IOException {
         IOException failure = null;
@@ -492,12 +711,12 @@ public final class RtpSession implements AutoCloseable {
             OutgoingPacketScheduler.PacketSink sink = new OutgoingPacketScheduler.PacketSink() {
                 @Override
                 public void send(ByteBuffer plainRtp) throws IOException {
-                    sendNow(packet, plainRtp, false);
+                    sendNow(packet, plainRtp);
                 }
 
                 @Override
                 public void send(ByteBuffer plainRtp, boolean probe) throws IOException {
-                    sendNow(packet, plainRtp, probe);
+                    sendNow(packet, plainRtp);
                 }
             };
             if (scheduler == ImmediateScheduler.INSTANCE) {
@@ -520,11 +739,12 @@ public final class RtpSession implements AutoCloseable {
     }
 
     /// Stamps the send-time extensions, protects and sends one packet, then accounts for it.
-    private void sendNow(Outgoing packet, ByteBuffer buffer, boolean probe) throws IOException {
+    private void sendNow(Outgoing packet, ByteBuffer buffer) throws IOException {
         int sequence = -1;
         int size;
         int payloadBytes;
         int headerBytes;
+        int rtpSequence;
         long sentAt;
         sendLock.lock();
         try {
@@ -541,6 +761,7 @@ public final class RtpSession implements AutoCloseable {
                 if (offset.isPresent()) {
                     sequence = transportSequence;
                     transportSequence = (transportSequence + 1) & 0xFFFF;
+                    transportSequenceUsed = true;
                     TransportSequenceNumber.stamp(buffer, offset.getAsInt(), sequence);
                 }
             }
@@ -554,19 +775,22 @@ public final class RtpSession implements AutoCloseable {
             size = view.length();
             payloadBytes = view.payloadLength();
             headerBytes = size - payloadBytes;
+            rtpSequence = view.sequence();
             transport.sendRtp(buffer);
         } finally {
             sendLock.unlock();
         }
         lock.lock();
         try {
-            packet.stream().onSent(packet.kind(), payloadBytes, headerBytes, sentAt);
+            packet.stream().onSent(packet.kind(), payloadBytes, headerBytes, sentAt, sentAt - packet.scheduledNanos());
         } finally {
             lock.unlock();
         }
         var observer = feedbackObserver;
         if (observer != null) {
-            observer.onPacketSent(sequence, size, sentAt, packet.priority(), probe);
+            observer.onPacketSent(new SentPacket(sequence, size, sentAt, packet.priority(),
+                    packet.kind() == PacketKind.RETRANSMISSION || packet.kind() == PacketKind.PADDING
+                            && packet.ssrc() != packet.stream().ssrc(), packet.ssrc(), rtpSequence));
         }
     }
 
@@ -598,7 +822,7 @@ public final class RtpSession implements AutoCloseable {
             lock.unlock();
         }
         for (var packet : outgoing) {
-            sendNow(packet, packet.buffer(), probe);
+            sendNow(packet, packet.buffer());
         }
         return produced;
     }
@@ -620,6 +844,21 @@ public final class RtpSession implements AutoCloseable {
             }
             return;
         }
+        Optional<Map.Entry<List<RtcpPacket>, SsrcChange>> collision = Optional.empty();
+        var own = false;
+        lock.lock();
+        try {
+            if (isLocal(packet.ssrc())) {
+                own = true;
+                collision = onLocalSsrc(packet.ssrc(), false, arrivalNanos);
+            }
+        } finally {
+            lock.unlock();
+        }
+        if (own) {
+            collision.ifPresent(this::announceCollision);
+            return;
+        }
         var observer = arrivalObserver;
         if (observer != null) {
             observer.accept(arrival(packet, arrivalNanos));
@@ -634,6 +873,16 @@ public final class RtpSession implements AutoCloseable {
         stream.deliver(work.deliveries());
         if (stream.nextDeadline() != Long.MAX_VALUE) {
             wakeTimer();
+        }
+    }
+
+    /// Sends the BYE of a collision and tells the listener.
+    private void announceCollision(Map.Entry<List<RtcpPacket>, SsrcChange> collision) {
+        notifySsrcChange(collision.getValue());
+        try {
+            sendCompound(collision.getKey());
+        } catch (IOException exception) {
+            LOGGER.log(Level.DEBUG, "could not send the BYE of a colliding SSRC", exception);
         }
     }
 
@@ -663,7 +912,7 @@ public final class RtpSession implements AutoCloseable {
         UnsignaledStream unsignaled;
         lock.lock();
         try {
-            remoteSsrcs.put(packet.ssrc(), arrivalNanos);
+            members.heard(packet.ssrc(), arrivalNanos).sentRtp = true;
             switch (demuxer.route(packet)) {
                 case RtpDemuxer.Result.Matched<RtpReceiveStream>(var stream) -> {
                     stream.receive(packet, arrivalNanos, work);
@@ -681,9 +930,9 @@ public final class RtpSession implements AutoCloseable {
             lock.unlock();
         }
         try {
-            unhandledStreamListener.accept(unsignaled);
+            unsignaledStreamListener.accept(unsignaled);
         } catch (RuntimeException exception) {
-            LOGGER.log(Level.WARNING, "the unhandled-stream listener failed", exception);
+            LOGGER.log(Level.WARNING, "the unsignaled-stream listener failed", exception);
         }
         lock.lock();
         try {
@@ -699,6 +948,49 @@ public final class RtpSession implements AutoCloseable {
         } finally {
             lock.unlock();
         }
+    }
+
+    /// {@return whether a remote SSRC may have its CNAME recorded: heard in RTP, sent a sender report, or bound to a
+    /// receive stream}. Called under the lock.
+    private boolean mayRecordCname(long ssrc, MemberTable.Member member) {
+        if (member.sentRtp || member.sentSenderReport) {
+            return true;
+        }
+        if (demuxer.boundTarget(ssrc).isPresent()) {
+            return true;
+        }
+        for (var stream : receiveStreams) {
+            if (stream.ownsSsrc(ssrc)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /// {@return whether a compound packet carries the session's own CNAME for `ssrc`, the mark of a loop}
+    private boolean carriesOwnCname(List<RtcpPacket> packets, long ssrc) {
+        for (var packet : packets) {
+            if (packet instanceof SourceDescription description) {
+                for (var chunk : description.chunks()) {
+                    if (chunk.ssrc() == ssrc
+                            && chunk.find(SourceDescription.Item.CNAME).map(cname::equals).orElse(false)) {
+                        return true;
+                    }
+                }
+            }
+        }
+        return false;
+    }
+
+    /// {@return whether transport-wide feedback names packets this session could have sent: its base is at most
+    /// [#FEEDBACK_WINDOW] behind the last transport-wide sequence number sent}. Called under the lock.
+    private boolean plausible(TransportFeedback feedback) {
+        if (!transportSequenceUsed) {
+            return false;
+        }
+        var last = (transportSequence - 1) & 0xFFFF;
+        var behind = (last - feedback.baseSequence()) & 0xFFFF;
+        return behind < FEEDBACK_WINDOW;
     }
 
     /// Receives one decrypted compound RTCP packet from the transport.
@@ -721,7 +1013,9 @@ public final class RtpSession implements AutoCloseable {
         var outgoing = new ArrayList<Outgoing>();
         var keyframes = new ArrayList<Map.Entry<RtpSendStream, KeyframeRequest>>();
         var forwarded = new ArrayList<RtcpPacket>();
+        var observed = new ArrayList<RtcpPacket>();
         var reports = new ArrayList<ReceptionReport>();
+        var changes = new ArrayList<Map.Entry<List<RtcpPacket>, SsrcChange>>();
         var reportRtt = -1L;
         var observer = feedbackObserver;
         lock.lock();
@@ -729,7 +1023,12 @@ public final class RtpSession implements AutoCloseable {
             for (var packet : packets) {
                 switch (packet) {
                     case SenderReport report -> {
-                        remoteSsrcs.put(report.ssrc(), arrivalNanos);
+                        if (isLocal(report.ssrc())) {
+                            onLocalSsrc(report.ssrc(), carriesOwnCname(packets, report.ssrc()), arrivalNanos)
+                                    .ifPresent(changes::add);
+                            continue;
+                        }
+                        members.heard(report.ssrc(), arrivalNanos).sentSenderReport = true;
                         for (var stream : receiveStreams) {
                             if (stream.mediaSsrc().isPresent() && stream.mediaSsrc().getAsLong() == report.ssrc()) {
                                 stream.onSenderReport(report, arrivalNanos);
@@ -738,23 +1037,33 @@ public final class RtpSession implements AutoCloseable {
                         reportRtt = Math.max(reportRtt, onReceptionReports(report.reports(), arrivalNanos, reports));
                     }
                     case ReceiverReport report -> {
-                        remoteSsrcs.put(report.ssrc(), arrivalNanos);
+                        if (isLocal(report.ssrc())) {
+                            onLocalSsrc(report.ssrc(), carriesOwnCname(packets, report.ssrc()), arrivalNanos)
+                                    .ifPresent(changes::add);
+                            continue;
+                        }
+                        members.heard(report.ssrc(), arrivalNanos);
                         reportRtt = Math.max(reportRtt, onReceptionReports(report.reports(), arrivalNanos, reports));
                     }
-                    case SourceDescription description -> {
-                        for (var chunk : description.chunks()) {
-                            chunk.find(SourceDescription.Item.CNAME)
-                                    .ifPresent(value -> remoteCnames.put(chunk.ssrc(), value));
-                        }
-                    }
+                    case SourceDescription description -> onSourceDescription(description, arrivalNanos);
                     case Bye bye -> {
                         for (var ssrc : bye.ssrcs()) {
-                            remoteSsrcs.remove(ssrc);
+                            if (isLocal(ssrc)) {
+                                continue;
+                            }
+                            members.remove(ssrc);
                             demuxer.unbind(ssrc);
+                        }
+                        for (var pending : pendingByes) {
+                            pending.byeMembers++;
                         }
                         forwarded.add(bye);
                     }
-                    case ExtendedReport report -> onExtendedReport(report, arrivalNanos);
+                    case ExtendedReport report -> {
+                        if (!isLocal(report.ssrc())) {
+                            onExtendedReport(report, arrivalNanos);
+                        }
+                    }
                     case Nack nack -> {
                         var stream = sendStreamOf(nack.mediaSsrc());
                         if (stream != null) {
@@ -777,26 +1086,31 @@ public final class RtpSession implements AutoCloseable {
                             }
                         }
                     }
-                    case Remb remb -> {
-                        if (observer == null) {
-                            forwarded.add(remb);
-                        }
-                    }
+                    case Remb remb -> (observer == null ? forwarded : observed).add(remb);
                     case TransportFeedback feedback -> {
                         if (observer == null) {
                             forwarded.add(feedback);
+                        } else if (plausible(feedback)) {
+                            observed.add(feedback);
+                        } else {
+                            droppedFeedback++;
                         }
                     }
+                    case CongestionControlFeedback feedback ->
+                            (observer == null ? forwarded : observed).add(feedback);
                     default -> forwarded.add(packet);
                 }
             }
         } finally {
             lock.unlock();
         }
+        changes.forEach(this::announceCollision);
         if (observer != null) {
-            for (var packet : packets) {
+            for (var packet : observed) {
                 switch (packet) {
                     case TransportFeedback feedback -> observer.onTransportFeedback(feedback, arrivalNanos);
+                    case CongestionControlFeedback feedback ->
+                            observer.onCongestionControlFeedback(feedback, arrivalNanos);
                     case Remb remb -> observer.onRemb(remb, arrivalNanos);
                     default -> {
                     }
@@ -827,6 +1141,30 @@ public final class RtpSession implements AutoCloseable {
         }
     }
 
+    /// Records the CNAMEs of a source description. Called under the lock.
+    private void onSourceDescription(SourceDescription description, long arrivalNanos) {
+        for (var chunk : description.chunks()) {
+            var announced = chunk.find(SourceDescription.Item.CNAME);
+            if (announced.isEmpty() || isLocal(chunk.ssrc())) {
+                continue;
+            }
+            var member = members.peek(chunk.ssrc());
+            if (member.isEmpty() || !mayRecordCname(chunk.ssrc(), member.get())) {
+                continue;
+            }
+            var known = member.get().cname;
+            if (known == null) {
+                member.get().cname = announced.get();
+            } else if (!known.equals(announced.get())) {
+                thirdPartyCollisions++;
+                conflicts.put(chunk.ssrc(), arrivalNanos);
+                while (conflicts.size() > MAX_CONFLICTS) {
+                    conflicts.remove(conflicts.keySet().iterator().next());
+                }
+            }
+        }
+    }
+
     /// Applies report blocks about local streams. Called under the lock; returns the round-trip time measured.
     private long onReceptionReports(List<ReceptionReport> blocks, long arrivalNanos, List<ReceptionReport> local) {
         var measured = -1L;
@@ -850,13 +1188,16 @@ public final class RtpSession implements AutoCloseable {
         return measured;
     }
 
-    /// Applies an extended report: remembers receiver reference times to answer, measures round trips from
-    /// answered ones. Called under the lock.
+    /// Applies an extended report: remembers the receiver reference time of a member to answer, measures round
+    /// trips from answered ones. Called under the lock.
     private void onExtendedReport(ExtendedReport report, long arrivalNanos) {
         for (var block : report.blocks()) {
             switch (block) {
-                case ExtendedReport.ReceiverReferenceTime(var ntp) ->
-                        peerReferenceTimes.put(report.ssrc(), new long[]{NtpTime.compact(ntp), arrivalNanos});
+                case ExtendedReport.ReceiverReferenceTime(var ntp) -> {
+                    var member = members.heard(report.ssrc(), arrivalNanos);
+                    member.referenceTimeNtpCompact = NtpTime.compact(ntp);
+                    member.referenceTimeArrivalNanos = arrivalNanos;
+                }
                 case ExtendedReport.Dlrr(var entries) -> {
                     for (var entry : entries) {
                         if (entry.ssrc() != feedbackSsrc() && entry.ssrc() != localSsrc) {
@@ -973,13 +1314,7 @@ public final class RtpSession implements AutoCloseable {
     }
 
     private int members(long now) {
-        var members = Math.max(1, sendStreams.size());
-        for (var seen : remoteSsrcs.values()) {
-            if (now - seen < MEMBER_TIMEOUT_NANOS) {
-                members++;
-            }
-        }
-        return members;
+        return Math.max(1, sendStreams.size()) + members.activeCount(now);
     }
 
     private int senders(long now) {
@@ -1014,42 +1349,52 @@ public final class RtpSession implements AutoCloseable {
     long tick() {
         var works = new ArrayList<Map.Entry<RtpReceiveStream, RtpReceiveStream.Work>>();
         List<List<RtcpPacket>> regular = List.of();
+        var byes = new ArrayList<List<RtcpPacket>>();
         long next;
         lock.lock();
         try {
-            if (closed) {
-                return Long.MAX_VALUE;
-            }
             var now = clock.nanos();
-            for (var stream : receiveStreams) {
-                var work = new RtpReceiveStream.Work();
-                stream.onTick(now, work);
-                if (!work.deliveries().isEmpty() || !work.feedback().isEmpty()) {
-                    works.add(Map.entry(stream, work));
-                }
-            }
-            if (rtcpScheduler.regularDue(now)) {
-                var members = members(now);
-                var senders = senders(now);
-                var weSent = weSent(now);
-                var allowed = rtcpScheduler.trrAllows(now);
-                var size = 0;
-                if (allowed) {
-                    regular = buildRegular(now);
-                    for (var compound : regular) {
-                        for (var packet : compound) {
-                            size += packet.encodedLength();
-                        }
+            next = dueByes(now, byes);
+            if (!closed) {
+                members.expire(now);
+                conflicts.values().removeIf(seen -> now - seen >= CONFLICT_TIMEOUT_NANOS);
+                for (var stream : receiveStreams) {
+                    var work = new RtpReceiveStream.Work();
+                    stream.onTick(now, work);
+                    if (!work.deliveries().isEmpty() || !work.feedback().isEmpty()) {
+                        works.add(Map.entry(stream, work));
                     }
                 }
-                rtcpScheduler.onRegular(now, size, allowed, members, senders, weSent);
-            }
-            next = rtcpScheduler.nextRegularNanos();
-            for (var stream : receiveStreams) {
-                next = Math.min(next, stream.nextDeadline());
+                if (rtcpScheduler.regularDue(now)) {
+                    var members = members(now);
+                    var senders = senders(now);
+                    var weSent = weSent(now);
+                    var allowed = rtcpScheduler.trrAllows(now);
+                    var size = 0;
+                    if (allowed) {
+                        regular = buildRegular(now);
+                        for (var compound : regular) {
+                            for (var packet : compound) {
+                                size += packet.encodedLength();
+                            }
+                        }
+                    }
+                    rtcpScheduler.onRegular(now, size, allowed, members, senders, weSent);
+                }
+                next = Math.min(next, rtcpScheduler.nextRegularNanos());
+                for (var stream : receiveStreams) {
+                    next = Math.min(next, stream.nextDeadline());
+                }
             }
         } finally {
             lock.unlock();
+        }
+        for (var compound : byes) {
+            try {
+                sendCompound(compound);
+            } catch (IOException | RuntimeException exception) {
+                LOGGER.log(Level.DEBUG, "could not send a delayed BYE", exception);
+            }
         }
         for (var entry : works) {
             sendFeedbackQuietly(entry.getValue().feedback());
@@ -1061,6 +1406,29 @@ public final class RtpSession implements AutoCloseable {
             } catch (IOException exception) {
                 LOGGER.log(Level.DEBUG, "could not send an RTCP report", exception);
             }
+        }
+        return next;
+    }
+
+    /// Takes the BYEs whose reconsidered timer expired (RFC 3550 section 6.3.7: the interval is recomputed with
+    /// the BYEs received meanwhile, and the BYE leaves only when the recomputed time has passed) and returns the
+    /// next BYE deadline. Called under the lock.
+    private long dueByes(long nowNanos, List<List<RtcpPacket>> out) {
+        var next = Long.MAX_VALUE;
+        for (var iterator = pendingByes.iterator(); iterator.hasNext(); ) {
+            var pending = iterator.next();
+            if (pending.dueNanos > nowNanos) {
+                next = Math.min(next, pending.dueNanos);
+                continue;
+            }
+            var reconsidered = pending.startNanos + rtcpScheduler.byeInterval(pending.byeMembers, pending.size);
+            if (reconsidered > nowNanos) {
+                pending.dueNanos = reconsidered;
+                next = Math.min(next, reconsidered);
+                continue;
+            }
+            iterator.remove();
+            out.add(pending.compound);
         }
         return next;
     }
@@ -1115,13 +1483,13 @@ public final class RtpSession implements AutoCloseable {
             xrBlocks.add(new ExtendedReport.ReceiverReferenceTime(ntp));
             referenceTimesSent.put(NtpTime.compact(ntp), now);
         }
-        if (!peerReferenceTimes.isEmpty()) {
+        var referenceTimes = members.takeReferenceTimes(MAX_DLRR_ENTRIES);
+        if (!referenceTimes.isEmpty()) {
             var entries = new ArrayList<ExtendedReport.DlrrEntry>();
-            for (var entry : peerReferenceTimes.entrySet()) {
-                entries.add(new ExtendedReport.DlrrEntry(entry.getKey(), entry.getValue()[0],
-                        NtpTime.compactOfNanos(now - entry.getValue()[1])));
+            for (var reference : referenceTimes) {
+                entries.add(new ExtendedReport.DlrrEntry(reference.ssrc(), reference.ntpCompact(),
+                        NtpTime.compactOfNanos(now - reference.arrivalNanos())));
             }
-            peerReferenceTimes.clear();
             xrBlocks.add(new ExtendedReport.Dlrr(entries));
         }
         if (!xrBlocks.isEmpty()) {
@@ -1138,14 +1506,26 @@ public final class RtpSession implements AutoCloseable {
         }
     }
 
+    private boolean timerDone() {
+        lock.lock();
+        try {
+            return closed && pendingByes.isEmpty();
+        } finally {
+            lock.unlock();
+        }
+    }
+
     private void runTimers() {
-        while (!closed && !Thread.currentThread().isInterrupted()) {
+        while (!timerDone() && !Thread.currentThread().isInterrupted()) {
             long next;
             try {
                 next = tick();
             } catch (RuntimeException exception) {
                 LOGGER.log(Level.WARNING, "an RTP session timer failed", exception);
                 next = clock.nanos() + 100_000_000L;
+            }
+            if (timerDone()) {
+                return;
             }
             var wait = next - clock.nanos();
             if (wait > 0) {
@@ -1168,6 +1548,12 @@ public final class RtpSession implements AutoCloseable {
         private OutgoingPacketScheduler scheduler = OutgoingPacketScheduler.immediate();
         private TransportFeedbackObserver feedbackObserver;
         private Consumer<PacketArrival> arrivalObserver;
+        private Consumer<? super UnsignaledStream> unsignaledStreamListener = _ -> {
+        };
+        private Consumer<? super RtcpPacket> rtcpListener = _ -> {
+        };
+        private Consumer<? super SsrcChange> ssrcChangedListener = _ -> {
+        };
         private RtcpConfig rtcp = RtcpConfig.webrtc();
         private String cname;
         private long localSsrc = -1;
@@ -1223,6 +1609,39 @@ public final class RtpSession implements AutoCloseable {
         /// @return this builder
         public Builder arrivalObserver(Consumer<PacketArrival> observer) {
             this.arrivalObserver = Objects.requireNonNull(observer, "observer cannot be null");
+            return this;
+        }
+
+        /// Sets the listener told of incoming SSRCs no receive stream claims; it may create a receive stream for one,
+        /// after which the packet that triggered the report is routed again. Each SSRC is reported at most once a
+        /// second. None by default.
+        ///
+        /// @param listener the listener, called on the transport's reader thread
+        /// @return this builder
+        public Builder unsignaledStreamListener(Consumer<? super UnsignaledStream> listener) {
+            this.unsignaledStreamListener = Objects.requireNonNull(listener, "listener cannot be null");
+            return this;
+        }
+
+        /// Sets the listener told of every received RTCP packet the session does not consume: application data,
+        /// BYEs, unknown packets, and REMB, transport-wide or RFC 8888 feedback when no feedback observer was given.
+        /// None by default.
+        ///
+        /// @param listener the listener, called on the transport's reader thread
+        /// @return this builder
+        public Builder rtcpListener(Consumer<? super RtcpPacket> listener) {
+            this.rtcpListener = Objects.requireNonNull(listener, "listener cannot be null");
+            return this;
+        }
+
+        /// Sets the listener told when a local SSRC changes after a collision or
+        /// [RtpSendStream#changeSsrc(long)]. None by default.
+        ///
+        /// @param listener the listener, called on the thread that detected the change, after the session's lock
+        ///                 was released
+        /// @return this builder
+        public Builder ssrcChangedListener(Consumer<? super SsrcChange> listener) {
+            this.ssrcChangedListener = Objects.requireNonNull(listener, "listener cannot be null");
             return this;
         }
 

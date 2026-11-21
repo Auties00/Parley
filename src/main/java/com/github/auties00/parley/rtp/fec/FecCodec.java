@@ -21,6 +21,25 @@ final class FecCodec {
     /// @param length the packet length after the 12-byte fixed header
     /// @param body   the bytes after the fixed header, as long as the longest packet's
     record Parity(int bits0, int bits1, long timestamp, int length, byte[] body) {
+        /// {@return the parity of no packet, the start of an incremental parity}
+        static Parity empty() {
+            return new Parity(0, 0, 0, 0, new byte[0]);
+        }
+
+        /// {@return this parity with `packet` XOR-ed in}
+        ///
+        /// @param packet the packet to add
+        Parity plus(RtpPacket packet) {
+            var bytes = packet.buffer();
+            var size = packet.length() - RtpPacket.FIXED_HEADER_LENGTH;
+            var grown = java.util.Arrays.copyOf(body, Math.max(size, body.length));
+            for (var i = 0; i < size; i++) {
+                grown[i] ^= bytes.get(RtpPacket.FIXED_HEADER_LENGTH + i);
+            }
+            return new Parity(bits0 ^ (bytes.get(0) & 0x3F), bits1 ^ (bytes.get(1) & 0xFF),
+                    timestamp ^ packet.timestamp(), length ^ size, grown);
+        }
+
         static Parity of(List<RtpPacket> packets) {
             var longest = 0;
             for (var packet : packets) {
@@ -52,6 +71,58 @@ final class FecCodec {
     /// @param protectedSsrc      the SSRC the header names (FlexFEC draft 03), if any
     /// @param protectedSequences the sequence numbers the packet protects
     record Parsed(Parity parity, OptionalLong protectedSsrc, int[] protectedSequences) {
+    }
+
+    /// Writes an RFC 8627 repair payload with fixed columns and rows (`R=0, F=1`) into a new heap buffer.
+    ///
+    /// @param parity  the parity of the protected packets
+    /// @param base    the lowest protected sequence number, `SN base`
+    /// @param columns `L`, `1..255`
+    /// @param rows    `D`, `0..255`
+    static ByteBuffer encodeFixed(Parity parity, int base, int columns, int rows) {
+        var out = ByteBuffer.allocate(12 + parity.body().length);
+        out.put((byte) (0x40 | parity.bits0()));
+        out.put((byte) parity.bits1());
+        out.putShort((short) parity.length());
+        out.putInt((int) parity.timestamp());
+        out.putShort((short) base);
+        out.put((byte) columns);
+        out.put((byte) rows);
+        out.put(parity.body());
+        return out.flip();
+    }
+
+    /// Writes an RFC 8627 retransmission repair payload (`R=1`): the source packet with its version bits replaced by
+    /// `R=1, F=0`, into a new heap buffer.
+    ///
+    /// @param packet the source packet
+    static ByteBuffer encodeRetransmission(RtpPacket packet) {
+        var out = ByteBuffer.allocate(packet.length());
+        out.put(packet.buffer().duplicate());
+        out.put(0, (byte) (0x80 | (out.get(0) & 0x3F)));
+        return out.flip();
+    }
+
+    /// {@return whether an RFC 8627 repair payload is a retransmission (`R=1`)}
+    ///
+    /// @param payload the payload
+    static boolean isRetransmission(ByteBuffer payload) {
+        return payload.hasRemaining() && (payload.get(payload.position()) & 0xC0) == 0x80;
+    }
+
+    /// Rebuilds the source packet of an RFC 8627 retransmission repair payload (`R=1`).
+    ///
+    /// @param payload the payload
+    /// @return the source packet, in a new heap buffer
+    /// @throws RtpFormatException if the rebuilt packet is malformed
+    static RtpPacket decodeRetransmission(ByteBuffer payload) throws RtpFormatException {
+        if (payload.remaining() < RtpPacket.FIXED_HEADER_LENGTH) {
+            throw new RtpFormatException("FlexFEC retransmission shorter than an RTP header");
+        }
+        var out = ByteBuffer.allocate(payload.remaining());
+        out.put(payload.duplicate());
+        out.put(0, (byte) (0x80 | (out.get(0) & 0x3F)));
+        return RtpPacket.parse(out.flip());
     }
 
     /// Writes an FEC payload protecting `packets` into a new heap buffer.
@@ -169,10 +240,13 @@ final class FecCodec {
                 var start = buffer.position();
                 var first = buffer.get(start) & 0xFF;
                 if ((first & 0x80) != 0) {
-                    throw new RtpFormatException("FlexFEC retransmission packets are not supported");
+                    throw new RtpFormatException("a FlexFEC retransmission is not a parity payload");
                 }
                 if ((first & 0x40) != 0) {
-                    throw new RtpFormatException("FlexFEC fixed (row and column) masks are not supported");
+                    if (format == FecFormat.FLEXFEC_03) {
+                        throw new RtpFormatException("flexfec-03 fixed (row and column) masks are not supported");
+                    }
+                    yield parseFixed(buffer, start, first);
                 }
                 var bits1 = buffer.get(start + 1) & 0xFF;
                 var length = buffer.getShort(start + 2) & 0xFFFF;
@@ -212,6 +286,36 @@ final class FecCodec {
                         java.util.Arrays.copyOf(sequences, count));
             }
         };
+    }
+
+    /// Parses an RFC 8627 repair payload with fixed columns and rows (`R=0, F=1`, Figure 14).
+    private static Parsed parseFixed(ByteBuffer buffer, int start, int first) throws RtpFormatException {
+        if (buffer.limit() - start < 12) {
+            throw new RtpFormatException("FlexFEC fixed header shorter than 12 bytes");
+        }
+        var bits1 = buffer.get(start + 1) & 0xFF;
+        var length = buffer.getShort(start + 2) & 0xFFFF;
+        var timestamp = buffer.getInt(start + 4) & 0xFFFFFFFFL;
+        var base = buffer.getShort(start + 8) & 0xFFFF;
+        var columns = buffer.get(start + 10) & 0xFF;
+        var rows = buffer.get(start + 11) & 0xFF;
+        int[] sequences;
+        if (columns == 0) {
+            sequences = new int[0];
+        } else if (rows <= 1) {
+            sequences = new int[columns];
+            for (var i = 0; i < columns; i++) {
+                sequences[i] = (base + i) & 0xFFFF;
+            }
+        } else {
+            sequences = new int[rows];
+            for (var i = 0; i < rows; i++) {
+                sequences[i] = (base + i * columns) & 0xFFFF;
+            }
+        }
+        var body = new byte[buffer.limit() - start - 12];
+        buffer.get(start + 12, body);
+        return new Parsed(new Parity(first & 0x3F, bits1, timestamp, length, body), OptionalLong.empty(), sequences);
     }
 
     /// Rebuilds the one packet a parity block misses from the others it protects.

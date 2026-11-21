@@ -322,17 +322,46 @@ public record DependencyDescriptor(boolean startOfFrame, boolean endOfFrame, int
                 template.frameDiffs(), template.chainDiffs());
     }
 
-    /// Parses a descriptor.
+    /// Parses a descriptor that attaches its own template structure, as the first packet of a key frame does.
+    ///
+    /// @param value the element value between position and limit; it is not modified
+    /// @return the descriptor, its frame fields resolved from its template
+    /// @throws RtpFormatException if the value is malformed, attaches no structure, or names no template of it
+    public static DependencyDescriptor parse(ByteBuffer value) throws RtpFormatException {
+        Objects.requireNonNull(value, "value cannot be null");
+        return read(value, Optional.empty());
+    }
+
+    /// Parses a descriptor against the latest structure the stream attached, unless the packet attaches its own.
     ///
     /// @param value  the element value between position and limit; it is not modified
     /// @param latest the latest structure the stream attached, used when this packet attaches none
     /// @return the descriptor, its frame fields resolved from its template
-    /// @throws RtpFormatException if the value is malformed, names no template of its structure, or neither
-    ///                            attaches a structure nor has a `latest` one to read against
-    public static DependencyDescriptor parse(ByteBuffer value, Optional<TemplateStructure> latest)
-            throws RtpFormatException {
+    /// @throws RtpFormatException if the value is malformed or names no template of its structure
+    public static DependencyDescriptor parse(ByteBuffer value, TemplateStructure latest) throws RtpFormatException {
         Objects.requireNonNull(value, "value cannot be null");
         Objects.requireNonNull(latest, "latest cannot be null");
+        return read(value, Optional.of(latest));
+    }
+
+    /// Parses a descriptor against an optional latest structure.
+    ///
+    /// @param value  the element value
+    /// @param latest the latest structure, or empty
+    /// @return the descriptor
+    /// @throws RtpFormatException if the value is malformed
+    /// @deprecated use [#parse(ByteBuffer)] or [#parse(ByteBuffer, TemplateStructure)]
+    @Deprecated(forRemoval = true)
+    public static DependencyDescriptor parse(ByteBuffer value, Optional<TemplateStructure> latest)
+            throws RtpFormatException {
+        // TODO: remove once payload.VideoDepacketizer calls the overloads (cross-group, integration).
+        Objects.requireNonNull(value, "value cannot be null");
+        Objects.requireNonNull(latest, "latest cannot be null");
+        return read(value, latest);
+    }
+
+    private static DependencyDescriptor read(ByteBuffer value, Optional<TemplateStructure> latest)
+            throws RtpFormatException {
         var size = value.remaining();
         var reader = new BitReader(value);
         var startOfFrame = reader.readFlag();

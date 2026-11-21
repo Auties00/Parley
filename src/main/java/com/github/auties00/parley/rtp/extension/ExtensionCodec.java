@@ -37,6 +37,9 @@ final class ExtensionCodec {
         if (length == 0) {
             throw new RtpFormatException(name + " is empty");
         }
+        if (length > 255) {
+            throw new RtpFormatException(name + " longer than 255 bytes: " + length);
+        }
         return new String(bytes, 0, length, StandardCharsets.UTF_8);
     }
 

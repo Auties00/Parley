@@ -1,5 +1,6 @@
 package com.github.auties00.parley.rtp.session;
 
+import java.util.function.Consumer;
 import com.github.auties00.parley.rtp.extension.HeaderExtensionMap;
 
 import java.time.Duration;
@@ -26,12 +27,14 @@ import java.util.Set;
 /// @param red            redundant audio, if negotiated and wanted; exclusive with [FecConfig.Ulpfec]
 /// @param fec            forward error correction, if negotiated and wanted
 /// @param historyLength  how long sent packets stay available for retransmission (`rtx-time`)
+/// @param keyframeRequestListener told of every PLI and new FIR the peer sends about the stream, on the transport's
+///                       RTCP reader thread; it must not block
 /// @spec https://www.rfc-editor.org/rfc/rfc4588.html RFC 4588: RTP Retransmission Payload Format
 /// @spec https://www.rfc-editor.org/rfc/rfc8853.html RFC 8853: Using Simulcast in Session Description Protocol (SDP) and RTP Sessions
 public record SendStreamConfig(String mid, Optional<String> rid, long ssrc, OptionalLong rtxSsrc, int payloadType,
                                OptionalInt rtxPayloadType, int clockRate, HeaderExtensionMap extensions,
                                Set<FeedbackMechanism> feedback, Optional<RedConfig> red, Optional<FecConfig> fec,
-                               Duration historyLength) {
+                               Duration historyLength, Consumer<? super KeyframeRequest> keyframeRequestListener) {
     /// The history length browsers default to, the `rtx-time` RFC 4588 suggests for interactive video.
     public static final Duration DEFAULT_HISTORY_LENGTH = Duration.ofSeconds(1);
 
@@ -64,6 +67,18 @@ public record SendStreamConfig(String mid, Optional<String> rid, long ssrc, Opti
         if (historyLength.isNegative() || historyLength.isZero()) {
             throw new IllegalArgumentException("historyLength must be positive: " + historyLength);
         }
+        Objects.requireNonNull(keyframeRequestListener, "keyframeRequestListener cannot be null");
+    }
+
+    /// {@return a copy with one SSRC (media, RTX or FlexFEC) replaced, after an SSRC change}
+    SendStreamConfig withReplacedSsrc(long oldSsrc, long newSsrc) {
+        var media = ssrc == oldSsrc ? newSsrc : ssrc;
+        var rtx = rtxSsrc.isPresent() && rtxSsrc.getAsLong() == oldSsrc ? OptionalLong.of(newSsrc) : rtxSsrc;
+        var repair = fec.map(value -> value instanceof FecConfig.Flexfec flexfec && flexfec.ssrc() == oldSsrc
+                ? new FecConfig.Flexfec(flexfec.payloadType(), newSsrc, flexfec.draft03(),
+                flexfec.protectionPercent(), flexfec.scheme()) : value);
+        return new SendStreamConfig(mid, rid, media, rtx, payloadType, rtxPayloadType, clockRate, extensions, feedback,
+                red, repair, historyLength, keyframeRequestListener);
     }
 
     /// {@return a builder with the required fields set and the rest empty or default}
@@ -90,6 +105,8 @@ public record SendStreamConfig(String mid, Optional<String> rid, long ssrc, Opti
         private Optional<RedConfig> red = Optional.empty();
         private Optional<FecConfig> fec = Optional.empty();
         private Duration historyLength = DEFAULT_HISTORY_LENGTH;
+        private Consumer<? super KeyframeRequest> keyframeRequestListener = _ -> {
+        };
 
         private Builder(String mid, long ssrc, int payloadType, int clockRate) {
             this.mid = mid;
@@ -163,12 +180,22 @@ public record SendStreamConfig(String mid, Optional<String> rid, long ssrc, Opti
             return this;
         }
 
+        /// Sets the listener told of PLI and FIR requests from the peer; a FIR retransmitted with an unchanged
+        /// command sequence number is reported once. None by default.
+        ///
+        /// @param listener the listener, called on the transport's RTCP reader thread; it must not block
+        /// @return this builder
+        public Builder keyframeRequestListener(Consumer<? super KeyframeRequest> listener) {
+            this.keyframeRequestListener = Objects.requireNonNull(listener, "listener cannot be null");
+            return this;
+        }
+
         /// {@return the configuration}
         ///
         /// @throws IllegalArgumentException if the fields are inconsistent, as [SendStreamConfig] checks
         public SendStreamConfig build() {
             return new SendStreamConfig(mid, rid, ssrc, rtxSsrc, payloadType, rtxPayloadType, clockRate, extensions,
-                    feedback, red, fec, historyLength);
+                    feedback, red, fec, historyLength, keyframeRequestListener);
         }
     }
 }

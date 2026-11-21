@@ -8,42 +8,60 @@ import java.nio.ByteBuffer;
 import java.time.Duration;
 import java.util.ArrayDeque;
 import java.util.EnumMap;
-import java.util.List;
 import java.util.Objects;
 import java.util.OptionalLong;
 import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.locks.Condition;
 import java.util.concurrent.locks.ReentrantLock;
+import java.util.function.Consumer;
 
-/// A leaky-bucket packet pacer: holds the RTP packets an RTP session would send and releases them at the pacing rate, highest [OutgoingPacketScheduler.Priority] first, so a keyframe does
-/// not leave the host as one burst that overflows a bottleneck queue.
+/// A leaky-bucket packet pacer: holds the RTP packets an RTP session would send and releases them at the pacing
+/// rate, highest [OutgoingPacketScheduler.Priority] first, so a keyframe does not leave the host as one burst that
+/// overflows a bottleneck queue.
 ///
 /// Within the order `AUDIO`, `RETRANSMISSION`, `VIDEO` and `FEC` together, `PADDING`, packets of the same level leave
 /// in the order they were scheduled. Video and FEC share a level because ULPFEC travels in RED on the media stream's
 /// source and sequence space: a FEC packet queued behind later video would leave a gap the receiver counts as loss
-/// and asks to retransmit, and a sender that writes faster than the pacing rate would starve it outright. Audio is sent as soon as it is scheduled unless the configuration paces it. When the
-/// queue would take longer than the configured maximum queue time to drain at the pacing rate, the pacer raises its
-/// rate until it would not.
+/// and asks to retransmit, and a sender that writes faster than the pacing rate would starve it outright. Audio is
+/// sent as soon as it is scheduled unless the configuration paces it.
 ///
-/// The pacer also sends the probes of its [CongestionController] and keeps up the padding rate, taking the bytes
-/// the media queue cannot supply from the padding source the RTP session installs with
-/// [#setPaddingSource(OutgoingPacketScheduler.PaddingSource)], or from a
-/// [com.github.auties00.parley.cc.PaddingSource] given to
-/// [#setPaddingSource(com.github.auties00.parley.cc.PaddingSource)].
+/// # Queue bounds
 ///
-/// # Threading
+/// When the queue would take longer than the configured maximum queue time to drain at the pacing rate, the pacer
+/// raises its rate until it would not. When the oldest queued packet has still waited longer than twice the maximum
+/// queue time (a sink that blocks, such as a stalled TCP or TLS relay, or a rate far below what is scheduled), the
+/// pacer drops the oldest queued packets until it has not: retransmissions first, then video, FEC and padding in
+/// scheduling order. Audio is never dropped. [#droppedPackets()] counts what was dropped.
+///
+/// # Congestion window
+///
+/// While its [CongestionController] reports the congestion window full ([#setCongested(boolean)]), the pacer sends
+/// only audio; the other packets wait (and age out under the queue bound), and no padding or probe is sent.
+///
+/// # Padding and probes
+///
+/// The pacer also sends the probes of its [CongestionController] and keeps up the padding rate, taking the bytes the
+/// media queue cannot supply from the padding source the RTP session installs with
+/// [#setPaddingSource(OutgoingPacketScheduler.PaddingSource)].
+///
+/// # Threading and failures
 ///
 /// [#schedule(ByteBuffer, Priority, long, PacketSink)] may be called from any thread and never blocks. Packets are
 /// handed to their [OutgoingPacketScheduler.PacketSink] on the pacer's own thread, started from the configured
-/// [ThreadFactory]; a sink that throws [IOException] loses that packet only. [#close()] stops the thread and drops
-/// what is still queued.
+/// [ThreadFactory]; a sink that throws loses that packet only ([#failedPackets()]). An unexpected exception inside
+/// one step of the pacer is logged and counted ([#failures()]) and the pacer goes on with the next step; only
+/// [#MAX_CONSECUTIVE_FAILURES] failed steps in a row, or an [Error], stop it: the pacer then closes, drops its queue
+/// and reports the cause to its failure listener once. [#close()] stops the thread and drops what is still queued.
 ///
 /// @implNote This implementation follows the debt-based pacing of the libwebrtc pacer rather than a fixed 5 ms
 /// interval: each sent byte adds to a debt that drains at the pacing rate, and the thread sleeps exactly until the
 /// debt is gone, so the rate is exact at any packet size.
 public final class Pacer implements OutgoingPacketScheduler, AutoCloseable {
     private static final System.Logger LOGGER = System.getLogger(Pacer.class.getName());
+
+    /// The failed steps in a row after which the pacer gives up and reports its failure.
+    public static final int MAX_CONSECUTIVE_FAILURES = 16;
 
     /// The probe cluster a packet handed to a sink belongs to, bound while the pacer calls the sink so that the
     /// controller sees which packets are probes when the session reports them sent from inside the sink.
@@ -62,6 +80,9 @@ public final class Pacer implements OutgoingPacketScheduler, AutoCloseable {
     /// How long the thread sleeps with nothing to do, so the ALR detector keeps seeing time pass.
     private static final long IDLE_NANOS = 250_000_000L;
 
+    /// How long the thread waits after a failed step before the next one.
+    private static final long FAILURE_BACKOFF_NANOS = 5_000_000L;
+
     /// The smallest padding request, in bytes.
     private static final int MIN_PADDING_BYTES = 50;
 
@@ -70,6 +91,9 @@ public final class Pacer implements OutgoingPacketScheduler, AutoCloseable {
 
     /// A probe cluster is dropped when it has not completed this long after it started.
     private static final long PROBE_TIMEOUT_NANOS = 1_000_000_000L;
+
+    /// The queues the time bound drops from: every one but audio.
+    private static final Priority[] DROPPABLE = {Priority.RETRANSMISSION, Priority.VIDEO, Priority.PADDING};
 
     private record Queued(ByteBuffer packet, Priority priority, long ssrc, PacketSink sink, long enqueuedNanos,
                           int size) {
@@ -101,6 +125,7 @@ public final class Pacer implements OutgoingPacketScheduler, AutoCloseable {
     private final MonotonicClock clock;
     private final boolean paceAudio;
     private final long maxQueueTimeNanos;
+    private final Consumer<? super Throwable> failureListener;
     private final ReentrantLock lock;
     private final Condition wake;
     private final EnumMap<Priority, ArrayDeque<Queued>> queues;
@@ -117,11 +142,13 @@ public final class Pacer implements OutgoingPacketScheduler, AutoCloseable {
     private boolean mediaSent;
     private boolean signalled;
     private boolean closed;
-    private com.github.auties00.parley.cc.PaddingSource paddingSource;
-    private OutgoingPacketScheduler.PaddingSource sessionPaddingSource;
+    private boolean congested;
+    private OutgoingPacketScheduler.PaddingSource paddingSource;
     private long sentPackets;
     private long sentBytes;
     private long failedPackets;
+    private long droppedPackets;
+    private long failures;
 
     /// Creates a pacer and, when `threadFactory` is present, starts its thread.
     ///
@@ -130,11 +157,13 @@ public final class Pacer implements OutgoingPacketScheduler, AutoCloseable {
     /// @param maxQueueTimeNanos the queue time bound
     /// @param paceAudio         whether audio waits for the budget
     /// @param threadFactory     the factory of the pacer thread, or `null` for a pacer driven by [#process(long)]
+    /// @param failureListener   told once when the pacer stops on a failure
     Pacer(MonotonicClock clock, long pacingRateBps, long maxQueueTimeNanos, boolean paceAudio,
-          ThreadFactory threadFactory) {
+          ThreadFactory threadFactory, Consumer<? super Throwable> failureListener) {
         this.clock = clock;
         this.paceAudio = paceAudio;
         this.maxQueueTimeNanos = maxQueueTimeNanos;
+        this.failureListener = Objects.requireNonNull(failureListener, "failureListener");
         this.lock = new ReentrantLock();
         this.wake = lock.newCondition();
         this.queues = new EnumMap<>(Priority.class);
@@ -172,6 +201,7 @@ public final class Pacer implements OutgoingPacketScheduler, AutoCloseable {
             queues.get(level(priority)).addLast(queued);
             queuedBytes += queued.size();
             queuedPackets++;
+            enforceQueueBound(now);
             signalled = true;
             wake.signalAll();
         } finally {
@@ -233,11 +263,39 @@ public final class Pacer implements OutgoingPacketScheduler, AutoCloseable {
         }
     }
 
-    /// Installs the source of padding and probe packets, replacing the previous one. Until one is installed, probes
-    /// carry only queued media and no padding is sent.
+    /// Holds every packet but audio while `congested` is `true`, as the congestion window pushback asks when more
+    /// bytes are in flight than the window allows; releasing it resumes pacing at once.
     ///
-    /// @param source the padding source
-    public void setPaddingSource(com.github.auties00.parley.cc.PaddingSource source) {
+    /// @param congested whether the congestion window is full
+    void setCongested(boolean congested) {
+        lock.lock();
+        try {
+            if (this.congested != congested) {
+                this.congested = congested;
+                signalled = true;
+                wake.signalAll();
+            }
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    /// {@return whether the pacer holds non-audio packets because the congestion window is full}
+    public boolean isCongested() {
+        lock.lock();
+        try {
+            return congested;
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    /// Installs the padding source of an RTP session, which sends padding and probe bytes through its own send path,
+    /// replacing the previous one. Until one is installed, probes carry only queued media and no padding is sent.
+    ///
+    /// @param source the session's padding source
+    @Override
+    public void setPaddingSource(OutgoingPacketScheduler.PaddingSource source) {
         Objects.requireNonNull(source, "source");
         lock.lock();
         try {
@@ -319,6 +377,36 @@ public final class Pacer implements OutgoingPacketScheduler, AutoCloseable {
         }
     }
 
+    /// {@return the packets dropped from the queue because they waited longer than twice the maximum queue time}
+    public long droppedPackets() {
+        lock.lock();
+        try {
+            return droppedPackets;
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    /// {@return the pacer steps that failed with an unexpected exception and were skipped}
+    public long failures() {
+        lock.lock();
+        try {
+            return failures;
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    /// {@return whether the pacer is closed, by [#close()] or after a failure}
+    public boolean isClosed() {
+        lock.lock();
+        try {
+            return closed;
+        } finally {
+            lock.unlock();
+        }
+    }
+
     /// Stops the pacer thread and drops the queued packets. Idempotent.
     @Override
     public void close() {
@@ -376,6 +464,7 @@ public final class Pacer implements OutgoingPacketScheduler, AutoCloseable {
                     return Long.MAX_VALUE;
                 }
                 advance(nowNanos);
+                enforceQueueBound(nowNanos);
                 var next = nextAction(nowNanos);
                 if (next instanceof NextWake(var wakeNanos)) {
                     return wakeNanos;
@@ -398,6 +487,16 @@ public final class Pacer implements OutgoingPacketScheduler, AutoCloseable {
     }
 
     private Step nextAction(long nowNanos) {
+        if (congested) {
+            var audio = queues.get(Priority.AUDIO).peekFirst();
+            if (audio != null && (!paceAudio || mediaDebtBytes <= 0)) {
+                return new Next(new Action.Media(poll(Priority.AUDIO), null));
+            }
+            if (audio != null) {
+                return new NextWake(nowNanos + Math.max(1, (long) (mediaDebtBytes * 8e9 / effectiveRate(nowNanos))));
+            }
+            return new NextWake(nowNanos + IDLE_NANOS);
+        }
         while (!probes.isEmpty()) {
             var probe = probes.peekFirst();
             if (probe.startNanos == Long.MIN_VALUE) {
@@ -451,69 +550,26 @@ public final class Pacer implements OutgoingPacketScheduler, AutoCloseable {
                 account(packet.size(), probe, sent, nowNanos);
             }
             case Action.Padding(var bytes, var probe) -> {
-                com.github.auties00.parley.cc.PaddingSource source;
-                OutgoingPacketScheduler.PaddingSource sessionSource;
+                OutgoingPacketScheduler.PaddingSource source;
                 lock.lock();
                 try {
                     source = paddingSource;
-                    sessionSource = sessionPaddingSource;
                 } finally {
                     lock.unlock();
                 }
-                if (source == null && sessionSource != null) {
-                    sendSessionPadding(sessionSource, bytes, probe, nowNanos);
-                    return;
-                }
-                List<PaddingPacket> packets;
-                try {
-                    packets = source == null ? List.of() : source.generatePadding(bytes);
-                } catch (RuntimeException exception) {
-                    LOGGER.log(System.Logger.Level.WARNING, "Padding source failed", exception);
-                    packets = List.of();
-                }
-                if (packets.isEmpty()) {
-                    lock.lock();
-                    try {
-                        if (probe != null) {
-                            probes.remove(probe);
-                        } else {
-                            paddingDebtBytes += bytes;
-                        }
-                    } finally {
-                        lock.unlock();
-                    }
-                    return;
-                }
-                for (var padding : packets) {
-                    var size = padding.plainRtp().remaining();
-                    var sent = send(padding.plainRtp(), padding.sink(), probe);
-                    account(size, probe, sent, nowNanos);
-                }
+                sendPadding(source, bytes, probe, nowNanos);
             }
         }
     }
 
-    /// Installs the padding source of an RTP session, which sends the padding itself through its own send path; a
-    /// source given to [#setPaddingSource(com.github.auties00.parley.cc.PaddingSource)] takes precedence.
-    ///
-    /// @param source the session's padding source
-    @Override
-    public void setPaddingSource(OutgoingPacketScheduler.PaddingSource source) {
-        Objects.requireNonNull(source, "source");
-        lock.lock();
-        try {
-            sessionPaddingSource = source;
-        } finally {
-            lock.unlock();
-        }
-    }
-
-    /// Asks a session's padding source for `bytes` of padding inside the probe binding, and accounts what it sent.
-    private void sendSessionPadding(OutgoingPacketScheduler.PaddingSource source, int bytes, ProbeState probe,
-                                    long nowNanos) {
+    /// Asks the session's padding source for `bytes` of padding inside the probe binding, and accounts what it sent.
+    private void sendPadding(OutgoingPacketScheduler.PaddingSource source, int bytes, ProbeState probe,
+                             long nowNanos) {
         int sent;
         try {
-            if (probe == null) {
+            if (source == null) {
+                sent = 0;
+            } else if (probe == null) {
                 sent = source.sendPadding(bytes, false);
             } else {
                 sent = ScopedValue.where(PROBE, probe.cluster).call(() -> source.sendPadding(bytes, true));
@@ -592,6 +648,36 @@ public final class Pacer implements OutgoingPacketScheduler, AutoCloseable {
         }
     }
 
+    /// Drops the oldest droppable packets while the oldest queued packet has waited longer than twice the maximum
+    /// queue time: retransmissions first, then the oldest of video, FEC and padding. Audio is never dropped. Called
+    /// under the lock.
+    private void enforceQueueBound(long nowNanos) {
+        var bound = 2 * maxQueueTimeNanos;
+        while (true) {
+            var oldest = Long.MAX_VALUE;
+            for (var priority : DROPPABLE) {
+                var first = queues.get(priority).peekFirst();
+                if (first != null) {
+                    oldest = Math.min(oldest, first.enqueuedNanos());
+                }
+            }
+            if (oldest == Long.MAX_VALUE || nowNanos - oldest <= bound) {
+                return;
+            }
+            Priority victim;
+            if (!queues.get(Priority.RETRANSMISSION).isEmpty()) {
+                victim = Priority.RETRANSMISSION;
+            } else {
+                var video = queues.get(Priority.VIDEO).peekFirst();
+                var padding = queues.get(Priority.PADDING).peekFirst();
+                victim = video != null && (padding == null || video.enqueuedNanos() <= padding.enqueuedNanos())
+                        ? Priority.VIDEO : Priority.PADDING;
+            }
+            poll(victim);
+            droppedPackets++;
+        }
+    }
+
     private double effectiveRate(long nowNanos) {
         double rate = pacingRateBps;
         if (queuedBytes > 0) {
@@ -639,32 +725,74 @@ public final class Pacer implements OutgoingPacketScheduler, AutoCloseable {
         return packet;
     }
 
+    /// Runs the pacer: one [#process(long)] step per iteration, each isolated, so a failure in one step costs that
+    /// step only.
     private void run() {
-        try {
-            while (true) {
-                var next = process(clock.nanos());
+        var consecutiveFailures = 0;
+        while (true) {
+            long next;
+            try {
+                next = process(clock.nanos());
+                consecutiveFailures = 0;
+            } catch (RuntimeException exception) {
+                consecutiveFailures++;
                 lock.lock();
                 try {
-                    if (closed) {
-                        return;
-                    }
-                    if (signalled) {
-                        signalled = false;
-                        continue;
-                    }
-                    var wait = next == Long.MAX_VALUE ? IDLE_NANOS : next - clock.nanos();
-                    if (wait > 0) {
-                        wake.await(wait, TimeUnit.NANOSECONDS);
-                    }
-                    signalled = false;
+                    failures++;
                 } finally {
                     lock.unlock();
                 }
+                if (consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
+                    fail(exception);
+                    return;
+                }
+                LOGGER.log(System.Logger.Level.WARNING, "A pacer step failed; skipping it", exception);
+                next = clock.nanos() + FAILURE_BACKOFF_NANOS;
+            } catch (Error error) {
+                fail(error);
+                throw error;
             }
-        } catch (InterruptedException exception) {
-            Thread.currentThread().interrupt();
+            try {
+                if (!await(next)) {
+                    return;
+                }
+            } catch (InterruptedException exception) {
+                Thread.currentThread().interrupt();
+                return;
+            }
+        }
+    }
+
+    /// Waits until `next` or a signal; returns `false` once the pacer is closed.
+    private boolean await(long next) throws InterruptedException {
+        lock.lock();
+        try {
+            if (closed) {
+                return false;
+            }
+            if (signalled) {
+                signalled = false;
+                return true;
+            }
+            var wait = next == Long.MAX_VALUE ? IDLE_NANOS : next - clock.nanos();
+            if (wait > 0) {
+                wake.await(wait, TimeUnit.NANOSECONDS);
+            }
+            signalled = false;
+            return !closed;
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    /// Closes the pacer after a failure it cannot go on from and reports it.
+    private void fail(Throwable cause) {
+        LOGGER.log(System.Logger.Level.ERROR, "The pacer stopped after a failure", cause);
+        close();
+        try {
+            failureListener.accept(cause);
         } catch (RuntimeException exception) {
-            LOGGER.log(System.Logger.Level.ERROR, "Pacer thread failed", exception);
+            LOGGER.log(System.Logger.Level.WARNING, "The pacer failure listener failed", exception);
         }
     }
 }
