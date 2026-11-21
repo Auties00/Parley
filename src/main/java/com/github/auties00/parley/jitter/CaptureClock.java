@@ -17,8 +17,8 @@ import java.util.OptionalInt;
 /// along the RTP clock for up to [#INTERPOLATION_LIMIT] (the extension is sent only on some packets), else from the
 /// RTP to NTP mapping of the latest RTCP sender report. Not thread-safe: the owning buffer calls it under its lock.
 ///
-/// @spec https://webrtc.googlesource.com/src/+/refs/heads/main/docs/native-code/rtp-hdrext/abs-capture-time/README.md Absolute Capture Time
-/// @spec https://webrtc.googlesource.com/src/+/refs/heads/main/docs/native-code/rtp-hdrext/playout-delay/README.md Playout Delay
+/// @spec https://webrtc.googlesource.com/src/+/refs/heads/main/docs/native-code/rtp-hdrext/abs-capture-time/README.md WebRTC: Absolute Capture Time
+/// @spec https://webrtc.googlesource.com/src/+/refs/heads/main/docs/native-code/rtp-hdrext/playout-delay/README.md WebRTC: Playout Delay
 /// @spec https://www.rfc-editor.org/rfc/rfc3550.html#section-6.4.1 RFC 3550 section 6.4.1: SR: Sender Report RTCP Packet
 final class CaptureClock {
     /// How far along the RTP clock an `abs-capture-time` value is extrapolated, the interpolation limit webrtc.org

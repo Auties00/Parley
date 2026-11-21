@@ -54,7 +54,7 @@ import java.util.Set;
 /// @spec https://www.rfc-editor.org/rfc/rfc9335.html RFC 9335: Completely Encrypting RTP Header Extensions and Contributing Sources
 /// @spec https://www.rfc-editor.org/rfc/rfc8888.html RFC 8888: RTP Control Protocol (RTCP) Feedback for Congestion Control
 /// @spec https://www.rfc-editor.org/rfc/rfc3890.html RFC 3890: A Transport Independent Bandwidth Modifier for the Session Description Protocol (SDP)
-/// @spec https://w3c.github.io/webrtc-extensions/ WebRTC Extensions
+/// @spec https://www.w3.org/TR/webrtc-extensions/ WebRTC Extensions
 /// @spec https://www.w3.org/TR/webrtc/ WebRTC: Real-Time Communication in Browsers
 final class JsepEngine {
     /// The RTP profile of every media section Parley writes.

@@ -21,8 +21,8 @@ import java.util.OptionalInt;
 /// @spec https://www.rfc-editor.org/rfc/rfc8285.html RFC 8285: A General Mechanism for RTP Header Extensions
 /// @spec https://www.rfc-editor.org/rfc/rfc6464.html RFC 6464: A Real-time Transport Protocol (RTP) Header Extension for Client-to-Mixer Audio Level Indication
 /// @spec https://aomediacodec.github.io/av1-rtp-spec/ RTP Payload Format For AV1 (v1.0.0)
-/// @spec https://webrtc.googlesource.com/src/+/refs/heads/main/docs/native-code/rtp-hdrext/abs-capture-time/README.md Absolute Capture Time
-/// @spec https://webrtc.googlesource.com/src/+/refs/heads/main/docs/native-code/rtp-hdrext/playout-delay/README.md Playout Delay
+/// @spec https://webrtc.googlesource.com/src/+/refs/heads/main/docs/native-code/rtp-hdrext/abs-capture-time/README.md WebRTC: Absolute Capture Time
+/// @spec https://webrtc.googlesource.com/src/+/refs/heads/main/docs/native-code/rtp-hdrext/playout-delay/README.md WebRTC: Playout Delay
 public record DepacketizerConfig(OptionalInt audioLevelExtensionId, OptionalInt dependencyDescriptorExtensionId,
                                  OptionalInt absCaptureTimeExtensionId, OptionalInt playoutDelayExtensionId) {
     /// Settings that read no header extension.

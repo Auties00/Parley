@@ -12,7 +12,7 @@ import java.util.Objects;
 /// @param uri       the extension URI
 /// @param direction the direction to negotiate it in, `STOPPED` for an extension that is not negotiated
 /// @spec https://www.w3.org/TR/webrtc/ WebRTC: Real-Time Communication in Browsers
-/// @spec https://w3c.github.io/webrtc-extensions/ WebRTC Extensions
+/// @spec https://www.w3.org/TR/webrtc-extensions/ WebRTC Extensions
 /// @spec https://www.rfc-editor.org/rfc/rfc8285.html RFC 8285: A General Mechanism for RTP Header Extensions
 public record RtpHeaderExtensionCapability(URI uri, TransceiverDirection direction) {
     /// Creates the capability.

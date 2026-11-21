@@ -69,7 +69,7 @@ import java.util.concurrent.locks.ReentrantLock;
 /// @spec https://www.rfc-editor.org/rfc/rfc3550.html#appendix-A.8 RFC 3550 appendix A.8: Estimating the Interarrival Jitter
 /// @spec https://www.w3.org/TR/webrtc-extensions/#dom-rtcrtpreceiver-jitterbuffertarget W3C WebRTC Extensions: jitterBufferTarget
 /// @spec https://www.w3.org/TR/webrtc-stats/ Identifiers for WebRTC's Statistics API
-/// @spec https://webrtc.googlesource.com/src/+/refs/heads/main/docs/native-code/rtp-hdrext/playout-delay/README.md Playout Delay
+/// @spec https://webrtc.googlesource.com/src/+/refs/heads/main/docs/native-code/rtp-hdrext/playout-delay/README.md WebRTC: Playout Delay
 public final class AudioPlayoutBuffer implements AutoCloseable {
     /// The number of recent packet delays the percentile is taken over: about two seconds of 20 ms frames.
     private static final int HISTORY = 100;
