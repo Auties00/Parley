@@ -12,5 +12,5 @@
 ///
 /// @spec https://www.rfc-editor.org/rfc/rfc3550.html RFC 3550: RTP: A Transport Protocol for Real-Time Applications
 /// @spec https://www.rfc-editor.org/rfc/rfc4585.html RFC 4585: Extended RTP Profile for Real-time Transport Control Protocol (RTCP)-Based Feedback (RTP/AVPF)
-/// @spec https://www.w3.org/TR/webrtc-stats/ W3C Identifiers for WebRTC's Statistics API
+/// @spec https://www.w3.org/TR/webrtc-stats/ Identifiers for WebRTC's Statistics API
 package com.github.auties00.parley.jitter;

@@ -9,7 +9,7 @@ import java.nio.ByteBuffer;
 /// stamped when the packet leaves the sender, from which a receiver estimates queuing delay (REMB).
 ///
 /// @param value the 24-bit fixed-point value, `0..0xFFFFFF`
-/// @spec https://webrtc.googlesource.com/src/+/refs/heads/main/docs/native-code/rtp-hdrext/abs-send-time/README.md WebRTC: Absolute Send Time
+/// @spec https://webrtc.googlesource.com/src/+/refs/heads/main/docs/native-code/rtp-hdrext/abs-send-time/README.md Absolute Send Time
 public record AbsSendTime(int value) implements HeaderExtension {
     /// The encoded length.
     public static final int LENGTH = 3;

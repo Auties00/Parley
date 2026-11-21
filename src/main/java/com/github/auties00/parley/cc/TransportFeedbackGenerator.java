@@ -32,7 +32,7 @@ import java.util.function.Consumer;
 ///
 /// Every method may be called from any thread. The sink is called without the generator's lock held, serially.
 ///
-/// @spec https://datatracker.ietf.org/doc/html/draft-holmer-rmcat-transport-wide-cc-extensions-01 RTP Extensions for Transport-wide Congestion Control
+/// @spec https://datatracker.ietf.org/doc/html/draft-holmer-rmcat-transport-wide-cc-extensions-01 draft-holmer-rmcat-transport-wide-cc-extensions-01: RTP Extensions for Transport-wide Congestion Control
 public final class TransportFeedbackGenerator implements AutoCloseable {
     private static final System.Logger LOGGER = System.getLogger(TransportFeedbackGenerator.class.getName());
 

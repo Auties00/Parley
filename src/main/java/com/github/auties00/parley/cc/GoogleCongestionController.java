@@ -37,7 +37,7 @@ import java.util.concurrent.locks.ReentrantLock;
 /// absent and the target follows the loss-based estimate capped at the REMB.
 ///
 /// @spec https://datatracker.ietf.org/doc/html/draft-ietf-rmcat-gcc-02 A Google Congestion Control Algorithm for Real-Time Communication
-/// @spec https://datatracker.ietf.org/doc/html/draft-holmer-rmcat-transport-wide-cc-extensions-01 RTP Extensions for Transport-wide Congestion Control
+/// @spec https://datatracker.ietf.org/doc/html/draft-holmer-rmcat-transport-wide-cc-extensions-01 draft-holmer-rmcat-transport-wide-cc-extensions-01: RTP Extensions for Transport-wide Congestion Control
 /// @spec https://datatracker.ietf.org/doc/html/draft-alvestrand-rmcat-remb-03 RTCP message for Receiver Estimated Maximum Bitrate
 public final class GoogleCongestionController implements CongestionController {
     private static final System.Logger LOGGER = System.getLogger(GoogleCongestionController.class.getName());

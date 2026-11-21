@@ -14,7 +14,7 @@ import java.util.Objects;
 /// @param senderSsrc the feedback sender, an unsigned 32-bit value
 /// @param bitrateBps the estimated maximum bitrate in bits per second, non-negative
 /// @param ssrcs      the media sources the estimate applies to, at most 255
-/// @spec https://datatracker.ietf.org/doc/html/draft-alvestrand-rmcat-remb-03 draft-alvestrand-rmcat-remb-03: RTCP message for Receiver Estimated Maximum Bitrate
+/// @spec https://datatracker.ietf.org/doc/html/draft-alvestrand-rmcat-remb-03 RTCP message for Receiver Estimated Maximum Bitrate
 public record Remb(long senderSsrc, long bitrateBps, List<Long> ssrcs) implements RtcpPacket {
     /// The feedback message type of application-layer feedback.
     public static final int FORMAT = 15;

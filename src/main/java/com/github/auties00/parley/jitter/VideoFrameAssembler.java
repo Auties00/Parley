@@ -65,7 +65,7 @@ import java.util.concurrent.locks.ReentrantLock;
 ///
 /// @spec https://www.rfc-editor.org/rfc/rfc4585.html RFC 4585: Extended RTP Profile for Real-time Transport Control Protocol (RTCP)-Based Feedback (RTP/AVPF)
 /// @spec https://www.rfc-editor.org/rfc/rfc5104.html RFC 5104: Codec Control Messages in the RTP Audio-Visual Profile with Feedback (AVPF)
-/// @spec https://www.w3.org/TR/webrtc-stats/ W3C Identifiers for WebRTC's Statistics API
+/// @spec https://www.w3.org/TR/webrtc-stats/ Identifiers for WebRTC's Statistics API
 public final class VideoFrameAssembler implements AutoCloseable {
     /// The longest a blocked [#next()] waits before checking timers again, in nanoseconds.
     private static final long MAX_WAIT_NANOS = TimeUnit.MILLISECONDS.toNanos(10);

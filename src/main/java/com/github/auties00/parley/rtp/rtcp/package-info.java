@@ -19,5 +19,5 @@
 /// @spec https://www.rfc-editor.org/rfc/rfc5506.html RFC 5506: Support for Reduced-Size Real-Time Transport Control Protocol (RTCP): Opportunities and Consequences
 /// @spec https://www.rfc-editor.org/rfc/rfc8888.html RFC 8888: RTP Control Protocol (RTCP) Feedback for Congestion Control
 /// @spec https://datatracker.ietf.org/doc/html/draft-holmer-rmcat-transport-wide-cc-extensions-01 draft-holmer-rmcat-transport-wide-cc-extensions-01: RTP Extensions for Transport-wide Congestion Control
-/// @spec https://datatracker.ietf.org/doc/html/draft-alvestrand-rmcat-remb-03 draft-alvestrand-rmcat-remb-03: RTCP message for Receiver Estimated Maximum Bitrate
+/// @spec https://datatracker.ietf.org/doc/html/draft-alvestrand-rmcat-remb-03 RTCP message for Receiver Estimated Maximum Bitrate
 package com.github.auties00.parley.rtp.rtcp;

@@ -5,7 +5,7 @@ import java.util.Optional;
 
 /// The kind of a media track, the top-level type of its codecs' media types.
 ///
-/// @spec https://www.w3.org/TR/mediacapture-streams/ W3C Media Capture and Streams
+/// @spec https://www.w3.org/TR/mediacapture-streams/ Media Capture and Streams
 public enum MediaKind {
     /// Audio, media type `audio/*`.
     AUDIO("audio"),

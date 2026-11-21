@@ -15,7 +15,7 @@ import java.util.List;
 /// transport's RTCP reader thread. Implementations synchronize themselves and must not block.
 ///
 /// @spec https://datatracker.ietf.org/doc/html/draft-holmer-rmcat-transport-wide-cc-extensions-01 draft-holmer-rmcat-transport-wide-cc-extensions-01: RTP Extensions for Transport-wide Congestion Control
-/// @spec https://datatracker.ietf.org/doc/html/draft-alvestrand-rmcat-remb-03 draft-alvestrand-rmcat-remb-03: RTCP message for Receiver Estimated Maximum Bitrate
+/// @spec https://datatracker.ietf.org/doc/html/draft-alvestrand-rmcat-remb-03 RTCP message for Receiver Estimated Maximum Bitrate
 /// @spec https://www.rfc-editor.org/rfc/rfc3550.html RFC 3550: RTP: A Transport Protocol for Real-Time Applications
 public interface TransportFeedbackObserver {
     /// Called after a packet was written to the transport.
