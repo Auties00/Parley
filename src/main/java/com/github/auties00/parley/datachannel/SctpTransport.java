@@ -166,17 +166,17 @@ public final class SctpTransport implements AutoCloseable {
     /// @throws IllegalArgumentException if `remotePort` is out of range, `remoteMaxMessageSize` is negative or
     ///                                  `timeout` is not positive
     /// @spec https://www.rfc-editor.org/rfc/rfc8841.html RFC 8841: Session Description Protocol (SDP) Offer/Answer Procedures for Stream Control Transmission Protocol (SCTP) over Datagram Transport Layer Security (DTLS) Transport
-    public void start(DtlsRole role, int remotePort, OptionalLong remoteMaxMessageSizeAttribute, Duration timeout)
+    public void start(DtlsRole role, int remotePort, OptionalLong remoteMaxMessageSize, Duration timeout)
             throws IOException, InterruptedException {
         Objects.requireNonNull(role, "role");
-        Objects.requireNonNull(remoteMaxMessageSizeAttribute, "remoteMaxMessageSize");
+        Objects.requireNonNull(remoteMaxMessageSize, "remoteMaxMessageSize");
         Objects.requireNonNull(timeout, "timeout");
-        var remoteMaxMessageSize = remoteMaxMessageSizeAttribute.orElse(DEFAULT_REMOTE_MAX_MESSAGE_SIZE);
+        var remoteMax = remoteMaxMessageSize.orElse(DEFAULT_REMOTE_MAX_MESSAGE_SIZE);
         if (remotePort < 1 || remotePort > 0xFFFF) {
             throw new IllegalArgumentException("remotePort must be in 1..65535: " + remotePort);
         }
-        if (remoteMaxMessageSize < 0) {
-            throw new IllegalArgumentException("remoteMaxMessageSize must not be negative: " + remoteMaxMessageSize);
+        if (remoteMax < 0) {
+            throw new IllegalArgumentException("remoteMaxMessageSize must not be negative: " + remoteMax);
         }
         if (timeout.isNegative() || timeout.isZero()) {
             throw new IllegalArgumentException("timeout must be positive: " + timeout);
@@ -191,7 +191,7 @@ public final class SctpTransport implements AutoCloseable {
         } finally {
             lock.unlock();
         }
-        var effectiveMax = remoteMaxMessageSize == 0 ? Long.MAX_VALUE : remoteMaxMessageSize;
+        var effectiveMax = remoteMax == 0 ? Long.MAX_VALUE : remoteMax;
         var sendBuffer = (int) Math.min(Integer.MAX_VALUE, Math.max(config.maxSendBufferSize(), config.maxBufferedAmount()));
         var streamQueue = (int) Math.min(Integer.MAX_VALUE, config.maxBufferedAmount());
         var transport = lower.get();

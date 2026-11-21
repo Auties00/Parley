@@ -316,6 +316,29 @@ class SrtpTransportTest {
         }
     }
 
+    @ParameterizedTest(name = "{0}")
+    @EnumSource(value = SrtpCryptoSuite.class, names = {"AES_CM_128_HMAC_SHA1_80", "AEAD_AES_128_GCM"})
+    @DisplayName("applies cryptex to every stream of the transport, as one BUNDLE group must")
+    void cryptexEveryStream(SrtpCryptoSuite suite) throws Exception {
+        try (var pair = Pair.sdes(suite, SrtpOptions.DEFAULT.withCryptex(true))) {
+            for (var ssrc = 0x10; ssrc < 0x14; ssrc++) {
+                var packet = ByteBuffer.allocate(12 + 8 + 10);
+                packet.put((byte) 0x90).put((byte) 96).putShort((short) ssrc).putInt(900).putInt(ssrc)
+                        .putShort((short) 0xBEDE).putShort((short) 1).put((byte) 0x10).put((byte) 0x5A).putShort((short) 0);
+                for (var index = 0; index < 10; index++) {
+                    packet.put((byte) index);
+                }
+                var plain = packet.array();
+                pair.left().sendRtp(withTailroom(plain, pair.left().protectionOverhead()));
+                assertArrayEquals(plain, pair.rtpAtRight().poll(5, TimeUnit.SECONDS));
+                var wire = pair.link().left.sent.getLast();
+                assertEquals(0xC0DE, (wire[12] & 0xFF) << 8 | (wire[13] & 0xFF), "stream " + ssrc);
+                assertFalse(Arrays.equals(Arrays.copyOfRange(plain, 16, 20), Arrays.copyOfRange(wire, 16, 20)),
+                        "the extension of stream " + ssrc + " is encrypted");
+            }
+        }
+    }
+
     @Nested
     @DisplayName("keyed by DTLS-SRTP")
     class DtlsKeyed {

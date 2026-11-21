@@ -4,7 +4,7 @@
 ///
 /// {@snippet lang = java :
 /// var sctp = SctpTransport.over(dtls, SctpConfig.defaults());
-/// sctp.start(DtlsRole.CLIENT, remoteSctpPort, remoteMaxMessageSize, Duration.ofSeconds(10));
+/// sctp.start(DtlsRole.CLIENT, remoteSctpPort, OptionalLong.of(remoteMaxMessageSize), Duration.ofSeconds(10));
 /// try (var chat = sctp.createDataChannel("chat", DataChannelInit.reliable())) {
 ///     chat.send("hello");
 ///     switch (chat.receive()) {
@@ -17,9 +17,11 @@
 /// # Threading
 ///
 /// Every type is safe for use from several threads. Blocking calls ([DataChannel#receive()],
-/// [SctpTransport#acceptDataChannel()], the sends while the association's send buffer is full) block the calling
-/// thread, which is meant to be a virtual thread, and are interruptible. The transport reads the association on one
-/// thread from the configured [java.util.concurrent.ThreadFactory] and dispatches each message to its channel.
+/// [SctpTransport#acceptDataChannel()], [DataChannel#send(DataChannelMessage,java.time.Duration)]) block the calling
+/// thread, which is meant to be a virtual thread, and are interruptible; [DataChannel#send(DataChannelMessage)] never
+/// blocks and fails with [DataChannelBufferFullException] when the send buffer is full. The transport reads the
+/// association on one thread from the configured [java.util.concurrent.ThreadFactory] and dispatches each message to
+/// its channel without ever waiting for one, so a channel nobody reads cannot hold up the others.
 ///
 /// Unless otherwise noted, passing `null` to a method or constructor of a type in this package throws
 /// [NullPointerException].
