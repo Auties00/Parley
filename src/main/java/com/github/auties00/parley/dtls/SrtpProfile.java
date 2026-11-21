@@ -4,7 +4,7 @@ import com.github.auties00.srtp.SrtpCryptoSuite;
 
 import java.util.Optional;
 
-/// The SRTP protection profiles a [DtlsEndpoint] negotiates in the `use_srtp` extension, declared in this library's
+/// The SRTP protection profiles a [DtlsTransport] negotiates in the `use_srtp` extension, declared in this library's
 /// order of preference.
 ///
 /// @spec https://www.rfc-editor.org/rfc/rfc5764.html RFC 5764: Datagram Transport Layer Security (DTLS) Extension to Establish Keys for the Secure Real-time Transport Protocol (SRTP)
@@ -12,6 +12,9 @@ import java.util.Optional;
 public enum SrtpProfile {
     /// `SRTP_AEAD_AES_128_GCM`, profile `0x0007`: AES-128-GCM with a 12-byte salt (RFC 7714 section 14.2).
     AEAD_AES_128_GCM(0x0007, SrtpCryptoSuite.AEAD_AES_128_GCM, 16, 12),
+
+    /// `SRTP_AEAD_AES_256_GCM`, profile `0x0008`: AES-256-GCM with a 12-byte salt (RFC 7714 section 14.2).
+    AEAD_AES_256_GCM(0x0008, SrtpCryptoSuite.AEAD_AES_256_GCM, 32, 12),
 
     /// `SRTP_AES128_CM_HMAC_SHA1_80`, profile `0x0001`: AES-128 in counter mode with an 80-bit HMAC-SHA1 tag, the
     /// profile every WebRTC endpoint must support.
