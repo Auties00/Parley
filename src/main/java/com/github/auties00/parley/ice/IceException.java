@@ -2,10 +2,10 @@ package com.github.auties00.parley.ice;
 
 import java.io.IOException;
 
-/// Signals that ICE connectivity checks could not select a candidate pair: no candidate was usable, or none answered
-/// before the timeout.
+/// Signals that an ICE transport cannot carry data: connectivity checks failed or did not succeed in time, consent
+/// expired, or the transport is closed.
 ///
-/// @see IceAgent#nominate(java.util.List, java.time.Duration)
+/// @see IceAgent#awaitConnected(java.time.Duration)
 public final class IceException extends IOException {
     /// Creates the exception.
     ///
